@@ -1,203 +1,69 @@
-# 通用工具模块
+# 通用工具模块（utils）
 
-## 功能概述
+本目录包含项目的通用工具，当前重点为“日志管理”。
 
-提供项目所需的通用工具和基础设施，包括日志管理、HTTP客户端和异常定义，确保系统的稳定性和可维护性。
+## 日志调用逻辑（强烈建议遵循）
 
-## 模块组成
-
-### 1. 日志管理 (logger.py)
-- 多级别日志记录
-- 文件和控制台输出
-- 日志轮转和归档
-- 结构化日志格式
-
-### 2. HTTP客户端 (http_client.py)
-- 异步HTTP请求
-- 连接池管理
-- 自动重试机制
-- 请求/响应拦截
-
-### 3. 异常定义 (exceptions.py)
-- 自定义异常类型
-- 异常分类处理
-- 错误信息标准化
-- 异常追溯机制
-
-## 功能特性
-
-- 📝 专业日志系统
-- 🌐 高性能HTTP客户端
-- ⚠️ 完善异常处理
-- 🔧 丰富的工具函数
-- 🛡️ 安全机制集成
-- 📊 性能监控集成
-
-## 使用示例
-
+1) 在程序最开始初始化日志（一次即可）
 ```python
-# 日志管理
-from src.utils import get_logger
+from src.utils.logger import setup_logging
+import asyncio
 
-logger = get_logger(__name__)
-
-logger.info("应用启动", extra={"module": "main", "version": "1.0"})
-logger.warning("性能警告: 执行时间过长", extra={"execution_time": 15.2})
-logger.error("工作流执行失败", exc_info=True, extra={"workflow_id": "wf001"})
-
-# HTTP客户端
-from src.utils import HTTPClient
-
-client = HTTPClient(
-    base_url="https://api.dify.ai",
-    timeout=30,
-    max_retries=3
-)
-
-# GET请求
-response = await client.get("/workflows", params={"limit": 100})
-print(response.json())
-
-# POST请求
-result = await client.post(
-    "/workflows/run",
-    json={"workflow_id": "wf001", "inputs": {...}}
-)
-
-# 异常处理
-from src.utils import (
-    DifyAuthException,
-    WorkflowExecutionException,
-    ConfigurationException
-)
-
-try:
-    # 执行工作流
-    execute_workflow(...)
-except WorkflowExecutionException as e:
-    logger.error(f"工作流执行失败: {e}")
-    # 处理特定异常
-    handle_workflow_failure(e)
-except DifyAuthException as e:
-    logger.error(f"认证失败: {e}")
-    # 重新认证
-    reauthenticate()
-except ConfigurationException as e:
-    logger.error(f"配置错误: {e}")
-    # 修复配置
-    fix_configuration(e)
+asyncio.run(setup_logging("config/logging_config.yaml"))  # 未传参也可使用默认配置
 ```
 
-## 日志系统
-
-### 日志级别
-- **DEBUG**: 详细的调试信息
-- **INFO**: 一般信息记录
-- **WARNING**: 警告信息
-- **ERROR**: 错误信息
-- **CRITICAL**: 严重错误
-
-### 日志格式
+2) 通过工厂方法获取模块级 logger
 ```python
-LOGGING_CONFIG = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "formatters": {
-        "default": {
-            "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            "datefmt": "%Y-%m-%d %H:%M:%S"
-        },
-        "structured": {
-            "format": "%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s",
-            "datefmt": "%Y-%m-%d %H:%M:%S"
-        }
-    },
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
-            "level": "INFO",
-            "formatter": "default",
-            "stream": "ext://sys.stdout"
-        },
-        "file": {
-            "class": "logging.handlers.RotatingFileHandler",
-            "level": "DEBUG",
-            "formatter": "structured",
-            "filename": "logs/app.log",
-            "maxBytes": 10485760,  # 10MB
-            "backupCount": 5
-        },
-        "error_file": {
-            "class": "logging.handlers.RotatingFileHandler",
-            "level": "ERROR",
-            "formatter": "structured",
-            "filename": "logs/error.log",
-            "maxBytes": 10485760,
-            "backupCount": 5
-        }
-    },
-    "loggers": {
-        "": {
-            "level": "DEBUG",
-            "handlers": ["console", "file", "error_file"]
-        }
-    }
-}
+from src.utils.logger import get_logger
+
+logger = get_logger("main")
+logger.info("应用启动")
 ```
 
-### 结构化日志
+3) 可选：在代码块中绑定上下文或记录性能
 ```python
-import json
+from src.utils.logger import log_context, log_performance
 
-# 结构化日志记录
-logger.info(
-    "工作流执行完成",
-    extra={
-        "workflow_id": "wf001",
-        "execution_time": 2.5,
-        "token_count": 150,
-        "success": True,
-        "metadata": {
-            "model": "gpt-4",
-            "temperature": 0.7,
-            "max_tokens": 2000
-        }
-    }
-)
+with log_context(request_id="req_123", user_id="u_01"):
+    logger.info("带上下文的日志")
 
-# 输出格式
-# 2025-01-12 10:30:45 - main - INFO - 工作流执行完成 {"workflow_id": "wf001", "execution_time": 2.5, ...}
+@log_performance("数据处理")
+def process():
+    ...
 ```
 
-## HTTP客户端
+4) 文件输出位置与格式
+- 默认输出到 `logs/`，文件名形如 `dify_autoopt_YYYY-MM-DD.log`
+- 控制台与文件的级别/格式由 `config/logging_config.yaml` 中的 `logging.outputs.*` 与 `logging.global` 控制
 
-### 基础配置
-```python
-from aiohttp import ClientSession, ClientTimeout
-from typing import Optional, Dict, Any
+## 配置要点（config/logging_config.yaml）
+- `logging.global.level`: 日志级别（INFO/DEBUG/...）
+- `logging.global.format`: `simple` 或 `structured`
+- `logging.outputs.console.enabled`: 是否启用控制台输出
+- `logging.outputs.file.enabled`: 是否写入文件；`path` 指定目录
 
-class HTTPClient:
-    def __init__(
-        self,
-        base_url: str,
-        timeout: int = 30,
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
-        headers: Optional[Dict[str, str]] = None,
-        auth: Optional[Any] = None
-    ):
-        self.base_url = base_url.rstrip('/')
-        self.timeout = ClientTimeout(total=timeout)
-        self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.headers = headers or {}
-        self.auth = auth
+示例片段
+```yaml
+logging:
+  global:
+    level: INFO
+    format: simple
+  outputs:
+    console:
+      enabled: true
+    file:
+      enabled: true
+      path: logs
+      level: DEBUG
+```
 
-    async def _make_request(self, method: str, endpoint: str, **kwargs) -> Any:
-        """核心请求方法"""
-        url = f"{self.base_url}{endpoint}"
-        kwargs.setdefault('headers', {})
-        kwargs['headers'].update(self.headers)
+## 常见问题
+- 未先调用 `setup_logging()` 就使用 `get_logger()` 会抛出 `LoggingException`。
+- 测试场景参考：`src/test/test_logger_basic.py` 展示了初始化与文件写入的最小用例。
+
+## 目录说明
+- `logger/` 日志实现与对外 API（`setup_logging`、`get_logger` 等）
+- `exceptions.py` 通用异常定义（如有需要可扩展）
 
         if self.auth:
             kwargs['auth'] = self.auth

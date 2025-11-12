@@ -144,6 +144,28 @@ python src/main.py --mode optimize --workflow-id <workflow_id>
 python src/main.py --mode report --output report.xlsx
 ```
 
+## 单元测试
+
+本项目使用 pytest 进行单元测试，测试文件位于 `src/test/`，命名为 `test_*.py`。
+
+快速运行
+```bash
+# 从项目根目录运行所有测试
+python -m pytest -q
+
+# 仅运行日志相关测试
+pytest -q -k logger
+
+# 覆盖率报告（推荐）
+pytest --cov=src --cov-report=term-missing
+```
+
+约定与提示
+- 测试目录：`src/test/`（与 `src/` 结构对应）。
+- 命名规范：文件 `test_*.py`，函数 `test_*`。
+- 日志模块样例：参见 `src/test/test_logger_basic.py`，验证初始化与文件写入。
+- 测试不应访问真实 Dify 端点，对 I/O 或网络进行隔离/伪造。
+
 ## 使用指南
 
 ### 基础测试
