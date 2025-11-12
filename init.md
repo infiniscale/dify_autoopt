@@ -106,7 +106,7 @@ npx claude-code-templates@latest --hook=git/prevent-direct-push --yes
 检查当前仓库的 GitFlow 配置状态：
 ```bash
 # 使用 git-flow-manager 代理检查配置
-/agent run git-flow-manager "Check the gitflow configuration in this repository and provide a comparative status table"
+Check the gitflow configuration in this repository using the agent: git-flow-manager, and give me a comparative table of the status.
 ```
 
 ## 注意事项
