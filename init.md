@@ -101,6 +101,14 @@ npx claude-code-templates@latest --hook=git/prevent-direct-push --yes
 	•	分支命名规范、提交信息规范、合并策略等流程需事先在团队达成一致，并在 CLAUDE.md 中明确。
 
 
+## GitFlow 配置检查命令
+
+检查当前仓库的 GitFlow 配置状态：
+```bash
+# 使用 git-flow-manager 代理检查配置
+Check the gitflow configuration in this repository using the agent: git-flow-manager, and give me a comparative table of the status.
+```
+
 ## 注意事项
 
 1. **重启要求**: 安装插件后需要重启 Claude Code 才能加载新插件。
