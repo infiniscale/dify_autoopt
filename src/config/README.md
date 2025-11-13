@@ -409,44 +409,115 @@ Exception
 
 ### 测试覆盖率
 
-配置模块当前测试覆盖率：**97%**
+配置模块当前测试覆盖率：**100%** ✅
 
 ```
-config_loader.py:      100%
-config_validator.py:    98%
-env_config.py:          97%
-test_plan.py:           95%
-workflow_catalog.py:    83%
-run_manifest.py:       100%
-common.py:             100%
-exceptions.py:         100%
-yaml_parser.py:        100%  # 新增，完整测试覆盖
+Name                                     Stmts   Miss  Cover
+--------------------------------------------------------------
+src\config\__init__.py                       4      0   100%
+src\config\loaders\__init__.py               3      0   100%
+src\config\loaders\config_loader.py         60      0   100%
+src\config\loaders\config_validator.py      46      0   100%
+src\config\models\__init__.py                6      0   100%
+src\config\models\common.py                 12      0   100%
+src\config\models\env_config.py             34      0   100%
+src\config\models\run_manifest.py           25      0   100%
+src\config\models\test_plan.py             106      0   100%
+src\config\models\workflow_catalog.py       35      0   100%
+src\config\utils\__init__.py                 0      0   100%
+src\config\utils\exceptions.py              16      0   100%
+src\config\utils\yaml_parser.py             45      0   100%
+--------------------------------------------------------------
+TOTAL                                      392      0   100%
 ```
+
+**质量指标：**
+- ✅ 91 个测试，全部通过
+- ✅ 测试执行时间：0.56秒
+- ✅ 所有边界情况和错误路径均已覆盖
+- ✅ 生产就绪状态
 
 ### 运行测试
 
 ```bash
 # 运行所有配置测试
-pytest tests/config/ -v
+python -m pytest src/test/config/ -v
 
 # 带覆盖率运行
-pytest tests/config/ --cov=src/config --cov-report=term-missing
+python -m pytest src/test/config/ --cov=src/config --cov-report=term-missing
+
+# 生成HTML覆盖率报告
+python -m pytest src/test/config/ --cov=src/config --cov-report=html
 
 # 运行特定测试文件
-pytest tests/config/test_config_loader.py -v
+python -m pytest src/test/config/test_config_loader.py -v
+
+# 运行特定测试类
+python -m pytest src/test/config/test_models.py::TestDifyConfigUrlValidation -v
 ```
 
 ### 测试结构
 
 ```
-tests/config/
+src/test/config/
+├── test_config_loader.py      # 配置加载器测试（20个测试）
+│   ├── TestFileSystemReader (5 tests)
+│   ├── TestConfigLoaderEnvExpansion (6 tests)
+│   ├── TestConfigLoaderLoadEnv (3 tests)
+│   ├── TestConfigLoaderLoadCatalog (3 tests)
+│   └── TestConfigLoaderLoadTestPlan (3 tests)
+├── test_config_validator.py   # 跨文件验证测试（11个测试）
+│   ├── TestConfigValidatorEnv (4 tests)
+│   ├── TestConfigValidatorPlan (3 tests)
+│   ├── TestConfigValidatorPromptVariants (3 tests)
+│   └── TestConfigValidatorAll (1 test)
+├── test_models.py             # Pydantic模型测试（18个测试）
+│   ├── TestWorkflowEntryProperties (2 tests)
+│   ├── TestWorkflowCatalogMethods (4 tests)
+│   ├── TestTestPlanMethods (2 tests)
+│   ├── TestPromptStrategyValidation (5 tests)
+│   ├── TestEnvConfigPathValidation (2 tests)
+│   └── TestDifyConfigUrlValidation (3 tests)
 ├── test_smoke.py              # 基础冒烟测试（7个测试）
-├── test_config_validator.py   # 验证器测试（11个测试）
-├── test_config_loader.py      # 加载器测试（20个测试）
+│   ├── TestModelsSmokeTest (2 tests)
+│   ├── TestLoaderSmokeTest (2 tests)
+│   ├── TestExecutorSmokeTest (2 tests)
+│   └── TestOptimizerSmokeTest (1 test)
 └── test_yaml_parser.py        # YAML解析器测试（35个测试）
+    ├── TestYamlParserLoad (6 tests)
+    ├── TestYamlParserDump (4 tests)
+    ├── TestYamlParserGetNodeByPath (8 tests)
+    ├── TestYamlParserSetFieldValue (7 tests)
+    ├── TestYamlParserGetFieldValue (7 tests)
+    └── TestYamlParserIntegration (3 tests)
 
-总计：73 个测试，全部通过
+总计：91 个测试，全部通过 ✅
 ```
+
+### 测试覆盖的关键场景
+
+**边界情况测试：**
+- ✅ 空文件处理
+- ✅ 缺失环境变量
+- ✅ 无效YAML语法
+- ✅ 不存在的路径
+- ✅ 重复ID检测
+- ✅ 无效引用检测
+- ✅ 深层嵌套结构
+- ✅ Unicode字符处理
+
+**验证器测试：**
+- ✅ URL格式验证（http/https）
+- ✅ 空token检测
+- ✅ 路径类型转换
+- ✅ 提示词策略模式验证
+- ✅ 跨文件引用一致性
+
+**集成测试：**
+- ✅ 完整加载-修改-保存流程
+- ✅ 复杂DSL文档操作
+- ✅ 环境变量展开
+- ✅ 多层验证链
 
 ## 迁移指南
 

@@ -42,16 +42,31 @@ class TestConfigValidatorEnv:
         validator.validate_env(env)  # Should not raise
 
     def test_validate_env_invalid_url_format(self):
-        """Test validation catches invalid URL (tested at model level, not validator level)"""
-        # Note: URL validation actually happens at Pydantic model level via field_validator
-        # ConfigValidator.validate_env() performs additional checks
-        # This test verifies the field validator works correctly
-        with pytest.raises(Exception):  # Pydantic ValidationError
-            DifyConfig(
-                base_url="not-a-url",  # Invalid URL caught by field_validator
-                auth=AuthConfig(primary_token="token"),
-                rate_limits=RateLimit(per_minute=60)
-            )
+        """Test validation catches invalid URL at validator level"""
+        # Create an EnvConfig with invalid URL by bypassing Pydantic validation
+        # This tests the additional check in ConfigValidator.validate_env()
+        from pydantic import SecretStr
+
+        # Use model_construct to bypass validation
+        dify_config = DifyConfig.model_construct(
+            base_url="ftp://invalid-protocol.com",  # Invalid protocol
+            auth=AuthConfig(primary_token=SecretStr("token")),
+            rate_limits=RateLimit(per_minute=60)
+        )
+
+        env = EnvConfig.model_construct(
+            meta={"version": "1.0"},
+            dify=dify_config,
+            model_evaluator=ModelEvaluator(provider="openai", model_name="gpt-4"),
+            io_paths={},
+            logging={}
+        )
+
+        catalog = WorkflowCatalog(meta={"version": "1.0"}, workflows=[])
+        validator = ConfigValidator(catalog)
+
+        with pytest.raises(ConfigurationError, match="Invalid Dify URL format"):
+            validator.validate_env(env)
 
     def test_validate_env_empty_token(self):
         """Test validation fails for empty primary token"""
