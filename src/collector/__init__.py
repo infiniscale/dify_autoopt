@@ -14,6 +14,7 @@ from .models import (
     TestStatus,
 )
 from .data_collector import DataCollector
+from .classifier import ResultClassifier
 
 __all__ = [
     "TestStatus",
@@ -22,4 +23,5 @@ __all__ = [
     "PerformanceMetrics",
     "ClassificationResult",
     "DataCollector",
+    "ResultClassifier",
 ]
