@@ -15,6 +15,7 @@ from .models import (
 )
 from .data_collector import DataCollector
 from .classifier import ResultClassifier
+from .excel_exporter import ExcelExporter
 
 __all__ = [
     "TestStatus",
@@ -24,4 +25,5 @@ __all__ = [
     "ClassificationResult",
     "DataCollector",
     "ResultClassifier",
+    "ExcelExporter",
 ]
