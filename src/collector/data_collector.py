@@ -31,12 +31,72 @@ def _get_safe_logger():
 logger = _get_safe_logger()
 
 
+def calculate_percentiles(values: List[float]) -> Dict[str, float]:
+    """
+    计算百分位数（P50, P95, P99）
+
+    使用线性插值法计算百分位数，这是统计学上的标准做法。
+
+    Args:
+        values: 数值列表
+
+    Returns:
+        包含 p50, p95, p99 的字典
+
+    Algorithm:
+        1. 对值列表排序
+        2. 使用线性插值法计算百分位数
+        3. 百分位计算公式: index = (p / 100.0) * (n - 1)
+        4. 在 index 的整数部分和上界之间线性插值
+
+    Edge Cases:
+        - 空列表: 返回全 0
+        - 单个值: 返回该值作为所有百分位
+        - 两个值: 返回插值结果
+
+    Example:
+        >>> calculate_percentiles([1.0, 2.0, 3.0, 4.0, 5.0])
+        {'p50': 3.0, 'p95': 4.8, 'p99': 4.96}
+    """
+    if not values:
+        return {"p50": 0.0, "p95": 0.0, "p99": 0.0}
+
+    sorted_values = sorted(values)
+    n = len(sorted_values)
+
+    def percentile(p: float) -> float:
+        """计算第 p 百分位 (0-100)"""
+        if n == 1:
+            return sorted_values[0]
+
+        # 使用线性插值
+        index = (p / 100.0) * (n - 1)
+        lower = int(index)
+        upper = min(lower + 1, n - 1)
+        weight = index - lower
+
+        return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+
+    return {
+        "p50": percentile(50),
+        "p95": percentile(95),
+        "p99": percentile(99),
+    }
+
+
 class DataCollector:
     """
     测试结果数据收集器
 
     负责收集测试执行结果，提供统计分析和数据查询功能。
     支持按工作流、变体、数据集等维度过滤数据。
+
+    Thread Safety:
+        在 CPython 环境下，``collect_result()`` 支持多线程并发写入
+        （包括同一 workflow_id），不会丢失数据。但统计相关方法
+        （``get_statistics()``, ``get_results_by_workflow()`` 等）
+        返回的是近实时快照，不保证跨线程的强一致性。如需强一致视图，
+        请在外层进行同步控制。
 
     Attributes:
         _results: 存储所有测试结果的列表
@@ -100,10 +160,9 @@ class DataCollector:
         # 4. 添加到结果列表
         self._results.append(result)
 
-        # 5. 更新工作流索引
-        if result.workflow_id not in self._results_by_workflow:
-            self._results_by_workflow[result.workflow_id] = []
-        self._results_by_workflow[result.workflow_id].append(result)
+        # 5. 更新工作流索引（使用 setdefault 避免并发时列表覆盖）
+        workflow_list = self._results_by_workflow.setdefault(result.workflow_id, [])
+        workflow_list.append(result)
 
         # 6. 记录日志
         logger.debug(
@@ -184,50 +243,19 @@ class DataCollector:
 
     def _calculate_percentiles(self, values: List[float]) -> Dict[str, float]:
         """
-        计算百分位数
+        计算百分位数（内部方法，建议使用模块级 calculate_percentiles 函数）
+
+        Deprecated:
+            This method wraps the module-level calculate_percentiles() function.
+            For new code, consider using calculate_percentiles() directly.
 
         Args:
             values: 数值列表
 
         Returns:
             包含 p50, p95, p99 的字典
-
-        算法说明:
-        1. 对值列表排序
-        2. 使用线性插值法计算百分位数
-        3. P50 = 第 50% 位置的值
-        4. P95 = 第 95% 位置的值
-        5. P99 = 第 99% 位置的值
-
-        边界情况:
-        - 空列表: 返回全 0
-        - 单个值: 返回该值
-        - 两个值: 返回插值
         """
-        if not values:
-            return {"p50": 0.0, "p95": 0.0, "p99": 0.0}
-
-        sorted_values = sorted(values)
-        n = len(sorted_values)
-
-        def percentile(p: float) -> float:
-            """计算第 p 百分位 (0-100)"""
-            if n == 1:
-                return sorted_values[0]
-
-            # 使用线性插值
-            index = (p / 100.0) * (n - 1)
-            lower = int(index)
-            upper = min(lower + 1, n - 1)
-            weight = index - lower
-
-            return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
-
-        return {
-            "p50": percentile(50),
-            "p95": percentile(95),
-            "p99": percentile(99),
-        }
+        return calculate_percentiles(values)
 
     def get_all_results(self) -> List[TestResult]:
         """

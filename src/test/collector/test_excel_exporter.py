@@ -8,14 +8,21 @@ Description: 验证 ExcelExporter 的 Excel 导出功能
 
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+import pytest
 
 from src.collector import (
     ExcelExporter,
     DataCollector,
     ResultClassifier,
     TestResult,
-    TestStatus
+    TestStatus,
+    PerformanceMetrics,
+    ClassificationResult,
+    PerformanceGrade
 )
+from src.utils.exceptions import ExportException
 
 
 def test_excel_export():
@@ -128,3 +135,119 @@ def test_excel_export():
 
 if __name__ == "__main__":
     test_excel_export()
+
+
+class TestExcelExporterExceptions:
+    """测试 ExcelExporter 的异常处理"""
+
+    def test_export_results_generic_exception(self, tmp_path):
+        """测试 export_results 中的通用异常处理 (第 119-121 行)"""
+        exporter = ExcelExporter()
+
+        # 创建测试数据
+        results = [
+            TestResult(
+                workflow_id="wf_001",
+                execution_id="exec_001",
+                timestamp=datetime.now(),
+                status=TestStatus.SUCCESS,
+                execution_time=1.0,
+                tokens_used=100,
+                cost=0.01,
+                inputs={"query": "test"},
+                outputs={"answer": "result"}
+            )
+        ]
+
+        output_file = tmp_path / "test.xlsx"
+
+        # Mock openpyxl.Workbook 的 save 方法抛出异常
+        with patch('openpyxl.Workbook.save') as mock_save:
+            mock_save.side_effect = RuntimeError("Disk full")
+
+            with pytest.raises(ExportException) as exc_info:
+                exporter.export_results(results, output_file)
+
+            assert "Failed to export results" in str(exc_info.value)
+            assert "Disk full" in str(exc_info.value)
+
+    def test_export_statistics_generic_exception(self, tmp_path):
+        """测试 export_statistics 中的异常处理 (第 158-160 行)"""
+        exporter = ExcelExporter()
+
+        # 创建测试数据
+        metrics = PerformanceMetrics(
+            total_executions=10,
+            successful_count=9,
+            failed_count=1,
+            success_rate=0.9,
+            avg_execution_time=1.5,
+            p50_execution_time=1.2,
+            p95_execution_time=2.5,
+            p99_execution_time=3.0,
+            total_tokens=1000,
+            total_cost=0.1,
+            avg_tokens_per_request=100.0
+        )
+
+        classification = ClassificationResult(
+            excellent_count=5,
+            good_count=3,
+            fair_count=1,
+            poor_count=1,
+            grade_distribution={
+                PerformanceGrade.EXCELLENT: 50.0,
+                PerformanceGrade.GOOD: 30.0,
+                PerformanceGrade.FAIR: 10.0,
+                PerformanceGrade.POOR: 10.0
+            }
+        )
+
+        output_file = tmp_path / "stats.xlsx"
+
+        # Mock openpyxl.Workbook 的 save 方法抛出异常
+        with patch('openpyxl.Workbook.save') as mock_save:
+            mock_save.side_effect = PermissionError("Access denied")
+
+            with pytest.raises(ExportException) as exc_info:
+                exporter.export_statistics(metrics, classification, output_file)
+
+            assert "Failed to export statistics" in str(exc_info.value)
+            assert "Access denied" in str(exc_info.value)
+
+    def test_auto_adjust_column_width_exception(self, tmp_path):
+        """测试 _auto_adjust_column_width 中的异常处理 (第 321-322 行)"""
+        import openpyxl
+
+        exporter = ExcelExporter()
+
+        # 创建一个工作簿和工作表
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Test"
+
+        # 添加正常数据
+        ws['A1'] = "Normal"
+        ws['B1'] = 123
+
+        # 直接 patch len() 函数来触发异常
+        # 在 _auto_adjust_column_width 中，会调用 len(str(cell.value))
+        # 我们让 len() 在某些情况下抛出异常
+        original_len = __builtins__['len'] if isinstance(__builtins__, dict) else __builtins__.len
+        call_count = [0]
+
+        def mock_len(obj):
+            call_count[0] += 1
+            # 在第3次调用 len 时抛出异常（跳过前面的一些调用）
+            if call_count[0] == 3 and isinstance(obj, str):
+                raise TypeError("Mock len error")
+            return original_len(obj)
+
+        # 使用 patch 来模拟 len() 抛出异常
+        with patch('builtins.len', side_effect=mock_len):
+            # 调用 _auto_adjust_column_width，应该能正常完成而不抛出异常
+            # 因为异常被 try-except 捕获并忽略
+            exporter._auto_adjust_column_width(ws)
+
+        # 测试成功 - 方法应该能处理异常而不崩溃
+        assert True

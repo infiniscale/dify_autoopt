@@ -18,6 +18,7 @@ from loguru import logger as loguru_logger
 
 from ..utils.exceptions import ExportException
 from .models import TestResult, PerformanceMetrics, ClassificationResult, PerformanceGrade
+from .data_collector import calculate_percentiles
 
 
 # 延迟初始化 logger，避免未初始化异常
@@ -288,10 +289,9 @@ class ExcelExporter:
             exec_times = [r.execution_time for r in wf_results]
             avg_time = sum(exec_times) / len(exec_times) if exec_times else 0
 
-            # P95
-            sorted_times = sorted(exec_times)
-            p95_index = int(0.95 * len(sorted_times))
-            p95_time = sorted_times[p95_index] if sorted_times else 0
+            # 使用统一的百分位计算函数
+            percentiles = calculate_percentiles(exec_times)
+            p95_time = percentiles["p95"]
 
             total_tokens = sum(r.tokens_used for r in wf_results)
             total_cost = sum(r.cost for r in wf_results)
@@ -318,7 +318,9 @@ class ExcelExporter:
                 try:
                     if cell.value:
                         max_length = max(max_length, len(str(cell.value)))
-                except:
+                except Exception:
+                    # 忽略单个单元格的宽度计算失败
+                    # 注意：不记录日志以避免在 Mock 测试中触发递归
                     pass
 
             adjusted_width = min(max_length + 2, 50)

@@ -557,6 +557,21 @@ class TestSetThresholds:
 
         assert "Missing token_efficiency for excellent" in str(exc_info.value)
 
+    def test_set_thresholds_missing_execution_time(self):
+        """测试缺少 execution_time 字段"""
+        classifier = ResultClassifier()
+
+        invalid_thresholds = {
+            "excellent": {"token_efficiency": 0.9},  # 缺少 execution_time
+            "good": {"execution_time": 3.0, "token_efficiency": 0.7},
+            "fair": {"execution_time": 8.0, "token_efficiency": 0.5},
+        }
+
+        with pytest.raises(ClassificationException) as exc_info:
+            classifier.set_thresholds(invalid_thresholds)
+
+        assert "Missing execution_time for excellent" in str(exc_info.value)
+
     def test_set_thresholds_invalid_type(self):
         """测试无效的阈值类型"""
         classifier = ResultClassifier()
