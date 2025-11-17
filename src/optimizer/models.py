@@ -442,6 +442,7 @@ class OptimizationConfig(BaseModel):
         strategies: List of strategies to try (or single strategy).
         min_confidence: Minimum confidence threshold to accept optimization.
         max_iterations: Maximum optimization iterations.
+        score_threshold: Minimum score to skip optimization (0-100).
         analysis_rules: Custom analysis rules (optional).
         metadata: Additional configuration metadata.
 
@@ -450,6 +451,7 @@ class OptimizationConfig(BaseModel):
         ...     strategies=[OptimizationStrategy.CLARITY_FOCUS],
         ...     min_confidence=0.7,
         ...     max_iterations=3,
+        ...     score_threshold=80.0,
         ...     analysis_rules={},
         ...     metadata={}
         ... )
@@ -468,6 +470,13 @@ class OptimizationConfig(BaseModel):
         description="Minimum confidence to accept optimization",
     )
     max_iterations: int = Field(3, ge=1, description="Maximum optimization iterations")
+    score_threshold: float = Field(
+        default=80.0,
+        ge=0.0,
+        le=100.0,
+        description="Minimum score threshold to skip optimization (0-100). "
+                    "Prompts with overall_score below this value will be optimized.",
+    )
     analysis_rules: Dict[str, Any] = Field(
         default_factory=dict, description="Custom analysis rules"
     )

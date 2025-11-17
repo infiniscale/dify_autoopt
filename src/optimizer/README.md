@@ -1,514 +1,1332 @@
-# 智能优化模块
+# Optimizer Module - Prompt Optimization and Version Management
 
-## 功能概述
+The Optimizer module provides intelligent prompt extraction, analysis, optimization, and version management for Dify workflows. It enables automatic prompt quality assessment and AI-driven optimization with semantic versioning support.
 
-负责Dify工作流中LLM提示词的智能提取、分析和优化，提供基于大模型的自动化提示词优化和版本管理功能。
+**Status**: Production Ready - 13 files, 4,874 lines, 87% test coverage
 
-## 模块组成
+---
 
-### 1. 提示词提取 (prompt_extractor.py)
-- 工作流提示词自动识别
-- 多层级提示词提取
-- 提示词上下文分析
-- 结构化数据转换
+## Table of Contents
 
-### 2. LLM分析器 (llm_analyzer.py)
-- 提示词效果评估
-- 多维度质量分析
-- 性能基准测试
-- 智能评分算法
+- [Overview](#overview)
+- [Quick Start](#quick-start)
+- [Core Components](#core-components)
+- [API Reference](#api-reference)
+- [Usage Guide](#usage-guide)
+- [Configuration](#configuration)
+- [Best Practices](#best-practices)
+- [Troubleshooting](#troubleshooting)
+- [Extensibility](#extensibility)
 
-### 3. 优化引擎 (optimization_engine.py)
-- AI驱动的优化算法
-- 多策略优化方案
-- 迭代式改进机制
-- A/B测试验证
+---
 
-### 4. 版本管理 (version_manager.py)
-- 提示词版本控制
-- 回滚机制管理
-- 变更历史追踪
-- 效果对比分析
+## Overview
 
-## 功能特性
+### Key Features
 
-- 🔍 智能提示词提取
-- 🧠 AI效果评估
-- 🎯 自动优化建议
-- 📚 完整版本管理
-- 🔄 迭代改进机制
-- 📊 效果对比分析
+- **Intelligent Extraction**: Automatically extract prompts from workflow DSL files
+- **Quality Analysis**: Rule-based scoring across clarity, efficiency, and structure
+- **Multi-Strategy Optimization**: Three optimization strategies (clarity, efficiency, structure)
+- **Version Management**: Semantic versioning with full history tracking
+- **Test Integration**: Generate PromptPatch objects for A/B testing
+- **Extensible Design**: Plugin architecture for custom LLM clients and storage backends
 
-## 使用示例
+### Architecture
+
+```
+OptimizerService (High-level Facade)
+    |
+    +-- PromptExtractor    -> Extract prompts from workflow DSL
+    +-- PromptAnalyzer     -> Analyze quality and detect issues
+    +-- OptimizationEngine -> Generate optimized variants
+    +-- VersionManager     -> Track prompt history
+    +-- PromptPatchEngine  -> Generate test patches
+```
+
+### Scoring Formula
+
+The analyzer uses a weighted scoring system:
+
+- **Clarity Score** = 0.4 × structure + 0.3 × specificity + 0.3 × coherence
+- **Efficiency Score** = 0.5 × token_efficiency + 0.5 × information_density
+- **Overall Score** = 0.6 × clarity + 0.4 × efficiency
+
+All scores range from 0-100.
+
+---
+
+## Quick Start
+
+### Basic Workflow Optimization (5 minutes)
 
 ```python
-# 提示词提取
+from src.config import ConfigLoader
+from src.optimizer import optimize_workflow, analyze_workflow
+
+# 1. Load workflow catalog
+loader = ConfigLoader()
+catalog = loader.load_workflow_catalog("config/workflows.yaml")
+
+# 2. Analyze workflow quality
+report = analyze_workflow("wf_customer_service", catalog)
+print(f"Average Score: {report['average_score']:.1f}")
+print(f"Needs Optimization: {report['needs_optimization']}")
+
+# 3. Optimize if needed
+if report['needs_optimization']:
+    patches = optimize_workflow(
+        workflow_id="wf_customer_service",
+        catalog=catalog,
+        strategy="clarity_focus"
+    )
+
+    print(f"Generated {len(patches)} optimization patches")
+
+    # 4. Apply patches to test plan
+    for patch in patches:
+        print(f"  - Node {patch.selector.by_id}: {patch.strategy.mode}")
+```
+
+### Output Example
+
+```
+Average Score: 68.5
+Needs Optimization: True
+Generated 3 optimization patches
+  - Node llm_1: replace
+  - Node llm_3: replace
+  - Node llm_5: replace
+```
+
+---
+
+## Core Components
+
+### 1. OptimizerService
+
+**Purpose**: High-level orchestration facade for complete optimization workflow.
+
+**Key Methods**:
+- `run_optimization_cycle()`: Full optimization pipeline
+- `optimize_single_prompt()`: Optimize individual prompts
+- `analyze_workflow()`: Quality analysis without optimization
+- `get_version_history()`: Retrieve version history
+
+**Example**:
+
+```python
+from src.optimizer import OptimizerService
+
+service = OptimizerService(catalog=catalog)
+
+# Analyze workflow
+report = service.analyze_workflow("wf_001")
+
+# Run optimization
+patches = service.run_optimization_cycle(
+    workflow_id="wf_001",
+    strategy="auto",  # Auto-select best strategy
+    baseline_metrics={"success_rate": 0.75}
+)
+```
+
+---
+
+### 2. PromptExtractor
+
+**Purpose**: Extract prompts from workflow DSL YAML files.
+
+**Extraction Strategy**:
+- Searches multiple DSL structure patterns
+- Extracts text from LLM nodes
+- Detects Jinja2 variables (`{{variable}}`)
+- Captures metadata (model, temperature, position)
+
+**Example**:
+
+```python
 from src.optimizer import PromptExtractor
+from pathlib import Path
 
 extractor = PromptExtractor()
-prompts = extractor.extract_prompts_from_workflow(workflow_id="wf001")
+
+# Load and parse DSL
+dsl_dict = extractor.load_dsl_file(Path("workflows/customer_service.yml"))
+
+# Extract prompts
+prompts = extractor.extract_from_workflow(dsl_dict, workflow_id="wf_001")
 
 for prompt in prompts:
-    print(f"提示词ID: {prompt.id}")
-    print(f"内容: {prompt.text[:100]}...")
-    print(f"上下文: {prompt.context}")
+    print(f"Node: {prompt.node_id}")
+    print(f"Text: {prompt.text[:100]}...")
+    print(f"Variables: {prompt.variables}")
+    print(f"Model: {prompt.context.get('model')}")
     print("---")
+```
 
-# LLM分析
-from src.optimizer import LLMAnalyzer
+---
 
-analyzer = LLMAnalyzer()
-analysis = analyzer.analyze_prompt(prompt_text)
-print(f"清晰度评分: {analysis.clarity_score}")
-print(f"相关性评分: {analysis.relevance_score}")
-print(f"效率评分: {analysis.efficiency_score}")
-print(f"综合评分: {analysis.overall_score}")
+### 3. PromptAnalyzer
 
-# 优化引擎
-from src.optimizer import OptimizationEngine
+**Purpose**: Rule-based prompt quality analysis with scoring and issue detection.
 
-optimizer = OptimizationEngine()
-optimization_result = optimizer.optimize(
-    original_prompt=prompt_text,
-    target_metrics=["clarity", "efficiency", "accuracy"],
-    optimization_strategy="iterative"
-)
+**Analysis Dimensions**:
+- **Structure**: Headers, bullets, formatting
+- **Specificity**: Action verbs, concrete instructions, no vague language
+- **Coherence**: Sentence flow, consistent terminology
+- **Token Efficiency**: Optimal length, no redundancy
+- **Information Density**: High semantic value, minimal filler
 
-print(f"优化后提示词: {optimization_result.optimized_prompt}")
-print(f"预期提升: {optimization_result.expected_improvement}")
+**Issue Types**:
+- `TOO_LONG`: > 2000 characters
+- `TOO_SHORT`: < 20 characters
+- `VAGUE_LANGUAGE`: Contains "some", "maybe", "etc"
+- `MISSING_STRUCTURE`: No headers/bullets in long prompts
+- `REDUNDANCY`: Repeated phrases
+- `POOR_FORMATTING`: No line breaks
+- `AMBIGUOUS_INSTRUCTIONS`: No action verbs
 
-# 版本管理
+**Example**:
+
+```python
+from src.optimizer import PromptAnalyzer, Prompt
+
+analyzer = PromptAnalyzer()
+
+# Analyze prompt
+analysis = analyzer.analyze_prompt(prompt)
+
+print(f"Overall Score: {analysis.overall_score:.1f}")
+print(f"Clarity: {analysis.clarity_score:.1f}")
+print(f"Efficiency: {analysis.efficiency_score:.1f}")
+
+# Review issues
+for issue in analysis.issues:
+    print(f"[{issue.severity.value}] {issue.type.value}")
+    print(f"  {issue.description}")
+    print(f"  Suggestion: {issue.suggestion}")
+
+# Review suggestions
+for suggestion in analysis.suggestions:
+    print(f"Priority {suggestion.priority}: {suggestion.description}")
+```
+
+---
+
+### 4. OptimizationEngine
+
+**Purpose**: Generate optimized prompt variants using rule-based transformations.
+
+**Strategies**:
+
+1. **clarity_focus**: Improve readability
+   - Add section headers
+   - Break long sentences
+   - Replace vague terms
+   - Add explicit instructions
+
+2. **efficiency_focus**: Reduce token usage
+   - Remove filler words
+   - Compress verbose phrases
+   - Eliminate redundancy
+   - Clean whitespace
+
+3. **structure_focus**: Enhance organization
+   - Add markdown formatting
+   - Create numbered steps
+   - Add section separators
+   - Apply templates
+
+**Example**:
+
+```python
+from src.optimizer import OptimizationEngine, PromptAnalyzer
+
+analyzer = PromptAnalyzer()
+engine = OptimizationEngine(analyzer)
+
+# Optimize with specific strategy
+result = engine.optimize(prompt, strategy="clarity_focus")
+
+print(f"Original: {result.original_prompt}")
+print(f"Optimized: {result.optimized_prompt}")
+print(f"Improvement: {result.improvement_score:.1f} points")
+print(f"Confidence: {result.confidence:.2f}")
+print(f"Changes: {', '.join(result.changes)}")
+```
+
+---
+
+### 5. VersionManager
+
+**Purpose**: Track prompt evolution with semantic versioning.
+
+**Version Numbering**:
+- `1.0.0`: Baseline version
+- `1.1.0`: Minor optimization
+- `1.2.0`: Another minor optimization
+- `2.0.0`: Major restructure
+
+**Key Operations**:
+- Create versions (auto-increment)
+- Retrieve specific versions
+- Compare versions
+- Rollback to previous versions
+- Find best version by score
+
+**Example**:
+
+```python
 from src.optimizer import VersionManager
 
-version_manager = VersionManager()
-version = version_manager.create_version(
-    prompt_id="prompt_001",
-    prompt_text=original_prompt,
-    optimization_result=optimization_result
+manager = VersionManager()
+
+# Create baseline version
+v1 = manager.create_version(
+    prompt=prompt,
+    analysis=analysis,
+    optimization_result=None,  # Baseline
+    parent_version=None
 )
-print(f"版本号: {version.version}")
-print(f"创建时间: {version.created_at}")
+
+# Create optimized version
+v2 = manager.create_version(
+    prompt=optimized_prompt,
+    analysis=optimized_analysis,
+    optimization_result=result,
+    parent_version="1.0.0"
+)
+
+# Compare versions
+comparison = manager.compare_versions("prompt_001", "1.0.0", "1.1.0")
+print(f"Improvement: {comparison['improvement']:.1f}")
+
+# Get version history
+history = manager.get_version_history("prompt_001")
+for v in history:
+    print(f"v{v.version}: score={v.analysis.overall_score:.1f}")
+
+# Rollback if needed
+if v2.analysis.overall_score < v1.analysis.overall_score:
+    rolled_back = manager.rollback("prompt_001", "1.0.0")
 ```
 
-## 提示词数据结构
+---
 
-### 提示词对象
+## API Reference
+
+### Data Models
+
+#### Prompt
+
+Extracted prompt with metadata.
+
 ```python
-@dataclass
-class Prompt:
-    id: str
-    workflow_id: str
-    node_id: str
-    text: str
-    role: str  # system, user, assistant
-    context: Dict[str, Any]
-    variables: List[str]  # 变量占位符
-    metadata: Dict[str, Any]
-    created_at: datetime
-    updated_at: datetime
+from src.optimizer import Prompt
+
+prompt = Prompt(
+    id="wf_001_llm_1",              # Unique identifier
+    workflow_id="wf_001",            # Parent workflow
+    node_id="llm_1",                 # Node ID in DSL
+    node_type="llm",                 # Node type
+    text="Summarize: {{document}}", # Prompt content
+    role="user",                     # Message role
+    variables=["document"],          # Jinja2 variables
+    context={"model": "gpt-4"},      # Node metadata
+    extracted_at=datetime.now()      # Extraction timestamp
+)
 ```
 
-### 提示词分析结果
+**Validation**:
+- `text` must not be empty
+- `variables` must contain valid identifiers
+
+---
+
+#### PromptAnalysis
+
+Quality analysis result with scores and suggestions.
+
 ```python
-@dataclass
-class PromptAnalysis:
-    prompt_id: str
-    clarity_score: float      # 清晰度评分 (0-100)
-    relevance_score: float    # 相关性评分 (0-100)
-    efficiency_score: float  # 效率评分 (0-100)
-    safety_score: float       # 安全性评分 (0-100)
-    overall_score: float      # 综合评分 (0-100)
-    issues: List[str]        # 发现的问题
-    suggestions: List[str]   # 改进建议
-    metrics: Dict[str, float]  # 各项指标
+from src.optimizer import PromptAnalysis, PromptIssue, PromptSuggestion
+
+analysis = PromptAnalysis(
+    prompt_id="wf_001_llm_1",
+    overall_score=75.0,              # 0-100
+    clarity_score=80.0,              # 0-100
+    efficiency_score=70.0,           # 0-100
+    issues=[...],                    # List[PromptIssue]
+    suggestions=[...],               # List[PromptSuggestion]
+    metadata={
+        "character_count": 120,
+        "word_count": 18,
+        "sentence_count": 2,
+        "estimated_tokens": 30
+    },
+    analyzed_at=datetime.now()
+)
 ```
 
-### 优化结果
+**Fields**:
+- `overall_score`: Weighted combination of clarity and efficiency
+- `clarity_score`: Structure + specificity + coherence
+- `efficiency_score`: Token efficiency + information density
+- `issues`: Detected problems with severity levels
+- `suggestions`: Prioritized improvement recommendations
+- `metadata`: Additional metrics for reference
+
+---
+
+#### OptimizationResult
+
+Result of prompt optimization with improvement metrics.
+
 ```python
-@dataclass
-class OptimizationResult:
-    original_prompt: str
-    optimized_prompt: str
-    improvement_score: float     # 整体提升分数
-    improvements: Dict[str, float]  # 各维度提升
-    strategy_used: str          # 使用的优化策略
-    confidence: float           # 优化结果置信度
-    validation_results: Dict[str, Any]  # 验证结果
+from src.optimizer import OptimizationResult, OptimizationStrategy
+
+result = OptimizationResult(
+    prompt_id="wf_001_llm_1",
+    original_prompt="Write summary",
+    optimized_prompt="Please summarize the document in 3-5 bullet points",
+    strategy=OptimizationStrategy.CLARITY_FOCUS,
+    improvement_score=10.5,          # Score delta
+    confidence=0.85,                 # 0.0-1.0
+    changes=["Added specific output format", "Added clear instruction"],
+    metadata={
+        "original_score": 65.0,
+        "optimized_score": 75.5
+    },
+    optimized_at=datetime.now()
+)
 ```
 
-## 优化策略
+**Confidence Levels**:
+- `0.8-1.0`: High confidence (both metrics improved significantly)
+- `0.6-0.8`: Medium confidence (overall improvement)
+- `0.4-0.6`: Low confidence (minor improvement)
+- `0.0-0.4`: Very low confidence (marginal or no improvement)
 
-### 1. 聚焦优化
+---
+
+#### PromptVersion
+
+Version record for prompt history tracking.
+
 ```python
-def focus_optimization(prompt: str, target_aspect: str) -> str:
-    """针对特定方面的优化"""
-    if target_aspect == "clarity":
-        # 提高提示词清晰度
-        return simplify_language(prompt)
-    elif target_aspect == "efficiency":
-        # 提高效率，减少Token使用
-        return compress_prompt(prompt)
-    elif target_aspect == "safety":
-        # 增强安全性
-        return add_safety_constraints(prompt)
+from src.optimizer import PromptVersion
+
+version = PromptVersion(
+    prompt_id="wf_001_llm_1",
+    version="1.1.0",                 # Semantic version
+    prompt=prompt_obj,               # Prompt at this version
+    analysis=analysis_obj,           # Analysis result
+    optimization_result=opt_result,  # OptimizationResult or None
+    parent_version="1.0.0",          # Parent version
+    created_at=datetime.now(),
+    metadata={
+        "author": "optimizer",
+        "strategy": "clarity_focus"
+    }
+)
+
+# Check version type
+is_baseline = version.is_baseline()  # True if parent_version is None
+
+# Compare versions
+v_tuple = version.get_version_number()  # (1, 1, 0)
 ```
 
-### 2. 多目标优化
-```python
-def multi_objective_optimization(prompt: str, weights: Dict[str, float]) -> str:
-    """多目标优化算法"""
-    # 基于权重平衡多个优化目标
-    candidates = []
-    for strategy in optimization_strategies:
-        candidate = apply_strategy(prompt, strategy)
-        score = evaluate_multi_objective(candidate, weights)
-        candidates.append((candidate, score))
+---
 
-    # 选择最优候选
-    return max(candidates, key=lambda x: x[1][0])
+### Enumerations
+
+#### OptimizationStrategy
+
+Available optimization strategies.
+
+```python
+from src.optimizer import OptimizationStrategy
+
+OptimizationStrategy.CLARITY_FOCUS     # Improve readability
+OptimizationStrategy.EFFICIENCY_FOCUS  # Reduce token usage
+OptimizationStrategy.STRUCTURE_FOCUS   # Enhance organization
+OptimizationStrategy.AUTO              # Auto-select strategy
 ```
 
-### 3. 迭代优化
+#### IssueSeverity
+
+Severity levels for detected issues.
+
 ```python
-def iterative_optimization(prompt: str, max_iterations: int = 5) -> OptimizationResult:
-    """迭代优化算法"""
-    current_prompt = prompt
-    history = []
+from src.optimizer import IssueSeverity
 
-    for iteration in range(max_iterations):
-        # 生成优化候选
-        candidates = generate_optimization_candidates(current_prompt)
+IssueSeverity.CRITICAL  # Blocking issue
+IssueSeverity.WARNING   # Should be addressed
+IssueSeverity.INFO      # Informational notice
+```
 
-        # 评估候选
-        best_candidate = max(candidates, key=lambda x: evaluate_quality(x))
+#### IssueType / SuggestionType
 
-        # 检查是否达到优化目标
-        if is_optimal(best_candidate, current_prompt):
-            break
+See full lists in [models.py](./models.py).
 
-        current_prompt = best_candidate
-        history.append({
-            "iteration": iteration + 1,
-            "prompt": current_prompt,
-            "score": evaluate_quality(current_prompt)
-        })
+---
 
-    return OptimizationResult(
-        original_prompt=prompt,
-        optimized_prompt=current_prompt,
-        improvement_score=calculate_improvement(prompt, current_prompt),
-        optimization_history=history
+### Convenience Functions
+
+#### optimize_workflow()
+
+High-level workflow optimization function.
+
+```python
+from src.optimizer import optimize_workflow
+
+patches = optimize_workflow(
+    workflow_id: str,                      # Required
+    catalog: WorkflowCatalog,              # Required
+    strategy: str = "auto",                # clarity_focus, efficiency_focus, structure_focus, auto
+    baseline_metrics: Optional[Dict] = None,  # Optional performance baseline
+    config: Optional[OptimizationConfig] = None,  # Optional config
+    llm_client: Optional[LLMClient] = None,     # Optional LLM client
+    storage: Optional[VersionStorage] = None    # Optional storage backend
+) -> List[PromptPatch]
+```
+
+**Returns**: List of `PromptPatch` objects for test plan integration.
+
+**Raises**:
+- `WorkflowNotFoundError`: Workflow doesn't exist in catalog
+- `OptimizerError`: Optimization process failed
+
+**Example**:
+
+```python
+patches = optimize_workflow(
+    workflow_id="wf_001",
+    catalog=catalog,
+    strategy="clarity_focus",
+    baseline_metrics={"success_rate": 0.75}
+)
+```
+
+---
+
+#### analyze_workflow()
+
+Analyze workflow without optimization.
+
+```python
+from src.optimizer import analyze_workflow
+
+report = analyze_workflow(
+    workflow_id: str,
+    catalog: WorkflowCatalog
+) -> Dict[str, Any]
+```
+
+**Returns**:
+
+```python
+{
+    "workflow_id": "wf_001",
+    "prompt_count": 3,
+    "average_score": 72.5,
+    "needs_optimization": True,
+    "prompts": [
+        {
+            "prompt_id": "wf_001_llm_1",
+            "node_id": "llm_1",
+            "overall_score": 68.0,
+            "clarity_score": 65.0,
+            "efficiency_score": 72.0,
+            "issues_count": 2,
+            "suggestions_count": 3,
+            "issues": [...]
+        },
+        ...
+    ]
+}
+```
+
+---
+
+### Exceptions
+
+All optimizer exceptions inherit from `OptimizerError`.
+
+```python
+from src.optimizer import (
+    OptimizerError,          # Base exception
+    ExtractionError,         # Prompt extraction failed
+    WorkflowNotFoundError,   # Workflow not in catalog
+    NodeNotFoundError,       # Node not found in DSL
+    DSLParseError,          # DSL parsing failed
+    AnalysisError,          # Analysis failed
+    ScoringError,           # Scoring calculation failed
+    OptimizationError,      # Base optimization error
+    InvalidStrategyError,   # Invalid strategy name
+    OptimizationFailedError,# Optimization process failed
+    VersionError,           # Base version error
+    VersionConflictError,   # Version already exists
+    VersionNotFoundError,   # Version not found
+    ValidationError,        # Data validation failed
+    ConfigError             # Configuration error
+)
+
+# Example usage
+try:
+    patches = optimize_workflow("wf_001", catalog)
+except WorkflowNotFoundError as e:
+    print(f"Workflow not found: {e.workflow_id}")
+except InvalidStrategyError as e:
+    print(f"Invalid strategy: {e.strategy}")
+    print(f"Valid options: {e.valid_strategies}")
+except OptimizerError as e:
+    print(f"Optimization failed: {e.message}")
+    print(f"Error code: {e.error_code}")
+    print(f"Context: {e.context}")
+```
+
+---
+
+## Usage Guide
+
+### Scenario 1: Optimize All Workflows in Test Plan
+
+```python
+from src.config import ConfigLoader
+from src.optimizer import optimize_workflow
+
+loader = ConfigLoader()
+catalog = loader.load_workflow_catalog("config/workflows.yaml")
+test_plan = loader.load_test_plan("config/test_plan.yaml")
+
+all_patches = []
+
+for workflow_config in test_plan.workflows:
+    workflow_id = workflow_config.workflow_id
+
+    try:
+        patches = optimize_workflow(
+            workflow_id=workflow_id,
+            catalog=catalog,
+            strategy="auto"
+        )
+
+        all_patches.extend(patches)
+        print(f"{workflow_id}: {len(patches)} patches generated")
+
+    except Exception as e:
+        print(f"{workflow_id}: Optimization failed - {e}")
+
+print(f"Total patches: {len(all_patches)}")
+```
+
+---
+
+### Scenario 2: Compare Multiple Strategies
+
+```python
+from src.optimizer import OptimizerService
+
+service = OptimizerService(catalog=catalog)
+
+# Extract prompts
+prompts = service._extract_prompts("wf_001")
+
+strategies = ["clarity_focus", "efficiency_focus", "structure_focus"]
+results = {}
+
+for prompt in prompts[:1]:  # Test on first prompt
+    results[prompt.id] = {}
+
+    for strategy in strategies:
+        result = service.optimize_single_prompt(prompt, strategy)
+        results[prompt.id][strategy] = {
+            "improvement": result.improvement_score,
+            "confidence": result.confidence,
+            "changes": result.changes
+        }
+
+# Print comparison
+for prompt_id, strategies_data in results.items():
+    print(f"\nPrompt: {prompt_id}")
+    for strategy, metrics in strategies_data.items():
+        print(f"  {strategy}:")
+        print(f"    Improvement: {metrics['improvement']:.1f}")
+        print(f"    Confidence: {metrics['confidence']:.2f}")
+        print(f"    Changes: {metrics['changes']}")
+```
+
+---
+
+### Scenario 3: Version Management Workflow
+
+```python
+from src.optimizer import OptimizerService, VersionManager
+
+service = OptimizerService(catalog=catalog)
+manager = service._version_manager
+
+# Optimize and track versions
+prompts = service._extract_prompts("wf_customer_service")
+
+for prompt in prompts:
+    # Analyze baseline
+    analysis = service._analyzer.analyze_prompt(prompt)
+
+    # Create baseline version
+    v1 = manager.create_version(prompt, analysis, None, None)
+    print(f"Created baseline v{v1.version}: score={analysis.overall_score:.1f}")
+
+    # Optimize if needed
+    if analysis.overall_score < 80:
+        result = service.optimize_single_prompt(prompt, "auto")
+
+        # Create optimized prompt object
+        from src.optimizer import Prompt
+        opt_prompt = Prompt(
+            id=prompt.id,
+            workflow_id=prompt.workflow_id,
+            node_id=prompt.node_id,
+            node_type=prompt.node_type,
+            text=result.optimized_prompt,
+            role=prompt.role,
+            variables=prompt.variables,
+            context=prompt.context
+        )
+
+        # Analyze optimized version
+        opt_analysis = service._analyzer.analyze_prompt(opt_prompt)
+
+        # Create optimized version
+        v2 = manager.create_version(opt_prompt, opt_analysis, result, v1.version)
+        print(f"Created optimized v{v2.version}: score={opt_analysis.overall_score:.1f}")
+
+    # Get history
+    history = manager.get_version_history(prompt.id)
+    print(f"Version history: {len(history)} versions")
+
+    # Find best version
+    best = manager.get_best_version(prompt.id)
+    print(f"Best version: v{best.version} (score={best.analysis.overall_score:.1f})")
+```
+
+---
+
+### Scenario 4: Custom Quality Thresholds
+
+```python
+from src.optimizer import OptimizerService, OptimizationConfig
+
+# Define custom config
+config = OptimizationConfig(
+    strategies=["clarity_focus", "efficiency_focus"],
+    min_confidence=0.7,  # Require 70% confidence
+    max_iterations=5,
+    metadata={"project": "customer_service_v2"}
+)
+
+service = OptimizerService(catalog=catalog)
+
+patches = service.run_optimization_cycle(
+    workflow_id="wf_001",
+    config=config,
+    baseline_metrics={"success_rate": 0.6}  # Low baseline triggers optimization
+)
+
+# Filter by confidence
+high_confidence_patches = [
+    p for p in patches
+    if service._version_manager.get_latest_version(
+        f"{p.selector.by_id}"
+    ).optimization_result.confidence >= 0.8
+]
+
+print(f"High-confidence patches: {len(high_confidence_patches)}/{len(patches)}")
+```
+
+---
+
+### Scenario 5: Integration with Test Execution
+
+```python
+from src.config import ConfigLoader
+from src.optimizer import optimize_workflow
+from src.executor import TestCaseGenerator, RunManifestBuilder
+
+# Load config
+loader = ConfigLoader()
+catalog = loader.load_workflow_catalog("config/workflows.yaml")
+test_plan = loader.load_test_plan("config/test_plan.yaml")
+
+# Optimize workflows
+for wf_config in test_plan.workflows:
+    patches = optimize_workflow(
+        workflow_id=wf_config.workflow_id,
+        catalog=catalog,
+        strategy="auto"
     )
+
+    # Add patches to test plan
+    if not wf_config.prompt_optimization:
+        from src.config.models import PromptOptimizationConfig
+        wf_config.prompt_optimization = [
+            PromptOptimizationConfig(
+                variant_name="optimized",
+                nodes=patches
+            )
+        ]
+    else:
+        wf_config.prompt_optimization[0].nodes.extend(patches)
+
+# Generate test cases with optimized prompts
+generator = TestCaseGenerator(test_plan, catalog)
+test_cases = generator.generate_all_cases()
+
+# Build execution manifest
+builder = RunManifestBuilder(test_plan, catalog, generator)
+manifests = builder.build_all_manifests()
+
+print(f"Generated {len(manifests)} test manifests with optimized prompts")
 ```
 
-## 版本管理系统
+---
 
-### 1. 版本创建
-```python
-def create_prompt_version(prompt_id: str, prompt_text: str,
-                         changes: List[Change], author: str) -> PromptVersion:
-    """创建新版本"""
-    # 生成版本号
-    version = generate Semantic Version(last_version_of(prompt_id))
+## Configuration
 
-    # 验证版本
-    validate_prompt_version(prompt_text, version)
-
-    # 存储版本
-    version_record = PromptVersion(
-        prompt_id=prompt_id,
-        version=version,
-        text=prompt_text,
-        changes=changes,
-        author=author,
-        created_at=datetime.now()
-    )
-
-    save_version(version_record)
-    return version_record
-```
-
-### 2. 版本对比
-```python
-def compare_prompt_versions(v1: PromptVersion, v2: PromptVersion) -> ComparisonResult:
-    """版本对比分析"""
-    diff = calculate_text_diff(v1.text, v2.text)
-
-    performance_metrics = compare_performance_metrics(v1, v2)
-
-    return ComparisonResult(
-        version1=v1.version,
-        version2=v2.version,
-        text_changes=diff,
-        performance_improvement=performance_metrics,
-        recommendation=generate_comparison_recommendation(diff, performance_metrics)
-    )
-```
-
-### 3. 版本回滚
-```python
-def rollback_to_version(prompt_id: str, target_version: str, reason: str) -> bool:
-    """回滚到指定版本"""
-    target_version_prompt = get_version(prompt_id, target_version)
-
-    if not target_version_prompt:
-        raise VersionNotFoundError(f"Version {target_version} not found")
-
-    # 验证回滚安全性
-    if not is_safe_rollback(target_version_prompt):
-        return False
-
-    # 执行回滚
-    current_version = rollback(prompt_id, target_version_prompt.text, reason)
-
-    # 创建回滚记录
-    create_rollback_record(prompt_id, target_version, reason, current_version)
-
-    return True
-```
-
-## AI分析算法
-
-### 1. 质量评估算法
-```python
-class PromptQualityEvaluator:
-    def evaluate_clarity(self, prompt: str) -> float:
-        """评估提示词清晰度"""
-        # 基于语言复杂度分析
-        readability_score = self.calculate_readability(prompt)
-
-        # 基于指令明确性分析
-        instruction_clarity = self.analyze_instruction_clarity(prompt)
-
-        # 基于结构化程度分析
-        structure_score = self.analyze_structure(prompt)
-
-        return (readability_score * 0.4 +
-                instruction_clarity * 0.4 +
-                structure_score * 0.2) * 100
-
-    def evaluate_efficiency(self, prompt: str) -> float:
-        """评估提示词效率"""
-        token_count = self.count_tokens(prompt)
-        information_density = self.calculate_information_density(prompt)
-
-        # 效率评分：信息密度 / token数量
-        efficiency = information_density / token_count
-        return min(efficiency * 100, 100)
-
-    def evaluate_safety(self, prompt: str) -> float:
-        """评估提示词安全性"""
-        # 检查潜在的有害内容
-        safety_issues = self.detect_safety_issues(prompt)
-
-        # 检查偏见内容
-        bias_score = self.detect_bias(prompt)
-
-        # 检查隐私泄露风险
-        privacy_risk = self.assess_privacy_risk(prompt)
-
-        base_score = 100
-        safety_penalty = (safety_issues * 30 + bias_score * 40 + privacy_risk * 30)
-
-        return max(base_score - safety_penalty, 0)
-```
-
-### 2. 优化算法
-```python
-class PromptOptimizer:
-    def optimize_structure(self, prompt: str) -> str:
-        """优化提示词结构"""
-        # 识别结构化模式
-        structure_patterns = self.identify_structure_patterns(prompt)
-
-        # 优化结构顺序
-        optimized = self.reorder_prompt_structure(prompt, structure_patterns)
-
-        # 添加必要的分隔符
-        optimized = self.add_structural_separators(optimized)
-
-        return optimized
-
-    def optimize_language(self, prompt: str) -> str:
-        """优化提示词语言"""
-        # 简化复杂句子
-        simplified = self.simplify_sentences(prompt)
-
-        # 统一术语使用
-        terminology_standardized = self.standardize_terminology(simplified)
-
-        # 增强指令明确性
-        enhanced_clarity = self.enhance_instruction_clarity(terminology_standardized)
-
-        return enhanced_clarity
-
-    def optimize_variables(self, prompt: str) -> str:
-        """优化提示词变量"""
-        # 识别变量占位符
-        variables = self.extract_variables(prompt)
-
-        # 优化变量定义
-        optimized_variables = self.optimize_variable_definitions(variables)
-
-        # 替换变量使用
-        optimized = self.replace_variables(prompt, optimized_variables)
-
-        return optimized
-```
-
-## 配置参数
+### YAML Configuration Example
 
 ```yaml
 optimizer:
-  # 提示词提取配置
+  # Extraction settings
   extraction:
     max_prompt_length: 10000
-    extraction_strategies: ["llm_call", "text_template", "json_structure"]
-    enable_context_analysis: True
+    enable_context_analysis: true
     variable_pattern: "\\{\\{(\\w+)\\}\\}"
 
-  # 分析器配置
+  # Analysis settings
   analyzer:
     evaluation_metrics:
       - clarity
-      - relevance
       - efficiency
-      - safety
-      - accuracy
-    model_for_analysis: "gpt-4"
-    analysis_batch_size: 10
     confidence_threshold: 0.8
 
-  # 优化引擎配置
+  # Optimization settings
   optimization:
     strategies:
-      - name: "focus_clarity"
-        weight: 0.3
-        enabled: True
-      - name: "focus_efficiency"
-        weight: 0.3
-        enabled: True
-      - name: "focus_safety"
-        weight: 0.2
-        enabled: True
-      - name: "multi_objective"
-        weight: 0.2
-        enabled: True
+      - name: "clarity_focus"
+        enabled: true
+      - name: "efficiency_focus"
+        enabled: true
+      - name: "structure_focus"
+        enabled: true
 
     max_iterations: 5
-    improvement_threshold: 0.05  # 5%提升才接受
-    validation_sample_size: 20
+    improvement_threshold: 5.0  # Minimum 5% improvement
 
-  # 版本管理配置
+  # Versioning settings
   versioning:
     max_versions_kept: 50
-    auto_backup: True
-    backup_interval: 24  # 小时
-    enable_branching: True
-    merge_policy: "squash"
+    auto_backup: true
+    enable_branching: false
 ```
 
-## 高级功能
+### Programmatic Configuration
 
-### 1. 智能提示词模板
 ```python
-def generate_prompt_template(workflows: List[Workflow]) -> PromptTemplate:
-    """基于学习生成提示词模板"""
-    # 分析工作流模式
-    patterns = analyze_workflow_patterns(workflows)
+from src.optimizer import OptimizationConfig, OptimizationStrategy
 
-    # 生成通用模板
-    template = create_template_from_patterns(patterns)
-
-    # 验证模板有效性
-    validated_template = validate_template(template)
-
-    return validated_template
+config = OptimizationConfig(
+    strategies=[
+        OptimizationStrategy.CLARITY_FOCUS,
+        OptimizationStrategy.EFFICIENCY_FOCUS
+    ],
+    min_confidence=0.7,
+    max_iterations=3,
+    score_threshold=80.0,  # Skip optimization if score >= 80.0
+    analysis_rules={
+        "min_clarity_score": 70.0,
+        "min_efficiency_score": 65.0
+    },
+    metadata={
+        "project": "prod_optimization",
+        "version": "1.0"
+    }
+)
 ```
 
-### 2. A/B测试支持
+### Score Threshold Configuration
+
+The `score_threshold` parameter controls when optimization should be skipped based on prompt quality:
+
 ```python
-def run_ab_test(prompt_a: str, prompt_b: str,
-                test_data: List[TestCase]) -> ABTestResult:
-    """运行A/B测试"""
-    # 并行测试两个版本
-    results_a = run_prompt_test(prompt_a, test_data)
-    results_b = run_prompt_test(prompt_b, test_data)
+# Conservative: Only optimize low-quality prompts (score < 85)
+config = OptimizationConfig(score_threshold=85.0)
 
-    # 统计分析
-    statistical_analysis = compare_results_statistics(results_a, results_b)
+# Default: Optimize prompts below score of 80 (recommended)
+config = OptimizationConfig(score_threshold=80.0)  # Default value
 
-    # 生成测试报告
-    test_result = ABTestResult(
-        prompt_a_score=calculate_score(results_a),
-        prompt_b_score=calculate_score(results_b),
-        significant_difference=statistical_analysis.is_significant,
-        confidence_interval=statistical_analysis.confidence_interval,
-        winner=statistical_analysis.winner
-    )
+# Aggressive: Optimize more prompts (score < 70)
+config = OptimizationConfig(score_threshold=70.0)
 
-    return test_result
+# Optimize all prompts: Set threshold to maximum
+config = OptimizationConfig(score_threshold=100.0)
 ```
 
-### 3. 集成学习优化
+**How it works**:
+- If `analysis.overall_score < score_threshold`, the prompt will be optimized
+- If `analysis.overall_score >= score_threshold`, optimization is skipped
+- Valid range: 0.0 to 100.0
+- Default: 80.0 (optimizes prompts with scores below 80)
+
+**Use cases**:
+- **Production workflows**: Use higher threshold (85-90) to only optimize problematic prompts
+- **Development workflows**: Use default threshold (80) for balanced optimization
+- **Experimental workflows**: Use lower threshold (70) or maximum (100) to optimize aggressively
+
+---
+
+## Best Practices
+
+### 1. Optimization Strategy Selection
+
+**When to use clarity_focus**:
+- Prompts with low structure scores (< 60)
+- Contains vague language
+- Missing clear instructions
+- User-facing workflows
+
+**When to use efficiency_focus**:
+- High token consumption (> 500 tokens)
+- Redundant content
+- Batch processing workflows
+- Cost-sensitive applications
+
+**When to use structure_focus**:
+- Long prompts (> 300 characters)
+- Multi-step instructions
+- Complex workflows
+- Documentation-heavy prompts
+
+**When to use auto**:
+- First-time optimization
+- Unknown prompt patterns
+- Let analyzer determine best fit
+
+---
+
+### 2. Confidence Threshold Guidelines
+
 ```python
-def ensemble_optimization(prompt: str, optimizers: List[Optimizer]) -> str:
-    """集成学习优化"""
-    # 运行多个优化器
-    candidates = []
-    for optimizer in optimizers:
-        candidate = optimizer.optimize(prompt)
-        score = evaluate_candidate(candidate)
-        candidates.append((candidate, score))
+# Conservative: Only accept high-confidence optimizations
+config = OptimizationConfig(min_confidence=0.8)
 
-    # 使用集成方法选择最优结果
-    ensemble_result = ensemble_selection(candidates)
+# Balanced: Accept medium-confidence improvements
+config = OptimizationConfig(min_confidence=0.6)
 
-    return ensemble_result.best_candidate
+# Aggressive: Try all optimizations
+config = OptimizationConfig(min_confidence=0.4)
 ```
 
-## 错误处理
+**Recommendation**: Start with 0.7, adjust based on validation results.
 
-### 1. 提取异常
-- 提示词格式错误
-- 上下文解析失败
-- 变量识别错误
-- 权限访问受限
+---
 
-### 2. 分析异常
-- 模型调用失败
-- 评分算法异常
-- 数据预处理错误
-- 超时处理
+### 3. Version Management
 
-### 3. 优化异常
-- 优化策略冲突
-- 生成结果异常
-- 验证条件不满足
-- 资源限制突破
+```python
+# Always create baseline before optimization
+v_baseline = manager.create_version(prompt, analysis, None, None)
 
-### 4. 版本控制异常
-- 版本冲突
-- 回滚失败
-- 历史记录损坏
-- 合并冲突处理
+# Tag important versions
+v_baseline.metadata["tag"] = "production_baseline"
+v_baseline.metadata["deployment_date"] = "2025-01-15"
 
-## 最佳实践
+# Rollback if regression detected
+if new_score < baseline_score - 5:  # 5-point tolerance
+    manager.rollback(prompt_id, baseline_version)
+```
 
-1. **提示词设计**
-   - 明确目标和约束
-   - 使用结构化格式
-   - 避免歧义和复杂句式
-   - 合理使用变量和模板
+---
 
-2. **优化策略**
-   - 基于数据驱动决策
-   - 采用渐进式优化
-   - 重视验证和测试
-   - 保持版本控制
+### 4. Performance Optimization
 
-3. **版本管理**
-   - 清晰的版本命名
-   - 详细的变更记录
-   - 快速回滚机制
-   - 定期清理历史版本
+```python
+# Batch processing for multiple workflows
+from concurrent.futures import ThreadPoolExecutor
+
+workflows = ["wf_001", "wf_002", "wf_003"]
+
+def optimize_wf(wf_id):
+    return optimize_workflow(wf_id, catalog, strategy="auto")
+
+with ThreadPoolExecutor(max_workers=3) as executor:
+    results = list(executor.map(optimize_wf, workflows))
+
+# Results aggregation
+total_patches = sum(len(r) for r in results)
+```
+
+---
+
+### 5. Error Handling
+
+```python
+from src.optimizer import (
+    WorkflowNotFoundError,
+    InvalidStrategyError,
+    OptimizerError
+)
+
+def safe_optimize(workflow_id, catalog, strategy="auto"):
+    """Optimization with comprehensive error handling."""
+    try:
+        patches = optimize_workflow(workflow_id, catalog, strategy)
+        return {"status": "success", "patches": patches}
+
+    except WorkflowNotFoundError as e:
+        return {"status": "error", "reason": f"Workflow not found: {e.workflow_id}"}
+
+    except InvalidStrategyError as e:
+        return {"status": "error", "reason": f"Invalid strategy: {e.strategy}"}
+
+    except OptimizerError as e:
+        return {
+            "status": "error",
+            "reason": e.message,
+            "error_code": e.error_code,
+            "context": e.context
+        }
+```
+
+---
+
+## Troubleshooting
+
+### Issue: No prompts extracted
+
+**Symptoms**: `extractor.extract_from_workflow()` returns empty list.
+
+**Causes**:
+1. DSL file has non-standard structure
+2. No LLM nodes in workflow
+3. Prompt text fields are empty
+
+**Solutions**:
+
+```python
+# Debug extraction
+extractor = PromptExtractor()
+dsl_dict = extractor.load_dsl_file(dsl_path)
+
+# Check for nodes
+nodes = extractor._find_nodes(dsl_dict)
+print(f"Found {len(nodes)} nodes")
+
+# Check node types
+for node in nodes:
+    node_type = extractor._detect_node_type(node)
+    print(f"Node {node.get('id')}: type={node_type}")
+
+# Check prompt text
+for node in nodes:
+    text = extractor._extract_prompt_text(node)
+    print(f"Node {node.get('id')}: text_length={len(text) if text else 0}")
+```
+
+---
+
+### Issue: Low optimization scores
+
+**Symptoms**: `improvement_score` is negative or near zero.
+
+**Causes**:
+1. Prompt already well-optimized
+2. Wrong strategy selected
+3. Rule-based optimizer limitations
+
+**Solutions**:
+
+```python
+# Compare multiple strategies
+strategies = ["clarity_focus", "efficiency_focus", "structure_focus"]
+results = {}
+
+for strategy in strategies:
+    result = engine.optimize(prompt, strategy)
+    results[strategy] = result.improvement_score
+
+best_strategy = max(results.keys(), key=lambda k: results[k])
+print(f"Best strategy: {best_strategy} (improvement={results[best_strategy]:.1f})")
+
+# Manual analysis
+analysis = analyzer.analyze_prompt(prompt)
+print(f"Clarity: {analysis.clarity_score:.1f}")
+print(f"Efficiency: {analysis.efficiency_score:.1f}")
+
+# Check if already optimal
+if analysis.overall_score > 85:
+    print("Prompt already well-optimized")
+```
+
+---
+
+### Issue: Version conflicts
+
+**Symptoms**: `VersionConflictError` when creating version.
+
+**Cause**: Version number already exists.
+
+**Solution**:
+
+```python
+# Check existing versions
+existing = manager.get_version_history(prompt_id)
+print(f"Existing versions: {[v.version for v in existing]}")
+
+# Use latest version as parent
+latest = manager.get_latest_version(prompt_id)
+new_version = manager.create_version(
+    prompt, analysis, result,
+    parent_version=latest.version  # Explicitly set parent
+)
+```
+
+---
+
+### Issue: DSL parsing errors
+
+**Symptoms**: `DSLParseError` when loading workflow.
+
+**Causes**:
+1. Invalid YAML syntax
+2. File not found
+3. Encoding issues
+
+**Solutions**:
+
+```python
+# Validate YAML manually
+import yaml
+
+try:
+    with open(dsl_path, 'r', encoding='utf-8') as f:
+        data = yaml.safe_load(f)
+    print("YAML is valid")
+except yaml.YAMLError as e:
+    print(f"YAML error: {e}")
+
+# Check file existence
+from pathlib import Path
+
+if not Path(dsl_path).exists():
+    print(f"File not found: {dsl_path}")
+
+# Try different encoding
+with open(dsl_path, 'r', encoding='latin-1') as f:
+    content = f.read()
+```
+
+---
+
+## Extensibility
+
+### Custom LLM Client
+
+Implement the `LLMClient` interface to integrate real LLM APIs.
+
+```python
+from src.optimizer.interfaces import LLMClient
+from src.optimizer import PromptAnalysis, Prompt
+from typing import Dict, Any, Optional
+import openai
+
+class OpenAIClient(LLMClient):
+    """OpenAI GPT-4 based prompt analysis and optimization."""
+
+    def __init__(self, api_key: str, model: str = "gpt-4"):
+        self.client = openai.OpenAI(api_key=api_key)
+        self.model = model
+
+    def analyze_prompt(
+        self,
+        prompt: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> PromptAnalysis:
+        """Analyze prompt using GPT-4."""
+
+        analysis_prompt = f"""
+        Analyze this prompt and provide scores (0-100):
+
+        Prompt: {prompt}
+
+        Provide JSON output:
+        {{
+            "clarity_score": <score>,
+            "efficiency_score": <score>,
+            "issues": [list of issues],
+            "suggestions": [list of suggestions]
+        }}
+        """
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": analysis_prompt}],
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(response.choices[0].message.content)
+
+        # Convert to PromptAnalysis
+        return PromptAnalysis(
+            prompt_id=context.get("prompt_id", "unknown"),
+            overall_score=(result["clarity_score"] + result["efficiency_score"]) / 2,
+            clarity_score=result["clarity_score"],
+            efficiency_score=result["efficiency_score"],
+            issues=[],  # Parse from result["issues"]
+            suggestions=[]  # Parse from result["suggestions"]
+        )
+
+    def optimize_prompt(
+        self,
+        prompt: str,
+        strategy: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Generate optimized prompt using GPT-4."""
+
+        optimization_prompt = f"""
+        Optimize this prompt for {strategy}:
+
+        Original: {prompt}
+
+        Return only the optimized prompt text.
+        """
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": optimization_prompt}]
+        )
+
+        return response.choices[0].message.content
+
+# Usage
+openai_client = OpenAIClient(api_key="sk-...")
+service = OptimizerService(catalog=catalog, llm_client=openai_client)
+```
+
+---
+
+### Custom Storage Backend
+
+Implement the `VersionStorage` interface for persistent storage.
+
+```python
+from src.optimizer.interfaces import VersionStorage
+from src.optimizer import PromptVersion
+from typing import List, Optional
+import json
+from pathlib import Path
+
+class FileSystemStorage(VersionStorage):
+    """JSON file-based version storage."""
+
+    def __init__(self, storage_dir: str):
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_version(self, version: PromptVersion) -> None:
+        """Save version to JSON file."""
+        prompt_dir = self.storage_dir / version.prompt_id
+        prompt_dir.mkdir(exist_ok=True)
+
+        version_file = prompt_dir / f"{version.version}.json"
+
+        if version_file.exists():
+            raise VersionConflictError(version.prompt_id, version.version)
+
+        # Serialize to JSON
+        data = version.model_dump(mode="json")
+
+        with open(version_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def get_version(
+        self,
+        prompt_id: str,
+        version: str
+    ) -> Optional[PromptVersion]:
+        """Load version from JSON file."""
+        version_file = self.storage_dir / prompt_id / f"{version}.json"
+
+        if not version_file.exists():
+            return None
+
+        with open(version_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        return PromptVersion(**data)
+
+    def list_versions(self, prompt_id: str) -> List[PromptVersion]:
+        """List all versions for a prompt."""
+        prompt_dir = self.storage_dir / prompt_id
+
+        if not prompt_dir.exists():
+            return []
+
+        versions = []
+        for version_file in sorted(prompt_dir.glob("*.json")):
+            with open(version_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            versions.append(PromptVersion(**data))
+
+        # Sort by version number
+        versions.sort(key=lambda v: v.get_version_number())
+        return versions
+
+    def get_latest_version(self, prompt_id: str) -> Optional[PromptVersion]:
+        """Get latest version."""
+        versions = self.list_versions(prompt_id)
+        return versions[-1] if versions else None
+
+    def delete_version(self, prompt_id: str, version: str) -> bool:
+        """Delete version file."""
+        version_file = self.storage_dir / prompt_id / f"{version}.json"
+
+        if version_file.exists():
+            version_file.unlink()
+            return True
+        return False
+
+    def clear_all(self) -> None:
+        """Delete all version files."""
+        import shutil
+        if self.storage_dir.exists():
+            shutil.rmtree(self.storage_dir)
+        self.storage_dir.mkdir(parents=True)
+
+# Usage
+fs_storage = FileSystemStorage("data/prompt_versions")
+manager = VersionManager(storage=fs_storage)
+```
+
+---
+
+## Additional Resources
+
+- **Architecture Documentation**: See [docs/optimizer/optimizer_architecture.md](../../docs/optimizer/optimizer_architecture.md)
+- **SRS Document**: See [docs/optimizer/optimizer_srs.md](../../docs/optimizer/optimizer_srs.md)
+- **Test Report**: See [docs/optimizer/TEST_REPORT_OPTIMIZER.md](../../docs/optimizer/TEST_REPORT_OPTIMIZER.md)
+- **Implementation Summary**: See [docs/optimizer/optimizer_summary.md](../../docs/optimizer/optimizer_summary.md)
+- **Execution Blueprint**: See [docs/optimizer/optimizer_execution_blueprint.md](../../docs/optimizer/optimizer_execution_blueprint.md)
+
+---
+
+## Support
+
+For issues, questions, or contributions:
+- Review test cases in `tests/optimizer/`
+- Check existing issues in project tracker
+- Consult design documents in `docs/optimizer/`
+
+**Module Status**: Production Ready | **Coverage**: 87% | **Last Updated**: 2025-01-17

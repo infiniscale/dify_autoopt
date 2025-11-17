@@ -411,12 +411,8 @@ class OptimizerService:
         Returns:
             True if optimization is recommended.
         """
-        # Default threshold
-        score_threshold = 80.0
-
-        # Use config threshold if provided
-        if config and hasattr(config, "improvement_threshold"):
-            score_threshold = 100.0 - config.improvement_threshold
+        # Use config threshold if provided, otherwise default
+        score_threshold = config.score_threshold if config else 80.0
 
         # Optimize if score is below threshold
         if analysis.overall_score < score_threshold:
