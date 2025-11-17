@@ -1,0 +1,51 @@
+prompts:
+  - id: prompt_001
+    text: "This is a very very very long and verbose prompt that contains a lot of unnecessary filler words and repetitive redundant content that makes it inefficient and hard to read."
+    expected_issues:
+      - vague_language
+      - redundancy
+
+  - id: prompt_002
+    text: "Short prompt"
+    expected_issues:
+      - too_short
+      - ambiguous_instructions
+
+  - id: prompt_003
+    text: "Tell me about it"
+    expected_issues:
+      - too_short
+      - vague_language
+      - ambiguous_instructions
+
+  - id: prompt_004
+    text: |
+      # Task
+
+      Summarize the following document in exactly 5 bullet points.
+
+      ## Requirements
+
+      1. Focus on key insights and main ideas
+      2. Use clear, concise language
+      3. Preserve factual accuracy
+      4. Maintain logical flow
+
+      ## Input
+
+      {{document}}
+
+      ## Output Format
+
+      - Bullet point 1: [key insight]
+      - Bullet point 2: [key insight]
+      - Bullet point 3: [key insight]
+      - Bullet point 4: [key insight]
+      - Bullet point 5: [key insight]
+    expected_issues: []
+
+  - id: prompt_005
+    text: "Maybe you could possibly do some stuff with these things, kind of sort them or whatever etc."
+    expected_issues:
+      - vague_language
+      - ambiguous_instructions

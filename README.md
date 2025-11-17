@@ -56,7 +56,7 @@ src/
 ├── optimizer/             # 智能优化模块（新增）
 │   ├── __init__.py
 │   ├── prompt_extractor.py # 提示词提取
-│   ├── llm_analyzer.py     # LLM分析器
+│   ├── prompt_analyzer.py  # Prompt质量分析器(规则+启发式)
 │   ├── optimization_engine.py # 优化引擎
 │   └── version_manager.py  # 版本管理
 ├── utils/                 # 通用工具模块
