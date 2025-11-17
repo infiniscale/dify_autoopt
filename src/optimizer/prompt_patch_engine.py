@@ -10,8 +10,18 @@ import logging
 from typing import Any, Dict, List, Optional
 from jinja2 import Template, TemplateError
 
-from ..config.models import PromptPatch, PromptSelector, PromptStrategy, WorkflowCatalog, NodeMeta
-from ..config.utils.exceptions import PatchTargetMissing, TemplateRenderError, DSLParseError
+from ..config.models import (
+    PromptPatch,
+    PromptSelector,
+    PromptStrategy,
+    WorkflowCatalog,
+    NodeMeta,
+)
+from ..config.utils.exceptions import (
+    PatchTargetMissing,
+    TemplateRenderError,
+    DSLParseError,
+)
 from ..config.utils.yaml_parser import YamlParser
 
 logger = logging.getLogger(__name__)
@@ -75,13 +85,15 @@ class PromptPatchEngine:
 
             # Handle missing targets
             if not node_paths:
-                if_missing = patch.selector.constraints.get('if_missing', 'skip')
-                if if_missing == 'error':
+                if_missing = patch.selector.constraints.get("if_missing", "skip")
+                if if_missing == "error":
                     raise PatchTargetMissing(
-                        f"No nodes matched selector: {patch.selector.dict()}"
+                        f"No nodes matched selector: {patch.selector.model_dump()}"
                     )
                 else:
-                    logger.warning(f"No nodes matched selector, skipping: {patch.selector.dict()}")
+                    logger.warning(
+                        f"No nodes matched selector, skipping: {patch.selector.model_dump()}"
+                    )
                     continue
 
             # Apply patch to each matching node
@@ -94,20 +106,18 @@ class PromptPatchEngine:
                 prompt_fields = self._get_prompt_fields(workflow_id, node_path)
 
                 for field_path in prompt_fields:
-                    original_prompt = self.yaml_parser.get_field_value(node, field_path) or ""
+                    original_prompt = (
+                        self.yaml_parser.get_field_value(node, field_path) or ""
+                    )
                     new_prompt = self._apply_strategy(
-                        original_prompt,
-                        patch.strategy,
-                        context
+                        original_prompt, patch.strategy, context
                     )
                     self.yaml_parser.set_field_value(node, field_path, new_prompt)
 
         return self.yaml_parser.dump(dsl_tree)
 
     def _resolve_selector(
-        self,
-        workflow_id: str,
-        selector: PromptSelector
+        self, workflow_id: str, selector: PromptSelector
     ) -> List[str]:
         """
         Resolve selector to list of node paths
@@ -139,7 +149,10 @@ class PromptPatchEngine:
 
             # Match by label (fuzzy)
             if selector.by_label:
-                if not node_meta.label or selector.by_label.lower() not in node_meta.label.lower():
+                if (
+                    not node_meta.label
+                    or selector.by_label.lower() not in node_meta.label.lower()
+                ):
                     continue
 
             matched_paths.append(node_meta.path)
@@ -154,10 +167,7 @@ class PromptPatchEngine:
         return []
 
     def _apply_strategy(
-        self,
-        original: str,
-        strategy: PromptStrategy,
-        context: Dict[str, Any]
+        self, original: str, strategy: PromptStrategy, context: Dict[str, Any]
     ) -> str:
         """
         Apply prompt modification strategy
@@ -174,22 +184,24 @@ class PromptPatchEngine:
             TemplateRenderError: If template rendering fails
         """
         try:
-            if strategy.mode == 'replace':
+            if strategy.mode == "replace":
                 return strategy.content or original
 
-            elif strategy.mode == 'prepend':
+            elif strategy.mode == "prepend":
                 if strategy.content:
                     return f"{strategy.content}\n\n{original}"
                 return original
 
-            elif strategy.mode == 'append':
+            elif strategy.mode == "append":
                 if strategy.content:
                     return f"{original}\n\n{strategy.content}"
                 return original
 
-            elif strategy.mode == 'template':
+            elif strategy.mode == "template":
                 if not strategy.template:
-                    raise TemplateRenderError("Template mode requires template configuration")
+                    raise TemplateRenderError(
+                        "Template mode requires template configuration"
+                    )
 
                 # Get template content
                 if strategy.template.file:
@@ -202,9 +214,7 @@ class PromptPatchEngine:
                 # Render template
                 template = Template(template_text)
                 rendered = template.render(
-                    original=original,
-                    **context,
-                    **strategy.template.variables
+                    original=original, **context, **strategy.template.variables
                 )
                 return rendered
 
@@ -228,8 +238,9 @@ class PromptPatchEngine:
         """Load template from file"""
         try:
             from pathlib import Path
+
             path = Path(file_path)
-            with open(path, 'r', encoding='utf-8') as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return f.read()
         except Exception as e:
             raise TemplateRenderError(f"Failed to load template file {file_path}: {e}")
