@@ -10,9 +10,9 @@ import logging
 import itertools
 from typing import Any, Dict, List, Optional
 
-from ..config.models import TestPlan, WorkflowCatalog, Dataset, InputParameter, TestCase
-from .pairwise_engine import PairwiseEngine
-from ..config.utils.exceptions import CaseGenerationError
+from src.config.models import TestPlan, WorkflowCatalog, Dataset, InputParameter, TestCase
+from src.executor.pairwise_engine import PairwiseEngine
+from src.config.utils.exceptions import CaseGenerationError
 
 logger = logging.getLogger(__name__)
 
@@ -215,13 +215,12 @@ class TestCaseGenerator:
             return param.values
 
         if param.range:
-            # Generate numeric range
-            import numpy as np
-            return list(np.arange(
-                param.range['min'],
-                param.range['max'] + param.range.get('step', 1),
-                param.range.get('step', 1)
-            ))
+            # Generate numeric range using standard library
+            start = param.range['min']
+            stop = param.range['max']
+            step = param.range.get('step', 1)
+            # Inclusive of stop, matching original np.arange(min, max + step, step)
+            return list(range(start, stop + step, step))
 
         if param.default is not None:
             return [param.default]

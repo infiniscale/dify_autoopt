@@ -12,7 +12,7 @@ import pickle
 from typing import Any, Dict, List, Optional, Sequence
 from pathlib import Path
 
-from ..config.utils.exceptions import CaseGenerationError
+from src.config.utils.exceptions import CaseGenerationError
 
 logger = logging.getLogger(__name__)
 

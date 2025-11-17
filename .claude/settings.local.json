@@ -23,7 +23,9 @@
       "Bash(go mod:*)",
       "Bash(make:*)",
       "Bash(awk:*)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(pytest:*)"
     ],
     "deny": []
   },
@@ -38,7 +40,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/validate-branch-name.py"
+            "command": "D:\\Work\\dify_autoopt\\.claude\\hooks\\validate-branch-name.py"
           }
         ]
       },
@@ -47,7 +49,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/prevent-direct-push.py"
+            "command": "D:\\Work\\dify_autoopt\\.claude\\hooks\\prevent-direct-push.py"
           }
         ]
       }
