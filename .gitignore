@@ -68,6 +68,7 @@ log/
 # Configuration files with secrets
 config/env_config.yaml
 config/*.secret.yaml
+config/llm.yaml  # LLM configuration (may contain API keys or sensitive settings)
 
 # Output and temporary files
 output/
