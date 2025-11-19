@@ -19,6 +19,7 @@ from .models import (
     PromptAnalysis,
     PromptVersion,
 )
+from .scoring_rules import ScoringRules
 
 
 class VersionManager:
@@ -28,12 +29,13 @@ class VersionManager:
 
     Version Numbering:
         - 1.0.0: Baseline version
-        - 1.1.0: Minor optimization
-        - 1.2.0: Another minor optimization
-        - 2.0.0: Major restructure
+        - 1.1.0: Minor optimization (5-15 point improvement)
+        - 2.0.0: Major optimization (15+ point improvement)
+        - 1.0.1: Patch optimization (< 5 point improvement)
 
     Attributes:
         _storage: Version storage backend.
+        _scoring_rules: ScoringRules for version bump decisions.
         _logger: Loguru logger instance.
 
     Example:
@@ -45,15 +47,18 @@ class VersionManager:
     def __init__(
         self,
         storage: Optional[VersionStorage] = None,
+        scoring_rules: Optional[ScoringRules] = None,
         custom_logger: Optional[Any] = None,
     ) -> None:
         """Initialize VersionManager.
 
         Args:
             storage: Version storage backend (defaults to InMemoryStorage).
+            scoring_rules: ScoringRules for version bump logic (defaults to ScoringRules()).
             custom_logger: Optional custom logger instance.
         """
         self._storage = storage or InMemoryStorage()
+        self._scoring_rules = scoring_rules or ScoringRules()
         self._logger = custom_logger or logger.bind(module="optimizer.version")
 
     def create_version(
@@ -65,7 +70,10 @@ class VersionManager:
     ) -> PromptVersion:
         """Create a new version for a prompt.
 
-        Automatically assigns the next version number based on existing versions.
+        Automatically assigns the next version number using semantic versioning:
+        - major (X.0.0): improvement >= 15.0 points
+        - minor (x.Y.0): improvement >= 5.0 points
+        - patch (x.y.Z): improvement < 5.0 points or manual edit
 
         Args:
             prompt: Prompt object for this version.
@@ -80,12 +88,19 @@ class VersionManager:
             VersionConflictError: If version conflict occurs.
 
         Example:
-            >>> version = manager.create_version(
+            >>> # Baseline version
+            >>> v1 = manager.create_version(
             ...     prompt=prompt,
             ...     analysis=analysis,
-            ...     optimization_result=None,  # Baseline
+            ...     optimization_result=None,
             ...     parent_version=None
             ... )
+            >>> assert v1.version == "1.0.0"
+            >>>
+            >>> # Major improvement (20 points)
+            >>> result = OptimizationResult(improvement_score=20.0, ...)
+            >>> v2 = manager.create_version(prompt, analysis, result, "1.0.0")
+            >>> assert v2.version == "2.0.0"
         """
         self._logger.info(f"Creating version for prompt '{prompt.id}'")
 
@@ -95,11 +110,21 @@ class VersionManager:
         if not existing_versions:
             # First version (baseline)
             version_number = "1.0.0"
-        else:
-            # Increment version
+        elif optimization_result is None:
+            # Manual edit without optimization - patch bump
             latest = existing_versions[-1]
-            version_number = self._increment_version(
-                latest.version, is_major=optimization_result is not None
+            version_number = self._increment_version(latest.version, "patch")
+        else:
+            # Optimized version - use ScoringRules to determine bump type
+            latest = existing_versions[-1]
+            bump_type = self._scoring_rules.version_bump_type(
+                optimization_result.improvement_score
+            )
+            version_number = self._increment_version(latest.version, bump_type)
+
+            self._logger.info(
+                f"Version bump '{bump_type}' selected for "
+                f"improvement_score={optimization_result.improvement_score:.1f}"
             )
 
         # Create version object
@@ -176,21 +201,41 @@ class VersionManager:
 
         return result
 
-    def get_version_history(self, prompt_id: str) -> List[PromptVersion]:
-        """Get all versions for a prompt, sorted chronologically.
+    def get_version_history(
+        self,
+        prompt_id: str,
+        limit: Optional[int] = None,
+        offset: int = 0
+    ) -> List[PromptVersion]:
+        """Get version history for a prompt with pagination support.
 
         Args:
             prompt_id: Prompt identifier.
+            limit: Maximum versions to return (None = capped at 1000 by default).
+            offset: Number of versions to skip from the beginning.
 
         Returns:
             List of PromptVersion objects (oldest first).
 
         Example:
-            >>> history = manager.get_version_history("prompt_001")
+            >>> # Get first 100 versions
+            >>> history = manager.get_version_history("prompt_001", limit=100)
+            >>> # Get next 100 versions
+            >>> more = manager.get_version_history("prompt_001", limit=100, offset=100)
             >>> for v in history:
             ...     print(f"v{v.version}: score={v.analysis.overall_score}")
         """
-        return self._storage.list_versions(prompt_id)
+        # Default limit to prevent loading excessive versions
+        if limit is None:
+            limit = 1000
+
+        all_versions = self._storage.list_versions(prompt_id, limit=None)
+
+        # Apply offset and limit in Python
+        start = offset
+        end = offset + limit if limit else len(all_versions)
+
+        return all_versions[start:end]
 
     def compare_versions(
         self,
@@ -330,37 +375,47 @@ class VersionManager:
 
         return best
 
-    def _increment_version(self, current_version: str, is_major: bool = False) -> str:
-        """Increment version number.
+    def _increment_version(self, current_version: str, bump_type: str) -> str:
+        """Increment version number based on semantic versioning.
 
         Args:
-            current_version: Current version string (e.g., "1.2.0").
-            is_major: Whether this is a major change (increments minor).
+            current_version: Current version string (e.g., "1.2.3").
+            bump_type: Type of version bump ("major", "minor", or "patch").
 
         Returns:
-            Next version string.
+            Next version string following semantic versioning.
+
+        Raises:
+            ValueError: If bump_type is invalid.
 
         Example:
-            >>> self._increment_version("1.2.0", is_major=False)
-            "1.2.1"
-            >>> self._increment_version("1.2.0", is_major=True)
+            >>> self._increment_version("1.2.3", "major")
+            "2.0.0"
+            >>> self._increment_version("1.2.3", "minor")
             "1.3.0"
+            >>> self._increment_version("1.2.3", "patch")
+            "1.2.4"
         """
         parts = current_version.split(".")
         major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
 
-        if is_major:
-            # Increment minor version, reset patch
-            minor += 1
-            patch = 0
+        if bump_type == "major":
+            # Major change: increment major, reset minor and patch
+            return f"{major + 1}.0.0"
+        elif bump_type == "minor":
+            # Minor change: increment minor, reset patch
+            return f"{major}.{minor + 1}.0"
+        elif bump_type == "patch":
+            # Patch change: increment patch only
+            return f"{major}.{minor}.{patch + 1}"
         else:
-            # Increment patch version
-            patch += 1
-
-        return f"{major}.{minor}.{patch}"
+            raise ValueError(
+                f"Invalid bump_type: '{bump_type}'. "
+                f"Must be 'major', 'minor', or 'patch'."
+            )
 
     def _compute_text_diff(self, text1: str, text2: str) -> Dict[str, Any]:
-        """Compute text difference metrics.
+        """Compute text difference metrics using difflib (C-optimized, O(n)).
 
         Args:
             text1: First text.
@@ -373,18 +428,19 @@ class VersionManager:
         len_diff = len(text2) - len(text1)
         word_diff = len(text2.split()) - len(text1.split())
 
-        # Character-level similarity (simple Jaccard)
-        set1 = set(text1.lower().split())
-        set2 = set(text2.lower().split())
+        # Fast path: identical texts
+        if text1 == text2:
+            return {
+                "character_diff": 0,
+                "word_diff": 0,
+                "similarity": 1.0,
+                "length_ratio": 1.0,
+            }
 
-        if not set1 and not set2:
-            similarity = 1.0
-        elif not set1 or not set2:
-            similarity = 0.0
-        else:
-            intersection = len(set1 & set2)
-            union = len(set1 | set2)
-            similarity = intersection / union if union > 0 else 0.0
+        # Use difflib.SequenceMatcher (C-optimized, O(n))
+        import difflib
+        matcher = difflib.SequenceMatcher(None, text1, text2, autojunk=False)
+        similarity = matcher.ratio()
 
         return {
             "character_diff": len_diff,

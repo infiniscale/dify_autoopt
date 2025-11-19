@@ -8,6 +8,53 @@ Description: Abstract interface for LLM-based prompt analysis and optimization.
 
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional
+from datetime import datetime
+
+from pydantic import BaseModel, Field
+
+
+class LLMResponse(BaseModel):
+    """LLM调用响应的统一封装
+
+    Attributes:
+        content: 生成的内容
+        tokens_used: 使用的token数
+        cost: 本次调用成本（美元）
+        model: 使用的模型
+        provider: 提供商
+        latency_ms: 响应延迟（毫秒）
+        cached: 是否来自缓存
+        metadata: 额外元数据
+        created_at: 创建时间
+    """
+    content: str = Field(..., description="生成的内容")
+    tokens_used: int = Field(..., description="使用的token数")
+    cost: float = Field(..., description="本次调用成本（美元）")
+    model: str = Field(..., description="使用的模型")
+    provider: str = Field(..., description="提供商")
+    latency_ms: float = Field(..., description="响应延迟（毫秒）")
+    cached: bool = Field(default=False, description="是否来自缓存")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="额外元数据")
+    created_at: datetime = Field(default_factory=datetime.now)
+
+
+class UsageStats(BaseModel):
+    """使用统计
+
+    Attributes:
+        total_requests: 总请求数
+        total_tokens: 总token数
+        total_cost: 总成本
+        cache_hits: 缓存命中次数
+        cache_misses: 缓存未命中次数
+        average_latency_ms: 平均延迟（毫秒）
+    """
+    total_requests: int = Field(default=0, description="总请求数")
+    total_tokens: int = Field(default=0, description="总token数")
+    total_cost: float = Field(default=0.0, description="总成本")
+    cache_hits: int = Field(default=0, description="缓存命中次数")
+    cache_misses: int = Field(default=0, description="缓存未命中次数")
+    average_latency_ms: float = Field(default=0.0, description="平均延迟（毫秒）")
 
 
 class LLMClient(ABC):
@@ -18,61 +65,83 @@ class LLMClient(ABC):
 
     Implementations:
         - StubLLMClient (MVP): Rule-based stub for testing.
-        - OpenAIClient (Future): GPT-4 based analysis.
+        - OpenAIClient: GPT-4 based analysis.
         - AnthropicClient (Future): Claude based analysis.
 
     Example:
         >>> client = StubLLMClient()
-        >>> analysis = client.analyze_prompt("Your prompt text", context={"workflow_id": "wf_001"})
-        >>> print(analysis.clarity_score)
+        >>> response = client.analyze_prompt("Your prompt text")
+        >>> print(response.content)
     """
 
     @abstractmethod
-    def analyze_prompt(
-        self, prompt: str, context: Optional[Dict[str, Any]] = None
-    ) -> "PromptAnalysis":  # type: ignore
+    def analyze_prompt(self, prompt: str) -> LLMResponse:
         """Analyze prompt quality using LLM.
 
         Args:
             prompt: Prompt text to analyze.
-            context: Optional context (workflow_id, node_type, etc.).
 
         Returns:
-            PromptAnalysis with scores and suggestions.
+            LLMResponse containing analysis results.
 
         Raises:
             AnalysisError: If LLM call fails or analysis cannot be performed.
 
         Example:
-            >>> analysis = client.analyze_prompt(
-            ...     "Summarize the document",
-            ...     context={"workflow_id": "wf_001", "node_id": "llm_1"}
-            ... )
+            >>> response = client.analyze_prompt("Summarize the document")
+            >>> analysis = json.loads(response.content)
+            >>> print(analysis['clarity_score'])
         """
         pass
 
     @abstractmethod
     def optimize_prompt(
-        self, prompt: str, strategy: str, context: Optional[Dict[str, Any]] = None
-    ) -> str:
+        self,
+        prompt: str,
+        strategy: str,
+        current_analysis: Optional[Dict[str, Any]] = None
+    ) -> LLMResponse:
         """Generate optimized prompt using LLM.
 
         Args:
             prompt: Original prompt text.
-            strategy: Optimization strategy hint (clarity_focus, efficiency_focus, etc.).
-            context: Optional context information.
+            strategy: Optimization strategy (llm_guided, llm_clarity, llm_efficiency).
+            current_analysis: Current analysis results (optional).
 
         Returns:
-            Optimized prompt text.
+            LLMResponse containing optimized prompt.
 
         Raises:
             OptimizationError: If LLM call fails or optimization cannot be performed.
 
         Example:
-            >>> optimized = client.optimize_prompt(
+            >>> response = client.optimize_prompt(
             ...     "Write a summary",
-            ...     strategy="clarity_focus"
+            ...     strategy="llm_clarity"
             ... )
+            >>> print(response.content)
+        """
+        pass
+
+    @abstractmethod
+    def get_usage_stats(self) -> UsageStats:
+        """Get usage statistics.
+
+        Returns:
+            UsageStats containing total requests, tokens, costs, and cache metrics.
+
+        Example:
+            >>> stats = client.get_usage_stats()
+            >>> print(f"Total cost: ${stats.total_cost:.4f}")
+        """
+        pass
+
+    @abstractmethod
+    def reset_stats(self) -> None:
+        """Reset usage statistics.
+
+        Example:
+            >>> client.reset_stats()
         """
         pass
 
@@ -90,37 +159,40 @@ class StubLLMClient(LLMClient):
 
     Example:
         >>> client = StubLLMClient()
-        >>> analysis = client.analyze_prompt("Your prompt")
+        >>> response = client.analyze_prompt("Your prompt")
         >>> # Returns analysis based on heuristics, not LLM
     """
 
-    def analyze_prompt(
-        self, prompt: str, context: Optional[Dict[str, Any]] = None
-    ) -> "PromptAnalysis":  # type: ignore
+    def __init__(self) -> None:
+        """Initialize stub client with usage tracking."""
+        self._total_requests = 0
+
+    def analyze_prompt(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> LLMResponse:
         """Analyze prompt using rule-based heuristics.
 
         This method delegates to PromptAnalyzer for MVP implementation.
 
         Args:
             prompt: Prompt text to analyze.
-            context: Optional context (workflow_id, node_type, etc.).
+            context: Optional context (ignored in new interface, kept for backward compatibility).
 
         Returns:
-            PromptAnalysis with scores based on heuristics.
+            LLMResponse with analysis results in JSON format.
 
         Note:
             This is a stub implementation. It does NOT call external LLM APIs.
         """
-        # Import here to avoid circular dependency
+        import json
         from ..prompt_analyzer import PromptAnalyzer
         from ..models import Prompt
-        from datetime import datetime
+
+        self._total_requests += 1
 
         # Create temporary Prompt object
         temp_prompt = Prompt(
             id="temp",
-            workflow_id=context.get("workflow_id", "unknown") if context else "unknown",
-            node_id=context.get("node_id", "unknown") if context else "unknown",
+            workflow_id=context.get("workflow_id", "stub") if context else "stub",
+            node_id=context.get("node_id", "stub") if context else "stub",
             node_type="llm",
             text=prompt,
             role="system",
@@ -131,22 +203,51 @@ class StubLLMClient(LLMClient):
 
         # Use rule-based analyzer
         analyzer = PromptAnalyzer()
-        return analyzer.analyze_prompt(temp_prompt)
+        analysis = analyzer.analyze_prompt(temp_prompt)
+
+        # Convert to JSON format
+        # Note: PromptAnalysis doesn't have structure_score, calculate as average
+        structure_score = int((analysis.clarity_score + analysis.efficiency_score) / 2)
+
+        result = {
+            "overall_score": analysis.overall_score,
+            "clarity_score": analysis.clarity_score,
+            "efficiency_score": analysis.efficiency_score,
+            "structure_score": structure_score,
+            "issues": [issue.description for issue in analysis.issues],
+            "suggestions": [sugg.description for sugg in analysis.suggestions]
+        }
+
+        return LLMResponse(
+            content=json.dumps(result, ensure_ascii=False, indent=2),
+            tokens_used=0,
+            cost=0.0,
+            model="stub",
+            provider="stub",
+            latency_ms=0,
+            cached=False,
+            metadata={"method": "rule-based"}
+        )
 
     def optimize_prompt(
-        self, prompt: str, strategy: str, context: Optional[Dict[str, Any]] = None
-    ) -> str:
+        self,
+        prompt: str,
+        strategy: str,
+        current_analysis: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None
+    ) -> LLMResponse:
         """Generate optimized prompt using rule-based transformations.
 
         This method delegates to OptimizationEngine for MVP implementation.
 
         Args:
             prompt: Original prompt text.
-            strategy: Strategy name (clarity_focus, efficiency_focus, structure_focus).
-            context: Optional context information.
+            strategy: Strategy name (llm_clarity, llm_efficiency, llm_guided, or legacy names).
+            current_analysis: Current analysis results (optional, ignored in stub).
+            context: Optional context (ignored, for backward compatibility).
 
         Returns:
-            Optimized prompt text.
+            LLMResponse containing optimized prompt.
 
         Raises:
             InvalidStrategyError: If strategy name is invalid.
@@ -154,14 +255,28 @@ class StubLLMClient(LLMClient):
         Note:
             This is a stub implementation. It does NOT call external LLM APIs.
         """
-        # Import here to avoid circular dependency
         from ..optimization_engine import OptimizationEngine
         from ..prompt_analyzer import PromptAnalyzer
         from ..exceptions import InvalidStrategyError
 
-        # Validate strategy
-        valid_strategies = ["clarity_focus", "efficiency_focus", "structure_focus"]
-        if strategy not in valid_strategies:
+        self._total_requests += 1
+
+        # Map both new LLM strategies and legacy rule-based strategies
+        strategy_mapping = {
+            # New LLM-style names
+            "llm_clarity": "clarity_focus",
+            "llm_efficiency": "efficiency_focus",
+            "llm_guided": "structure_focus",
+            # Legacy rule-based names (for backward compatibility)
+            "clarity_focus": "clarity_focus",
+            "efficiency_focus": "efficiency_focus",
+            "structure_focus": "structure_focus"
+        }
+
+        mapped_strategy = strategy_mapping.get(strategy)
+        if not mapped_strategy:
+            # Accept both new and old strategy names in error message
+            valid_strategies = list(strategy_mapping.keys())
             raise InvalidStrategyError(strategy, valid_strategies)
 
         # Use rule-based engine
@@ -169,12 +284,41 @@ class StubLLMClient(LLMClient):
         engine = OptimizationEngine(analyzer)
 
         # Apply strategy
-        if strategy == "clarity_focus":
-            return engine.apply_clarity_focus(prompt)
-        elif strategy == "efficiency_focus":
-            return engine.apply_efficiency_focus(prompt)
-        elif strategy == "structure_focus":
-            return engine.apply_structure_optimization(prompt)
+        if mapped_strategy == "clarity_focus":
+            optimized = engine.apply_clarity_focus(prompt)
+        elif mapped_strategy == "efficiency_focus":
+            optimized = engine.apply_efficiency_focus(prompt)
+        elif mapped_strategy == "structure_focus":
+            optimized = engine.apply_structure_optimization(prompt)
         else:
-            # Fallback (should not reach here due to validation)
-            return prompt
+            optimized = prompt
+
+        return LLMResponse(
+            content=optimized,
+            tokens_used=0,
+            cost=0.0,
+            model="stub",
+            provider="stub",
+            latency_ms=0,
+            cached=False,
+            metadata={"strategy": strategy, "method": "rule-based"}
+        )
+
+    def get_usage_stats(self) -> UsageStats:
+        """Get usage statistics.
+
+        Returns:
+            UsageStats with stub metrics (no real API usage).
+        """
+        return UsageStats(
+            total_requests=self._total_requests,
+            total_tokens=0,
+            total_cost=0.0,
+            cache_hits=0,
+            cache_misses=0,
+            average_latency_ms=0.0
+        )
+
+    def reset_stats(self) -> None:
+        """Reset usage statistics."""
+        self._total_requests = 0

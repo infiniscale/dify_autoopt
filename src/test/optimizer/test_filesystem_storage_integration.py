@@ -94,6 +94,10 @@ class TestFileSystemStorageIntegration:
         manager1.create_version(sample_prompt, sample_analysis, None, None)
         manager1.create_version(sample_prompt, sample_analysis, None, "1.0.0")
 
+        # Wait for async index saves to complete
+        import time
+        time.sleep(0.5)
+
         # "Restart" - create new instances
         storage2 = FileSystemStorage(str(temp_storage_dir))
         manager2 = VersionManager(storage=storage2)

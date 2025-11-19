@@ -10,8 +10,9 @@ import pytest
 from datetime import datetime
 
 from src.optimizer.version_manager import VersionManager
-from src.optimizer.models import PromptVersion, Prompt
+from src.optimizer.models import PromptVersion, Prompt, OptimizationResult, OptimizationStrategy
 from src.optimizer.exceptions import VersionNotFoundError, VersionConflictError
+from src.optimizer.scoring_rules import ScoringRules
 
 
 class TestVersionManagerBasic:
@@ -163,3 +164,373 @@ class TestVersionDeletion:
 
         history = version_manager.get_version_history(sample_prompt.id)
         assert len(history) == 0
+
+
+class TestSemanticVersioning:
+    """Test cases for semantic versioning logic."""
+
+    def test_baseline_version_is_1_0_0(self, version_manager, sample_prompt, sample_analysis):
+        """Test that first version is always 1.0.0."""
+        version = version_manager.create_version(
+            prompt=sample_prompt,
+            analysis=sample_analysis,
+            optimization_result=None,
+            parent_version=None
+        )
+        assert version.version == "1.0.0"
+
+    def test_manual_edit_increments_patch(self, version_manager, sample_prompt, sample_analysis):
+        """Test that manual edit without optimization increments patch version."""
+        # Create baseline
+        v1 = version_manager.create_version(sample_prompt, sample_analysis, None, None)
+        assert v1.version == "1.0.0"
+
+        # Manual edit (no optimization result)
+        v2 = version_manager.create_version(sample_prompt, sample_analysis, None, "1.0.0")
+        assert v2.version == "1.0.1"
+
+        # Another manual edit
+        v3 = version_manager.create_version(sample_prompt, sample_analysis, None, "1.0.1")
+        assert v3.version == "1.0.2"
+
+    def test_major_version_bump_for_large_improvement(
+        self, version_manager, sample_prompt, sample_analysis
+    ):
+        """Test major version bump for improvement >= 15.0 points."""
+        # Create baseline
+        v1 = version_manager.create_version(sample_prompt, sample_analysis, None, None)
+        assert v1.version == "1.0.0"
+
+        # Large improvement (20 points) -> major bump
+        result = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt=sample_prompt.text,
+            optimized_prompt="Optimized version",
+            strategy=OptimizationStrategy.CLARITY_FOCUS,
+            improvement_score=20.0,
+            confidence=0.9,
+            changes=[],
+            metadata={"original_score": 70.0, "optimized_score": 90.0}
+        )
+        v2 = version_manager.create_version(sample_prompt, sample_analysis, result, "1.0.0")
+        assert v2.version == "2.0.0"
+
+    def test_minor_version_bump_for_medium_improvement(
+        self, version_manager, sample_prompt, sample_analysis
+    ):
+        """Test minor version bump for improvement in [5.0, 15.0) range."""
+        # Create baseline
+        v1 = version_manager.create_version(sample_prompt, sample_analysis, None, None)
+        assert v1.version == "1.0.0"
+
+        # Medium improvement (10 points) -> minor bump
+        result = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt=sample_prompt.text,
+            optimized_prompt="Optimized version",
+            strategy=OptimizationStrategy.EFFICIENCY_FOCUS,
+            improvement_score=10.0,
+            confidence=0.8,
+            changes=[],
+            metadata={"original_score": 70.0, "optimized_score": 80.0}
+        )
+        v2 = version_manager.create_version(sample_prompt, sample_analysis, result, "1.0.0")
+        assert v2.version == "1.1.0"
+
+    def test_patch_version_bump_for_small_improvement(
+        self, version_manager, sample_prompt, sample_analysis
+    ):
+        """Test patch version bump for improvement < 5.0 points."""
+        # Create baseline
+        v1 = version_manager.create_version(sample_prompt, sample_analysis, None, None)
+        assert v1.version == "1.0.0"
+
+        # Small improvement (2 points) -> patch bump
+        result = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt=sample_prompt.text,
+            optimized_prompt="Optimized version",
+            strategy=OptimizationStrategy.CLARITY_FOCUS,
+            improvement_score=2.0,
+            confidence=0.7,
+            changes=[],
+            metadata={"original_score": 75.0, "optimized_score": 77.0}
+        )
+        v2 = version_manager.create_version(sample_prompt, sample_analysis, result, "1.0.0")
+        assert v2.version == "1.0.1"
+
+    def test_major_bump_boundary_at_15_points(
+        self, version_manager, sample_prompt, sample_analysis
+    ):
+        """Test that improvement_score=15.0 triggers major bump."""
+        # Create baseline
+        v1 = version_manager.create_version(sample_prompt, sample_analysis, None, None)
+
+        # Exactly 15.0 points -> major bump
+        result = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt=sample_prompt.text,
+            optimized_prompt="Optimized version",
+            strategy=OptimizationStrategy.STRUCTURE_FOCUS,
+            improvement_score=15.0,
+            confidence=0.85,
+            changes=[],
+            metadata={}
+        )
+        v2 = version_manager.create_version(sample_prompt, sample_analysis, result, "1.0.0")
+        assert v2.version == "2.0.0"
+
+    def test_minor_bump_boundary_at_5_points(
+        self, version_manager, sample_prompt, sample_analysis
+    ):
+        """Test that improvement_score=5.0 triggers minor bump."""
+        # Create baseline
+        v1 = version_manager.create_version(sample_prompt, sample_analysis, None, None)
+
+        # Exactly 5.0 points -> minor bump
+        result = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt=sample_prompt.text,
+            optimized_prompt="Optimized version",
+            strategy=OptimizationStrategy.CLARITY_FOCUS,
+            improvement_score=5.0,
+            confidence=0.75,
+            changes=[],
+            metadata={}
+        )
+        v2 = version_manager.create_version(sample_prompt, sample_analysis, result, "1.0.0")
+        assert v2.version == "1.1.0"
+
+    def test_minor_bump_just_below_major_threshold(
+        self, version_manager, sample_prompt, sample_analysis
+    ):
+        """Test that 14.9 points triggers minor bump (not major)."""
+        # Create baseline
+        v1 = version_manager.create_version(sample_prompt, sample_analysis, None, None)
+
+        # 14.9 points -> minor bump
+        result = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt=sample_prompt.text,
+            optimized_prompt="Optimized version",
+            strategy=OptimizationStrategy.EFFICIENCY_FOCUS,
+            improvement_score=14.9,
+            confidence=0.82,
+            changes=[],
+            metadata={}
+        )
+        v2 = version_manager.create_version(sample_prompt, sample_analysis, result, "1.0.0")
+        assert v2.version == "1.1.0"
+
+    def test_patch_bump_just_below_minor_threshold(
+        self, version_manager, sample_prompt, sample_analysis
+    ):
+        """Test that 4.9 points triggers patch bump (not minor)."""
+        # Create baseline
+        v1 = version_manager.create_version(sample_prompt, sample_analysis, None, None)
+
+        # 4.9 points -> patch bump
+        result = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt=sample_prompt.text,
+            optimized_prompt="Optimized version",
+            strategy=OptimizationStrategy.CLARITY_FOCUS,
+            improvement_score=4.9,
+            confidence=0.71,
+            changes=[],
+            metadata={}
+        )
+        v2 = version_manager.create_version(sample_prompt, sample_analysis, result, "1.0.0")
+        assert v2.version == "1.0.1"
+
+    def test_multiple_major_bumps(
+        self, version_manager, sample_prompt, sample_analysis
+    ):
+        """Test multiple major version bumps: 1.0.0 -> 2.0.0 -> 3.0.0."""
+        # Baseline
+        v1 = version_manager.create_version(sample_prompt, sample_analysis, None, None)
+        assert v1.version == "1.0.0"
+
+        # First major improvement
+        result1 = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt=sample_prompt.text,
+            optimized_prompt="Version 2",
+            strategy=OptimizationStrategy.CLARITY_FOCUS,
+            improvement_score=20.0,
+            confidence=0.9,
+            changes=[],
+            metadata={}
+        )
+        v2 = version_manager.create_version(sample_prompt, sample_analysis, result1, "1.0.0")
+        assert v2.version == "2.0.0"
+
+        # Second major improvement
+        result2 = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt="Version 2",
+            optimized_prompt="Version 3",
+            strategy=OptimizationStrategy.STRUCTURE_FOCUS,
+            improvement_score=18.0,
+            confidence=0.88,
+            changes=[],
+            metadata={}
+        )
+        v3 = version_manager.create_version(sample_prompt, sample_analysis, result2, "2.0.0")
+        assert v3.version == "3.0.0"
+
+    def test_mixed_version_bumps(
+        self, version_manager, sample_prompt, sample_analysis
+    ):
+        """Test sequence of mixed version bumps."""
+        # 1.0.0 (baseline)
+        v1 = version_manager.create_version(sample_prompt, sample_analysis, None, None)
+        assert v1.version == "1.0.0"
+
+        # 1.1.0 (minor improvement: 8 points)
+        result1 = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt=sample_prompt.text,
+            optimized_prompt="v1.1.0",
+            strategy=OptimizationStrategy.CLARITY_FOCUS,
+            improvement_score=8.0,
+            confidence=0.8,
+            changes=[],
+            metadata={}
+        )
+        v2 = version_manager.create_version(sample_prompt, sample_analysis, result1, "1.0.0")
+        assert v2.version == "1.1.0"
+
+        # 1.1.1 (patch improvement: 3 points)
+        result2 = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt="v1.1.0",
+            optimized_prompt="v1.1.1",
+            strategy=OptimizationStrategy.EFFICIENCY_FOCUS,
+            improvement_score=3.0,
+            confidence=0.75,
+            changes=[],
+            metadata={}
+        )
+        v3 = version_manager.create_version(sample_prompt, sample_analysis, result2, "1.1.0")
+        assert v3.version == "1.1.1"
+
+        # 2.0.0 (major improvement: 16 points)
+        result3 = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt="v1.1.1",
+            optimized_prompt="v2.0.0",
+            strategy=OptimizationStrategy.STRUCTURE_FOCUS,
+            improvement_score=16.0,
+            confidence=0.92,
+            changes=[],
+            metadata={}
+        )
+        v4 = version_manager.create_version(sample_prompt, sample_analysis, result3, "1.1.1")
+        assert v4.version == "2.0.0"
+
+        # 2.1.0 (minor improvement: 7 points)
+        result4 = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt="v2.0.0",
+            optimized_prompt="v2.1.0",
+            strategy=OptimizationStrategy.CLARITY_FOCUS,
+            improvement_score=7.0,
+            confidence=0.81,
+            changes=[],
+            metadata={}
+        )
+        v5 = version_manager.create_version(sample_prompt, sample_analysis, result4, "2.0.0")
+        assert v5.version == "2.1.0"
+
+    def test_custom_scoring_rules(self, in_memory_storage, sample_prompt, sample_analysis):
+        """Test version manager with custom scoring rules."""
+        # Custom rules: major=20, minor=10
+        custom_rules = ScoringRules(
+            major_version_min_improvement=20.0,
+            minor_version_min_improvement=10.0
+        )
+        manager = VersionManager(
+            storage=in_memory_storage,
+            scoring_rules=custom_rules
+        )
+
+        # Baseline
+        v1 = manager.create_version(sample_prompt, sample_analysis, None, None)
+        assert v1.version == "1.0.0"
+
+        # 15 points with custom rules -> minor (not major)
+        result1 = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt=sample_prompt.text,
+            optimized_prompt="v1.1.0",
+            strategy=OptimizationStrategy.CLARITY_FOCUS,
+            improvement_score=15.0,
+            confidence=0.85,
+            changes=[],
+            metadata={}
+        )
+        v2 = manager.create_version(sample_prompt, sample_analysis, result1, "1.0.0")
+        assert v2.version == "1.1.0"
+
+        # 8 points with custom rules -> patch (not minor)
+        result2 = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt="v1.1.0",
+            optimized_prompt="v1.1.1",
+            strategy=OptimizationStrategy.EFFICIENCY_FOCUS,
+            improvement_score=8.0,
+            confidence=0.78,
+            changes=[],
+            metadata={}
+        )
+        v3 = manager.create_version(sample_prompt, sample_analysis, result2, "1.1.0")
+        assert v3.version == "1.1.1"
+
+        # 25 points with custom rules -> major
+        result3 = OptimizationResult(
+            prompt_id=sample_prompt.id,
+            original_prompt="v1.1.1",
+            optimized_prompt="v2.0.0",
+            strategy=OptimizationStrategy.STRUCTURE_FOCUS,
+            improvement_score=25.0,
+            confidence=0.95,
+            changes=[],
+            metadata={}
+        )
+        v4 = manager.create_version(sample_prompt, sample_analysis, result3, "1.1.1")
+        assert v4.version == "2.0.0"
+
+
+class TestVersionIncrementMethod:
+    """Test cases for _increment_version method."""
+
+    def test_increment_major_version(self, version_manager):
+        """Test major version increment."""
+        assert version_manager._increment_version("1.2.3", "major") == "2.0.0"
+        assert version_manager._increment_version("5.10.20", "major") == "6.0.0"
+        assert version_manager._increment_version("0.1.0", "major") == "1.0.0"
+
+    def test_increment_minor_version(self, version_manager):
+        """Test minor version increment."""
+        assert version_manager._increment_version("1.2.3", "minor") == "1.3.0"
+        assert version_manager._increment_version("5.10.20", "minor") == "5.11.0"
+        assert version_manager._increment_version("0.0.1", "minor") == "0.1.0"
+
+    def test_increment_patch_version(self, version_manager):
+        """Test patch version increment."""
+        assert version_manager._increment_version("1.2.3", "patch") == "1.2.4"
+        assert version_manager._increment_version("5.10.20", "patch") == "5.10.21"
+        assert version_manager._increment_version("0.0.0", "patch") == "0.0.1"
+
+    def test_invalid_bump_type_raises_error(self, version_manager):
+        """Test that invalid bump_type raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid bump_type"):
+            version_manager._increment_version("1.0.0", "invalid")
+
+        with pytest.raises(ValueError, match="Invalid bump_type"):
+            version_manager._increment_version("1.0.0", "MAJOR")  # Case-sensitive
+
+        with pytest.raises(ValueError, match="Invalid bump_type"):
+            version_manager._increment_version("1.0.0", "")
+

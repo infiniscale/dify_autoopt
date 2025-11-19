@@ -80,22 +80,24 @@ class LRUCache:
     def put(self, key: str, value: PromptVersion) -> None:
         """Add item to cache (evict oldest if full).
 
+        Thread-safe put with atomic update to prevent race conditions.
+
         Args:
             key: Cache key.
             value: PromptVersion to cache.
         """
         with self._lock:
-            if key in self._cache:
-                # Update existing entry
-                self._cache.move_to_end(key)
-                self._cache[key] = value
-            else:
-                # Add new entry
-                if len(self._cache) >= self.max_size:
-                    # Evict oldest (first item)
-                    self._cache.popitem(last=False)
+            # Atomic operation: remove old entry if exists, add new at end
+            # This prevents race condition between move_to_end() and assignment
+            self._cache.pop(key, None)
 
-                self._cache[key] = value
+            # Evict if at capacity
+            if len(self._cache) >= self.max_size:
+                # Evict oldest (first item)
+                self._cache.popitem(last=False)
+
+            # Insert at end (most recent)
+            self._cache[key] = value
 
     def remove(self, key: str) -> None:
         """Remove item from cache.
@@ -165,40 +167,25 @@ class FileLock:
         self._system = platform.system()
 
     def __enter__(self):
-        """Acquire lock."""
-        # Create lock file if it doesn't exist
+        """Acquire lock using atomic exclusive file creation."""
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-
         start_time = time.time()
+
         while True:
             try:
-                # Open lock file in append mode
-                self.lock_file = open(self.lock_path, 'a')
-
-                if self._system == "Windows":
-                    # Windows: Use msvcrt.locking()
-                    import msvcrt
-                    msvcrt.locking(
-                        self.lock_file.fileno(),
-                        msvcrt.LK_NBLCK,  # Non-blocking lock
-                        1
-                    )
-                else:
-                    # Unix: Use fcntl.flock()
-                    import fcntl
-                    fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-                # Lock acquired successfully
+                # Atomic create-exclusive (cross-platform)
+                # This provides true mutual exclusion unlike msvcrt.locking()
+                self.lock_file = open(self.lock_path, 'x')
                 return self
 
-            except (IOError, OSError) as e:
-                # Lock acquisition failed
-                if self.lock_file:
-                    self.lock_file.close()
-                    self.lock_file = None
-
-                # Check timeout
+            except FileExistsError:
+                # Lock file exists, check if stale
                 if time.time() - start_time >= self.timeout:
+                    # Check for stale lock (>5 minutes old)
+                    if self._is_stale_lock():
+                        self.lock_path.unlink()
+                        continue
+
                     raise OptimizerError(
                         message=f"Failed to acquire lock after {self.timeout}s",
                         error_code="FS-LOCK-001",
@@ -206,22 +193,29 @@ class FileLock:
                     )
 
                 # Wait a bit before retrying
-                time.sleep(0.01)
+                time.sleep(0.1)
+
+    def _is_stale_lock(self) -> bool:
+        """Check if lock file is stale (older than 5 minutes).
+
+        Returns:
+            True if lock file is stale and should be removed.
+        """
+        try:
+            age = time.time() - self.lock_path.stat().st_mtime
+            return age > 300  # 5 minutes
+        except Exception:
+            return False
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Release lock."""
+        """Release lock and remove file."""
         if self.lock_file:
             try:
-                if self._system == "Windows":
-                    import msvcrt
-                    msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
-            except Exception:
-                pass  # Ignore errors during unlock
-            finally:
                 self.lock_file.close()
+                # Critical: always remove lock file to release lock
+                self.lock_path.unlink()
+            except Exception:
+                pass  # Ignore errors during cleanup
 
 
 # ============================================================================
@@ -304,6 +298,7 @@ class FileSystemStorage(VersionStorage):
         self._index_path = self.storage_dir / ".index.json"
         self._index_lock = threading.RLock()
         self._index: Optional[Dict[str, Any]] = None
+        self._index_dirty = False  # Track if index needs saving
 
         if self.use_index:
             self._load_index()
@@ -329,7 +324,7 @@ class FileSystemStorage(VersionStorage):
     # ========================================================================
 
     def save_version(self, version: PromptVersion) -> None:
-        """Save version to filesystem with atomic write.
+        """Save version to filesystem with atomic write and retry logic.
 
         Process:
             1. Check for duplicate version (with file lock)
@@ -339,16 +334,77 @@ class FileSystemStorage(VersionStorage):
             5. Update index (if enabled)
             6. Update cache (if enabled)
 
+        Retries transient I/O errors automatically (up to 3 attempts).
+
         Args:
             version: PromptVersion to save.
 
         Raises:
             VersionConflictError: If version already exists.
-            OptimizerError: If write operation fails.
+            OptimizerError: If write operation fails after retries.
 
         Example:
             >>> storage = FileSystemStorage("data/versions")
             >>> storage.save_version(version)
+        """
+        max_retries = 3
+        retry_delay = 0.1
+
+        for attempt in range(max_retries):
+            try:
+                self._save_version_internal(version)
+                return  # Success
+
+            except VersionConflictError:
+                raise  # Never retry conflicts
+
+            except (IOError, OSError) as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        f"Transient error on attempt {attempt + 1}/{max_retries}, retrying",
+                        error=str(e),
+                        prompt_id=version.prompt_id,
+                        version=version.version,
+                    )
+                    time.sleep(retry_delay * (2 ** attempt))  # Exponential backoff
+                else:
+                    logger.error(
+                        f"Failed to save version after {max_retries} attempts",
+                        prompt_id=version.prompt_id,
+                        version=version.version,
+                    )
+                    raise OptimizerError(
+                        message=f"Failed to save version {version.version} after {max_retries} retries",
+                        error_code="FS-SAVE-001",
+                        context={
+                            "prompt_id": version.prompt_id,
+                            "version": version.version,
+                            "error": str(e),
+                        },
+                    ) from e
+
+            except Exception as e:
+                # Non-retryable error
+                raise OptimizerError(
+                    message=f"Failed to save version {version.version}",
+                    error_code="FS-SAVE-002",
+                    context={
+                        "prompt_id": version.prompt_id,
+                        "version": version.version,
+                        "error": str(e),
+                    },
+                ) from e
+
+    def _save_version_internal(self, version: PromptVersion) -> None:
+        """Internal save logic (extracted for retry wrapper).
+
+        Args:
+            version: PromptVersion to save.
+
+        Raises:
+            VersionConflictError: If version already exists.
+            IOError/OSError: On file I/O errors (retryable).
+            Exception: On other errors (non-retryable).
         """
         prompt_dir = self._get_prompt_dir(version.prompt_id)
         version_file = prompt_dir / f"{version.version}.json"
@@ -361,54 +417,37 @@ class FileSystemStorage(VersionStorage):
                 raise VersionConflictError(
                     prompt_id=version.prompt_id,
                     version=version.version,
-                    reason="Version file already exists"
+                    reason="Version file already exists",
                 )
 
             # Create prompt directory
             prompt_dir.mkdir(parents=True, exist_ok=True)
 
-            try:
-                start_time = time.time()
+            start_time = time.time()
 
-                # Serialize to JSON
-                data = version.model_dump(mode="json")
+            # Serialize to JSON
+            data = version.model_dump(mode="json")
 
-                # Atomic write: temp file + rename
-                self._atomic_write(version_file, data)
+            # Atomic write: temp file + rename
+            self._atomic_write(version_file, data)
 
-                # Update index
-                if self.use_index:
-                    self._update_index_add(version)
+            # Update index
+            if self.use_index:
+                self._update_index_add(version)
 
-                # Update cache
-                if self._cache:
-                    cache_key = f"{version.prompt_id}:{version.version}"
-                    self._cache.put(cache_key, version)
+            # Update cache
+            if self._cache:
+                cache_key = f"{version.prompt_id}:{version.version}"
+                self._cache.put(cache_key, version)
 
-                elapsed = time.time() - start_time
-                logger.debug(
-                    "Version saved",
-                    prompt_id=version.prompt_id,
-                    version=version.version,
-                    elapsed_ms=elapsed * 1000,
-                    file_size=version_file.stat().st_size,
-                )
-
-            except VersionConflictError:
-                # Re-raise version conflicts
-                raise
-            except Exception as e:
-                logger.error(
-                    "Failed to save version",
-                    prompt_id=version.prompt_id,
-                    version=version.version,
-                    error=str(e),
-                )
-                raise OptimizerError(
-                    message=f"Failed to save version {version.version}",
-                    error_code="FS-SAVE-001",
-                    context={"prompt_id": version.prompt_id, "error": str(e)}
-                )
+            elapsed = time.time() - start_time
+            logger.debug(
+                "Version saved",
+                prompt_id=version.prompt_id,
+                version=version.version,
+                elapsed_ms=elapsed * 1000,
+                file_size=version_file.stat().st_size,
+            )
 
     def get_version(
         self,
@@ -496,19 +535,27 @@ class FileSystemStorage(VersionStorage):
                 context={"prompt_id": prompt_id, "error": str(e)}
             )
 
-    def list_versions(self, prompt_id: str) -> List[PromptVersion]:
-        """List all versions for a prompt, sorted by version number.
+    def list_versions(
+        self,
+        prompt_id: str,
+        limit: Optional[int] = None,
+        offset: int = 0
+    ) -> List[PromptVersion]:
+        """List versions for a prompt with pagination support.
 
         Args:
             prompt_id: Prompt identifier.
+            limit: Maximum number of versions to return (None = capped at 10000 for safety).
+            offset: Number of versions to skip from the beginning.
 
         Returns:
             List of PromptVersion, sorted oldest-first.
 
         Example:
-            >>> versions = storage.list_versions("prompt_001")
-            >>> for v in versions:
-            ...     print(f"v{v.version}: score={v.analysis.overall_score}")
+            >>> # Get first 100 versions
+            >>> versions = storage.list_versions("prompt_001", limit=100)
+            >>> # Get next 100 versions
+            >>> more = storage.list_versions("prompt_001", limit=100, offset=100)
         """
         prompt_dir = self._get_prompt_dir(prompt_id)
 
@@ -516,15 +563,45 @@ class FileSystemStorage(VersionStorage):
             logger.debug("Prompt directory not found", prompt_id=prompt_id)
             return []
 
+        # Safety cap to prevent OOM
+        MAX_LIMIT = 10000
+        if limit is None:
+            limit = MAX_LIMIT
+        else:
+            limit = min(limit, MAX_LIMIT)
+
         versions = []
-        for version_file in prompt_dir.glob("*.json"):
-            if version_file.stem.startswith('.'):
-                continue  # Skip metadata files like .lock
+        version_files = sorted(
+            [vf for vf in prompt_dir.glob("*.json") if not vf.stem.startswith('.')],
+            key=lambda p: self._parse_version(p.stem)
+        )
+
+        # Apply offset and limit
+        for i, version_file in enumerate(version_files):
+            if i < offset:
+                continue
+            if len(versions) >= limit:
+                break
 
             try:
+                # Check cache first
+                cache_key = f"{prompt_id}:{version_file.stem}"
+                if self._cache:
+                    cached = self._cache.get(cache_key)
+                    if cached:
+                        versions.append(cached)
+                        continue
+
+                # Load from file
                 with open(version_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                versions.append(PromptVersion(**data))
+                version = PromptVersion(**data)
+                versions.append(version)
+
+                # Update cache
+                if self._cache:
+                    self._cache.put(cache_key, version)
+
             except Exception as e:
                 # Skip corrupted files
                 logger.warning(
@@ -534,13 +611,12 @@ class FileSystemStorage(VersionStorage):
                 )
                 continue
 
-        # Sort by version tuple (major, minor, patch)
-        versions.sort(key=lambda v: self._parse_version(v.version))
-
         logger.debug(
             "Listed versions",
             prompt_id=prompt_id,
             count=len(versions),
+            offset=offset,
+            limit=limit,
         )
 
         return versions
@@ -794,7 +870,7 @@ class FileSystemStorage(VersionStorage):
                 logger.error("Failed to save index", error=str(e))
 
     def _update_index_add(self, version: PromptVersion) -> None:
-        """Update index when adding a version.
+        """Update index when adding a version with copy-on-write semantics.
 
         Args:
             version: PromptVersion being added.
@@ -807,7 +883,7 @@ class FileSystemStorage(VersionStorage):
             index_entry = self._index["index"].get(prompt_id)
 
             if not index_entry:
-                # New prompt
+                # New prompt - create immutable entry
                 self._index["index"][prompt_id] = {
                     "latest_version": version.version,
                     "version_count": 1,
@@ -817,16 +893,43 @@ class FileSystemStorage(VersionStorage):
                 }
                 self._index["total_prompts"] += 1
             else:
-                # Existing prompt
-                index_entry["versions"].append(version.version)
-                index_entry["versions"].sort(key=self._parse_version)
-                index_entry["latest_version"] = index_entry["versions"][-1]
-                index_entry["version_count"] += 1
-                index_entry["updated_at"] = datetime.now().isoformat()
+                # Existing prompt - copy-on-write: create new list, new dict
+                versions_copy = index_entry["versions"][:] + [version.version]
+                versions_copy.sort(key=self._parse_version)
+
+                # Atomic replace entire entry
+                self._index["index"][prompt_id] = {
+                    **index_entry,
+                    "versions": versions_copy,
+                    "latest_version": versions_copy[-1],
+                    "version_count": len(versions_copy),
+                    "updated_at": datetime.now().isoformat()
+                }
 
             self._index["total_versions"] += 1
             self._index["last_updated"] = datetime.now().isoformat()
-            self._save_index()
+            self._index_dirty = True
+
+        # Save outside lock in background
+        self._async_save_index()
+
+    def _async_save_index(self) -> None:
+        """Save index in background thread to avoid blocking."""
+        if hasattr(self, '_save_thread') and self._save_thread and self._save_thread.is_alive():
+            # Wait for existing save to complete
+            self._save_thread.join(timeout=1.0)
+
+        def _save():
+            with self._index_lock:
+                if self._index and self._index_dirty:
+                    try:
+                        self._atomic_write(self._index_path, self._index)
+                        self._index_dirty = False
+                    except Exception as e:
+                        logger.error("Failed to save index", error=str(e))
+
+        self._save_thread = threading.Thread(target=_save, daemon=False)  # Changed to non-daemon
+        self._save_thread.start()
 
     def _update_index_delete(self, prompt_id: str, version: str) -> None:
         """Update index when deleting a version.
@@ -863,37 +966,81 @@ class FileSystemStorage(VersionStorage):
             self._save_index()
 
     def _rebuild_index(self) -> None:
-        """Rebuild index by scanning all version files.
+        """Rebuild index without blocking operations.
 
-        Called when index is corrupted or missing.
+        Builds new index outside lock, then does quick atomic swap.
         """
         logger.info("Rebuilding index from filesystem")
 
+        # Build new index outside lock (read-only filesystem access)
+        new_index = {
+            "version": "1.0.0",
+            "last_updated": datetime.now().isoformat(),
+            "total_prompts": 0,
+            "total_versions": 0,
+            "index": {}
+        }
+
+        # Scan filesystem (no lock needed - read-only)
+        if self.enable_sharding:
+            for shard_dir in self.storage_dir.iterdir():
+                if shard_dir.is_dir() and not shard_dir.name.startswith('.'):
+                    self._scan_shard_directory_into(shard_dir, new_index)
+        else:
+            self._scan_shard_directory_into(self.storage_dir, new_index)
+
+        # Quick atomic swap under lock (<1ms)
         with self._index_lock:
-            self._index = {
-                "version": "1.0.0",
-                "last_updated": datetime.now().isoformat(),
-                "total_prompts": 0,
-                "total_versions": 0,
-                "index": {}
-            }
+            self._index = new_index
 
-            # Scan all version files
-            if self.enable_sharding:
-                # Scan all shard directories
-                for shard_dir in self.storage_dir.iterdir():
-                    if shard_dir.is_dir() and not shard_dir.name.startswith('.'):
-                        self._scan_shard_directory(shard_dir)
-            else:
-                # Scan storage directory directly
-                self._scan_shard_directory(self.storage_dir)
+        # Save outside lock
+        self._save_index()
 
-            self._save_index()
-            logger.info(
-                "Index rebuilt",
-                total_prompts=self._index["total_prompts"],
-                total_versions=self._index["total_versions"],
-            )
+        logger.info(
+            "Index rebuilt successfully",
+            total_prompts=new_index["total_prompts"],
+            total_versions=new_index["total_versions"],
+        )
+
+    def _scan_shard_directory_into(self, shard_dir: Path, index: Dict[str, Any]) -> None:
+        """Scan directory and update provided index (helper for rebuild).
+
+        Args:
+            shard_dir: Directory to scan.
+            index: Index dictionary to update.
+        """
+        for prompt_dir in shard_dir.iterdir():
+            if not prompt_dir.is_dir() or prompt_dir.name.startswith('.'):
+                continue
+
+            prompt_id = prompt_dir.name
+            version_files = list(prompt_dir.glob("*.json"))
+
+            if not version_files:
+                continue
+
+            versions = []
+            for vf in version_files:
+                if vf.stem.startswith('.'):
+                    continue
+                try:
+                    version_str = vf.stem
+                    versions.append(version_str)
+                except Exception:
+                    continue
+
+            if versions:
+                versions.sort(key=self._parse_version)
+
+                index["index"][prompt_id] = {
+                    "latest_version": versions[-1],
+                    "version_count": len(versions),
+                    "versions": versions,
+                    "created_at": datetime.fromtimestamp(prompt_dir.stat().st_ctime).isoformat(),
+                    "updated_at": datetime.fromtimestamp(prompt_dir.stat().st_mtime).isoformat(),
+                }
+                index["total_prompts"] += 1
+                index["total_versions"] += len(versions)
 
     def _scan_shard_directory(self, shard_dir: Path) -> None:
         """Scan a shard directory and update index.

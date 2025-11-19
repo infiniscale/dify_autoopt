@@ -637,6 +637,10 @@ class TestFileSystemStorageAtomicity:
         """Test atomic write completes successfully."""
         storage.save_version(sample_version)
 
+        # Wait for async index save to complete
+        import time
+        time.sleep(0.3)
+
         # No temp files should remain
         temp_files = list(storage.storage_dir.glob("**/*.tmp*"))
         assert len(temp_files) == 0

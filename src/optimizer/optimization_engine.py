@@ -22,6 +22,7 @@ from .models import (
     PromptAnalysis,
 )
 from .prompt_analyzer import PromptAnalyzer
+from .utils.variable_extractor import VariableExtractor
 
 
 class OptimizationEngine:
@@ -45,6 +46,9 @@ class OptimizationEngine:
         >>> result = engine.optimize(prompt, "clarity_focus")
         >>> print(f"Improvement: {result.improvement_score}")
     """
+
+    # Pre-compiled regex patterns for performance
+    _SENTENCE_SPLITTER = re.compile(r'[.!?]+\s+')
 
     def __init__(
         self,
@@ -71,9 +75,13 @@ class OptimizationEngine:
     ) -> OptimizationResult:
         """Generate optimized prompt using specified strategy.
 
+        Supports both rule-based and LLM-powered strategies:
+        - Rule strategies: clarity_focus, efficiency_focus, structure_focus
+        - LLM strategies: llm_guided, llm_clarity, llm_efficiency, hybrid
+
         Args:
             prompt: Prompt to optimize.
-            strategy: Strategy name (clarity_focus, efficiency_focus, structure_focus).
+            strategy: Strategy name.
             config: Optional optimization configuration.
 
         Returns:
@@ -84,29 +92,39 @@ class OptimizationEngine:
             OptimizationFailedError: If optimization process fails.
 
         Example:
+            >>> # Rule-based optimization
             >>> result = engine.optimize(prompt, "clarity_focus")
-            >>> print(result.optimized_prompt)
+            >>> # LLM optimization (requires llm_client)
+            >>> result = engine.optimize(prompt, "llm_guided")
         """
         self._logger.info(f"Optimizing prompt '{prompt.id}' with strategy '{strategy}'")
 
         # Validate strategy
-        valid_strategies = ["clarity_focus", "efficiency_focus", "structure_focus"]
+        llm_strategies = ["llm_guided", "llm_clarity", "llm_efficiency", "hybrid"]
+        rule_strategies = ["clarity_focus", "efficiency_focus", "structure_focus"]
+        valid_strategies = llm_strategies + rule_strategies
+
         if strategy not in valid_strategies:
             raise InvalidStrategyError(strategy, valid_strategies)
+
+        # Check LLM strategy availability
+        if strategy in llm_strategies and not self._llm_client:
+            self._logger.warning(
+                f"LLM strategy '{strategy}' requested but no LLM client available, "
+                f"falling back to rule-based optimization"
+            )
+            # Fallback to rule strategy
+            strategy = self._select_fallback_strategy(strategy)
 
         try:
             # Analyze original prompt
             original_analysis = self._analyzer.analyze_prompt(prompt)
 
             # Apply optimization strategy
-            if strategy == "clarity_focus":
-                optimized_text = self._apply_clarity_focus(prompt)
-            elif strategy == "efficiency_focus":
-                optimized_text = self._apply_efficiency_focus(prompt)
-            elif strategy == "structure_focus":
-                optimized_text = self._apply_structure_focus(prompt)
+            if strategy in llm_strategies:
+                optimized_text = self._apply_llm_strategy(prompt, strategy, original_analysis)
             else:
-                optimized_text = prompt.text
+                optimized_text = self._apply_rule_strategy(prompt, strategy)
 
             # Create optimized prompt object for re-analysis
             optimized_prompt = Prompt(
@@ -137,11 +155,14 @@ class OptimizationEngine:
             # Detect changes
             changes = self._detect_changes(prompt.text, optimized_text)
 
+            # Determine strategy type for metadata
+            strategy_type = "llm" if strategy in llm_strategies else "rule"
+
             result = OptimizationResult(
                 prompt_id=prompt.id,
                 original_prompt=prompt.text,
                 optimized_prompt=optimized_text,
-                strategy=OptimizationStrategy(strategy),
+                strategy=OptimizationStrategy(strategy) if strategy in rule_strategies else OptimizationStrategy.AUTO,
                 improvement_score=improvement_score,
                 confidence=confidence,
                 changes=changes,
@@ -152,13 +173,14 @@ class OptimizationEngine:
                     "optimized_clarity": optimized_analysis.clarity_score,
                     "original_efficiency": original_analysis.efficiency_score,
                     "optimized_efficiency": optimized_analysis.efficiency_score,
+                    "strategy_type": strategy_type,
                 },
                 optimized_at=datetime.now(),
             )
 
             self._logger.info(
                 f"Optimization complete: improvement={improvement_score:.1f}, "
-                f"confidence={confidence:.2f}"
+                f"confidence={confidence:.2f}, strategy_type={strategy_type}"
             )
 
             return result
@@ -355,7 +377,7 @@ class OptimizationEngine:
         return f"## Task Instructions\n\n{text}"
 
     def _break_long_sentences(self, text: str) -> str:
-        """Break long sentences into shorter ones.
+        """Break long sentences into shorter ones using pre-compiled regex.
 
         Args:
             text: Original text.
@@ -363,33 +385,27 @@ class OptimizationEngine:
         Returns:
             Text with shorter sentences.
         """
-        # Find sentences longer than 40 words
-        sentences = re.split(r"(?<=[.!?])\s+", text)
+        # Split sentences using pre-compiled regex
+        sentences = self._SENTENCE_SPLITTER.split(text)
         result = []
 
         for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
             words = sentence.split()
             if len(words) > 40:
-                # Try to split at conjunctions
-                split_points = [
-                    " and ",
-                    " but ",
-                    " however ",
-                    " therefore ",
-                    ", which ",
-                ]
-                modified = sentence
-                for point in split_points:
-                    if point in modified:
-                        parts = modified.split(point, 1)
-                        if len(parts) == 2 and len(parts[0].split()) > 10:
-                            modified = parts[0] + ".\n" + parts[1].capitalize()
-                            break
-                result.append(modified)
+                # Break into chunks of ~20 words
+                chunks = []
+                for i in range(0, len(words), 20):
+                    chunk = " ".join(words[i:i+20])
+                    chunks.append(chunk)
+                result.extend(chunks)
             else:
                 result.append(sentence)
 
-        return " ".join(result)
+        return ". ".join(result)
 
     def _replace_vague_terms(self, text: str) -> str:
         """Replace vague terms with specific language.
@@ -693,7 +709,7 @@ class OptimizationEngine:
         # Cap confidence
         return max(0.0, min(1.0, confidence))
 
-    def _detect_changes(self, original: str, optimized: str) -> List[str]:
+    def _detect_changes(self, original: str, optimized: str) -> List["OptimizationChange"]:
         """Detect and describe changes between prompts.
 
         Args:
@@ -701,54 +717,218 @@ class OptimizationEngine:
             optimized: Optimized prompt text.
 
         Returns:
-            List of change descriptions.
+            List of structured change records.
         """
+        from .models import OptimizationChange
+
         changes = []
 
         # Length change
         len_diff = len(optimized) - len(original)
         if len_diff > 50:
-            changes.append(f"Added {len_diff} characters")
+            changes.append(OptimizationChange(
+                rule_id="LENGTH_INCREASE",
+                description=f"Added {len_diff} characters",
+            ))
         elif len_diff < -50:
-            changes.append(f"Reduced by {-len_diff} characters")
+            changes.append(OptimizationChange(
+                rule_id="LENGTH_DECREASE",
+                description=f"Reduced by {-len_diff} characters",
+            ))
 
         # Structure changes
         if re.search(r"^#+\s+", optimized, re.MULTILINE) and not re.search(
             r"^#+\s+", original, re.MULTILINE
         ):
-            changes.append("Added section headers")
+            changes.append(OptimizationChange(
+                rule_id="ADD_HEADERS",
+                description="Added section headers",
+            ))
 
         if re.search(r"^\d+\.\s+", optimized, re.MULTILINE) and not re.search(
             r"^\d+\.\s+", original, re.MULTILINE
         ):
-            changes.append("Added numbered list")
+            changes.append(OptimizationChange(
+                rule_id="ADD_NUMBERED_LIST",
+                description="Added numbered list",
+            ))
 
         if re.search(r"^[\-\*]\s+", optimized, re.MULTILINE) and not re.search(
             r"^[\-\*]\s+", original, re.MULTILINE
         ):
-            changes.append("Added bullet points")
+            changes.append(OptimizationChange(
+                rule_id="ADD_BULLETS",
+                description="Added bullet points",
+            ))
 
         # Line break changes
         orig_lines = original.count("\n")
         opt_lines = optimized.count("\n")
         if opt_lines > orig_lines + 2:
-            changes.append("Improved formatting with line breaks")
+            changes.append(OptimizationChange(
+                rule_id="IMPROVE_FORMATTING",
+                description="Improved formatting with line breaks",
+            ))
 
         # Word count change
         orig_words = len(original.split())
         opt_words = len(optimized.split())
         if opt_words < orig_words * 0.8:
-            changes.append("Reduced word count for efficiency")
+            changes.append(OptimizationChange(
+                rule_id="REDUCE_WORDCOUNT",
+                description="Reduced word count for efficiency",
+            ))
         elif opt_words > orig_words * 1.2:
-            changes.append("Added more detailed instructions")
+            changes.append(OptimizationChange(
+                rule_id="ADD_DETAILS",
+                description="Added more detailed instructions",
+            ))
 
         if not changes:
-            changes.append("Minor text adjustments")
+            changes.append(OptimizationChange(
+                rule_id="MINOR_ADJUSTMENTS",
+                description="Minor text adjustments",
+            ))
 
         return changes
 
+    def _apply_llm_strategy(
+        self,
+        prompt: Prompt,
+        strategy: str,
+        analysis: PromptAnalysis,
+    ) -> str:
+        """Apply LLM-based optimization strategy.
+
+        Uses LLM client to generate optimized prompt based on strategy.
+        For hybrid strategy, applies rule-based cleanup after LLM optimization.
+
+        Args:
+            prompt: Prompt to optimize.
+            strategy: LLM strategy name (llm_guided, llm_clarity, llm_efficiency, hybrid).
+            analysis: Current prompt analysis.
+
+        Returns:
+            Optimized prompt text.
+
+        Raises:
+            ValueError: If LLM client not available.
+
+        Example:
+            >>> optimized = self._apply_llm_strategy(prompt, "llm_guided", analysis)
+        """
+        if not self._llm_client:
+            raise ValueError("LLM client not available")
+
+        self._logger.info(f"Applying LLM strategy: {strategy}")
+
+        # Build analysis context for LLM
+        analysis_context = {
+            "overall_score": analysis.overall_score,
+            "clarity_score": analysis.clarity_score,
+            "efficiency_score": analysis.efficiency_score,
+            "issues": [
+                {"type": issue.type.value, "description": issue.description}
+                for issue in analysis.issues[:3]  # Only pass top 3 issues
+            ],
+        }
+
+        # Call LLM optimization
+        response = self._llm_client.optimize_prompt(
+            prompt=prompt.text,
+            strategy=strategy,
+            current_analysis=analysis_context,
+        )
+
+        # Log LLM usage
+        self._logger.info(
+            f"LLM optimization: tokens={response.tokens_used}, "
+            f"cost=${response.cost:.4f}, cached={response.cached}"
+        )
+
+        # For hybrid strategy, apply rule-based cleanup
+        if strategy == "hybrid":
+            # LLM optimization first
+            llm_optimized = response.content
+            # Then apply rule cleanup
+            return self._apply_rule_cleanup(llm_optimized)
+
+        return response.content
+
+    def _apply_rule_strategy(self, prompt: Prompt, strategy: str) -> str:
+        """Apply rule-based optimization strategy.
+
+        Delegates to existing rule-based optimization methods.
+
+        Args:
+            prompt: Prompt to optimize.
+            strategy: Rule strategy name (clarity_focus, efficiency_focus, structure_focus).
+
+        Returns:
+            Optimized prompt text.
+
+        Example:
+            >>> optimized = self._apply_rule_strategy(prompt, "clarity_focus")
+        """
+        if strategy == "clarity_focus":
+            return self._apply_clarity_focus(prompt)
+        elif strategy == "efficiency_focus":
+            return self._apply_efficiency_focus(prompt)
+        elif strategy == "structure_focus":
+            return self._apply_structure_focus(prompt)
+        else:
+            return prompt.text
+
+    def _select_fallback_strategy(self, llm_strategy: str) -> str:
+        """Select fallback rule-based strategy when LLM is unavailable.
+
+        Maps LLM strategies to equivalent rule-based strategies.
+
+        Args:
+            llm_strategy: LLM strategy name.
+
+        Returns:
+            Equivalent rule-based strategy name.
+
+        Example:
+            >>> fallback = self._select_fallback_strategy("llm_clarity")
+            >>> # Returns: "clarity_focus"
+        """
+        fallback_map = {
+            "llm_guided": "structure_focus",
+            "llm_clarity": "clarity_focus",
+            "llm_efficiency": "efficiency_focus",
+            "hybrid": "clarity_focus",
+        }
+        return fallback_map.get(llm_strategy, "clarity_focus")
+
+    def _apply_rule_cleanup(self, text: str) -> str:
+        """Apply rule-based cleanup for hybrid strategy.
+
+        Performs lightweight cleanup operations:
+        - Remove excessive whitespace
+        - Remove common filler words
+        - Normalize formatting
+
+        Args:
+            text: Text to clean up.
+
+        Returns:
+            Cleaned up text.
+
+        Example:
+            >>> cleaned = self._apply_rule_cleanup("Text with  extra   spaces")
+        """
+        # Remove multiple spaces
+        text = self._clean_whitespace(text)
+
+        # Remove filler words
+        text = self._remove_filler_words(text)
+
+        return text.strip()
+
     def _extract_variables(self, text: str) -> List[str]:
-        """Extract variables from text.
+        """Extract variables using centralized extractor.
 
         Args:
             text: Prompt text.
@@ -756,12 +936,4 @@ class OptimizationEngine:
         Returns:
             List of variable names.
         """
-        pattern = r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}"
-        matches = re.findall(pattern, text)
-        seen = set()
-        unique_vars = []
-        for var in matches:
-            if var not in seen:
-                seen.add(var)
-                unique_vars.append(var)
-        return unique_vars
+        return VariableExtractor.extract(text)

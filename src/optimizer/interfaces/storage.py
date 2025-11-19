@@ -225,11 +225,16 @@ class InMemoryStorage(VersionStorage):
 
             return None
 
-    def list_versions(self, prompt_id: str) -> List["PromptVersion"]:  # type: ignore
+    def list_versions(
+        self,
+        prompt_id: str,
+        limit: Optional[int] = None
+    ) -> List["PromptVersion"]:  # type: ignore
         """List all versions for a prompt, sorted by version number (thread-safe).
 
         Args:
             prompt_id: Prompt identifier.
+            limit: Max versions to return (None = all).
 
         Returns:
             List of PromptVersion, sorted by version (oldest first).
@@ -246,7 +251,13 @@ class InMemoryStorage(VersionStorage):
                 parts = v.version.split(".")
                 return (int(parts[0]), int(parts[1]), int(parts[2]))
 
-            return sorted(versions, key=version_key)
+            sorted_versions = sorted(versions, key=version_key)
+
+            # Apply limit
+            if limit is not None:
+                return sorted_versions[:limit]
+
+            return sorted_versions
 
     def get_latest_version(
         self, prompt_id: str

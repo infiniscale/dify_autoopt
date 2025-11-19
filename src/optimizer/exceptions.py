@@ -9,6 +9,63 @@ Description: Defines custom exception hierarchy for the optimizer module.
 from typing import Any, Dict, Optional
 
 
+class ErrorCodes:
+    """Standardized error codes for the optimizer module.
+
+    Error Code Format: PREFIX-COMPONENT-NUMBER
+        - PREFIX: OPT (Optimizer)
+        - COMPONENT: Module identifier
+        - NUMBER: Sequential error number
+
+    Example:
+        OPT-SVC-001: OptimizerService error #1
+        FS-SAVE-001: FileSystem storage save error #1
+    """
+
+    # Optimizer Service
+    OPT_SVC_WORKFLOW_NOT_FOUND = "OPT-SVC-001"
+    OPT_SVC_DSL_NOT_FOUND = "OPT-SVC-002"
+    OPT_SVC_CATALOG_NOT_INIT = "OPT-SVC-003"
+    OPT_SVC_DSL_PATH_ERROR = "OPT-SVC-004"
+    OPT_SVC_OPTIMIZATION_FAILED = "OPT-SVC-005"
+    OPT_SVC_SINGLE_PROMPT_FAILED = "OPT-SVC-006"
+
+    # Extraction
+    OPT_EXT_WORKFLOW_NOT_FOUND = "OPT-EXT-001"
+    OPT_EXT_NODE_NOT_FOUND = "OPT-EXT-002"
+    OPT_EXT_DSL_PARSE_ERROR = "OPT-EXT-003"
+
+    # Analysis
+    OPT_ANA_SCORING_ERROR = "OPT-ANA-001"
+    OPT_ANA_ANALYSIS_FAILED = "OPT-ANA-010"
+
+    # Optimization
+    OPT_OPT_INVALID_STRATEGY = "OPT-OPT-001"
+    OPT_OPT_OPTIMIZATION_FAILED = "OPT-OPT-002"
+
+    # Version Management
+    OPT_VER_CONFLICT = "OPT-VER-001"
+    OPT_VER_NOT_FOUND = "OPT-VER-002"
+
+    # Validation
+    OPT_VAL_VALIDATION_ERROR = "OPT-VAL-001"
+    OPT_VAR_MISSING = "OPT-VAR-001"
+
+    # Configuration
+    OPT_CFG_CONFIG_ERROR = "OPT-CFG-001"
+
+    # FileSystem Storage
+    FS_LOCK_TIMEOUT = "FS-LOCK-001"
+    FS_SAVE_RETRY_FAILED = "FS-SAVE-001"
+    FS_SAVE_NON_RETRYABLE = "FS-SAVE-002"
+    FS_LOAD_JSON_ERROR = "FS-LOAD-001"
+    FS_LOAD_FAILED = "FS-LOAD-002"
+    FS_DELETE_FAILED = "FS-DELETE-001"
+
+    # Patch Engine
+    PATCH_UNKNOWN_NODE = "PATCH-001"
+
+
 class OptimizerError(Exception):
     """Base exception for optimizer module.
 

@@ -8,7 +8,7 @@ Description: Pydantic V2 models for prompts, analysis, optimization, and version
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -49,17 +49,68 @@ class SuggestionType(str, Enum):
 
 
 class OptimizationStrategy(str, Enum):
-    """Optimization strategy names."""
+    """Optimization strategy names.
 
+    Rule-based strategies (MVP):
+        - CLARITY_FOCUS: Improve readability and structure using rule-based heuristics
+        - EFFICIENCY_FOCUS: Reduce length and remove redundancy using rules
+        - STRUCTURE_FOCUS: Add formatting and organization using rules
+        - AUTO: Auto-select based on analysis
+
+    LLM-powered strategies (Production):
+        - LLM_GUIDED: Full LLM rewrite with context understanding
+        - LLM_CLARITY: Semantic restructuring for maximum clarity
+        - LLM_EFFICIENCY: Intelligent compression preserving meaning
+        - HYBRID: Combine rule-based + LLM refinement
+    """
+
+    # Rule-based strategies (MVP)
     CLARITY_FOCUS = "clarity_focus"
     EFFICIENCY_FOCUS = "efficiency_focus"
     STRUCTURE_FOCUS = "structure_focus"
     AUTO = "auto"  # Auto-select based on analysis
 
+    # LLM-powered strategies (Production)
+    LLM_GUIDED = "llm_guided"
+    LLM_CLARITY = "llm_clarity"
+    LLM_EFFICIENCY = "llm_efficiency"
+    HYBRID = "hybrid"
+
 
 # ============================================================================
 # Core Models
 # ============================================================================
+
+
+class OptimizationChange(BaseModel):
+    """Structured change record for audit trail.
+
+    Attributes:
+        rule_id: Rule identifier (e.g., 'REMOVE_FILLER', 'ADD_STRUCTURE')
+        description: Human-readable description of the change
+        location: Optional (start, end) character positions in text
+        before: Optional text before the change
+        after: Optional text after the change
+
+    Example:
+        >>> change = OptimizationChange(
+        ...     rule_id="REMOVE_FILLER",
+        ...     description="Removed filler word 'very'",
+        ...     location=(42, 47),
+        ...     before="very important",
+        ...     after="important"
+        ... )
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    rule_id: str = Field(..., description="Rule identifier (e.g., 'REMOVE_FILLER')")
+    description: str = Field(..., description="Human-readable description")
+    location: Optional[Tuple[int, int]] = Field(
+        None, description="(start, end) character positions"
+    )
+    before: Optional[str] = Field(None, description="Text before change")
+    after: Optional[str] = Field(None, description="Text after change")
 
 
 class Prompt(BaseModel):
@@ -114,7 +165,7 @@ class Prompt(BaseModel):
     @field_validator("text")
     @classmethod
     def validate_text_not_empty(cls, v: str) -> str:
-        """Ensure prompt text is not empty.
+        """Ensure prompt text is non-empty and within size limits.
 
         Args:
             v: Prompt text to validate.
@@ -123,10 +174,24 @@ class Prompt(BaseModel):
             Validated text.
 
         Raises:
-            ValueError: If text is empty or whitespace only.
+            ValueError: If text is empty, whitespace only, or exceeds size limit.
         """
         if not v or not v.strip():
             raise ValueError("Prompt text cannot be empty")
+
+        # Enforce reasonable limits (LLM context windows)
+        # GPT-4: ~8k tokens ≈ 32k chars
+        # GPT-4-32k: ~32k tokens ≈ 128k chars
+        # Claude 2: ~100k tokens ≈ 400k chars
+        MAX_PROMPT_LENGTH = 100_000  # ~25k tokens (safe for most LLMs)
+
+        if len(v) > MAX_PROMPT_LENGTH:
+            raise ValueError(
+                f"Prompt exceeds maximum length: "
+                f"{len(v):,} > {MAX_PROMPT_LENGTH:,} characters. "
+                f"Please split into smaller prompts or use a model with larger context."
+            )
+
         return v
 
     @field_validator("variables")
@@ -281,7 +346,7 @@ class OptimizationResult(BaseModel):
         strategy: Strategy used for optimization.
         improvement_score: Score delta (optimized - original).
         confidence: Confidence in improvement (0.0-1.0).
-        changes: List of change descriptions.
+        changes: List of structured changes made (OptimizationChange objects).
         metadata: Additional optimization metadata.
         optimized_at: Timestamp of optimization.
 
@@ -293,7 +358,7 @@ class OptimizationResult(BaseModel):
         ...     strategy=OptimizationStrategy.CLARITY_FOCUS,
         ...     improvement_score=10.5,
         ...     confidence=0.85,
-        ...     changes=["Added specific output format"],
+        ...     changes=[OptimizationChange(...)],
         ...     metadata={},
         ...     optimized_at=datetime.now()
         ... )
@@ -309,7 +374,9 @@ class OptimizationResult(BaseModel):
     confidence: float = Field(
         ..., ge=0.0, le=1.0, description="Confidence in improvement"
     )
-    changes: List[str] = Field(default_factory=list, description="List of changes")
+    changes: List[OptimizationChange] = Field(
+        default_factory=list, description="Structured list of changes made"
+    )
     metadata: Dict[str, Any] = Field(
         default_factory=dict, description="Additional metadata"
     )
@@ -503,3 +570,344 @@ class OptimizationConfig(BaseModel):
         if not v:
             raise ValueError("At least one strategy must be specified")
         return v
+
+
+# ============================================================================
+# Test-Driven Optimization Models (Phase 1)
+# ============================================================================
+
+
+class ErrorDistribution(BaseModel):
+    """Error type distribution from test execution.
+
+    Provides detailed breakdown of error types to inform optimization strategies.
+    For example, high timeout errors suggest clarity issues (prompt too complex),
+    while high API errors suggest infrastructure issues.
+
+    Attributes:
+        timeout_errors: Number of timeout errors (suggests complex/long prompts).
+        api_errors: Number of API/network errors (infrastructure issues).
+        validation_errors: Number of validation failures (output format issues).
+        llm_errors: Number of LLM-specific errors (rate limit, content filter).
+        total_errors: Total error count (must equal sum of individual errors).
+
+    Example:
+        >>> errors = ErrorDistribution(
+        ...     timeout_errors=5,
+        ...     api_errors=2,
+        ...     validation_errors=1,
+        ...     llm_errors=0,
+        ...     total_errors=8
+        ... )
+        >>> assert errors.total_errors == 8
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    timeout_errors: int = Field(default=0, ge=0, description="Timeout error count")
+    api_errors: int = Field(default=0, ge=0, description="API error count")
+    validation_errors: int = Field(
+        default=0, ge=0, description="Validation error count"
+    )
+    llm_errors: int = Field(default=0, ge=0, description="LLM-specific error count")
+    total_errors: int = Field(default=0, ge=0, description="Total error count")
+
+    @field_validator("total_errors")
+    @classmethod
+    def validate_total_errors(cls, v: int, info) -> int:
+        """Ensure total_errors matches sum of individual errors.
+
+        Args:
+            v: Total errors value.
+            info: Field validation info.
+
+        Returns:
+            Validated total_errors.
+
+        Raises:
+            ValueError: If total doesn't match sum of components.
+        """
+        individual_sum = (
+            info.data.get("timeout_errors", 0)
+            + info.data.get("api_errors", 0)
+            + info.data.get("validation_errors", 0)
+            + info.data.get("llm_errors", 0)
+        )
+        if v != individual_sum:
+            raise ValueError(
+                f"total_errors ({v}) must equal sum of individual errors ({individual_sum})"
+            )
+        return v
+
+
+class TestExecutionReport(BaseModel):
+    """Aggregated test execution metrics for optimization decisions.
+
+    This model serves as the contract between executor and optimizer modules.
+    It is intentionally decoupled from executor's internal models (RunExecutionResult)
+    to allow independent evolution of both modules.
+
+    Design Rationale:
+        - Placed in optimizer module (consumer defines contract)
+        - Conversion via factory method from executor results
+        - Strongly typed to catch errors at compile time
+        - Includes percentile metrics for latency analysis
+
+    Attributes:
+        workflow_id: Workflow identifier.
+        run_id: Test run identifier (from executor).
+        total_tests: Total number of tests executed.
+        successful_tests: Number of successful tests.
+        failed_tests: Number of failed tests.
+        success_rate: Success rate (0.0-1.0).
+        avg_response_time_ms: Average response time in milliseconds.
+        p95_response_time_ms: 95th percentile response time.
+        p99_response_time_ms: 99th percentile response time.
+        total_tokens: Total tokens consumed across all tests.
+        avg_tokens_per_request: Average tokens per request.
+        total_cost: Total cost in USD.
+        cost_per_request: Average cost per request in USD.
+        error_distribution: Error type distribution.
+        executed_at: Execution timestamp.
+        metadata: Additional execution metadata.
+
+    Example:
+        >>> report = TestExecutionReport(
+        ...     workflow_id="wf_001",
+        ...     run_id="run_001",
+        ...     total_tests=100,
+        ...     successful_tests=95,
+        ...     failed_tests=5,
+        ...     success_rate=0.95,
+        ...     avg_response_time_ms=1200.0,
+        ...     total_tokens=50000,
+        ...     avg_tokens_per_request=500.0,
+        ...     total_cost=2.5,
+        ...     cost_per_request=0.025
+        ... )
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    # Identifiers
+    workflow_id: str = Field(..., description="Workflow ID")
+    run_id: str = Field(..., description="Test run ID from executor")
+
+    # Test counts
+    total_tests: int = Field(..., ge=1, description="Total tests executed")
+    successful_tests: int = Field(..., ge=0, description="Successful tests")
+    failed_tests: int = Field(..., ge=0, description="Failed tests")
+
+    # Success metrics
+    success_rate: float = Field(..., ge=0.0, le=1.0, description="Success rate (0.0-1.0)")
+
+    # Performance metrics
+    avg_response_time_ms: float = Field(
+        ..., ge=0.0, description="Average response time (ms)"
+    )
+    p95_response_time_ms: Optional[float] = Field(
+        None, ge=0.0, description="95th percentile response time (ms)"
+    )
+    p99_response_time_ms: Optional[float] = Field(
+        None, ge=0.0, description="99th percentile response time (ms)"
+    )
+
+    # Token and cost metrics
+    total_tokens: int = Field(..., ge=0, description="Total tokens consumed")
+    avg_tokens_per_request: float = Field(
+        ..., ge=0.0, description="Average tokens per request"
+    )
+    total_cost: float = Field(..., ge=0.0, description="Total cost (USD)")
+    cost_per_request: float = Field(
+        ..., ge=0.0, description="Average cost per request (USD)"
+    )
+
+    # Error analysis
+    error_distribution: ErrorDistribution = Field(
+        default_factory=ErrorDistribution, description="Error type distribution"
+    )
+
+    # Metadata
+    executed_at: datetime = Field(
+        default_factory=lambda: datetime.now(), description="Execution timestamp"
+    )
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict, description="Additional metadata"
+    )
+
+    @field_validator("success_rate")
+    @classmethod
+    def validate_success_rate_consistency(cls, v: float, info) -> float:
+        """Ensure success_rate matches successful_tests / total_tests.
+
+        Args:
+            v: Success rate value.
+            info: Field validation info.
+
+        Returns:
+            Validated success_rate.
+
+        Raises:
+            ValueError: If success_rate inconsistent with test counts.
+        """
+        total = info.data.get("total_tests")
+        successful = info.data.get("successful_tests")
+
+        if total and successful is not None:
+            expected_rate = successful / total
+            # Allow small floating point differences
+            if abs(v - expected_rate) > 0.001:
+                raise ValueError(
+                    f"success_rate ({v:.3f}) inconsistent with "
+                    f"successful_tests/total_tests ({expected_rate:.3f})"
+                )
+        return v
+
+    @classmethod
+    def from_executor_result(cls, executor_result: Any) -> "TestExecutionReport":
+        """Convert executor's RunExecutionResult to TestExecutionReport.
+
+        This factory method decouples executor and optimizer modules by
+        providing a conversion layer. It extracts and transforms executor's
+        internal statistics into optimizer's contract format.
+
+        Args:
+            executor_result: RunExecutionResult from executor.models
+
+        Returns:
+            TestExecutionReport for optimizer consumption
+
+        Raises:
+            ValueError: If executor_result is None or missing required fields
+            ImportError: If executor module is not available
+
+        Example:
+            >>> from src.executor.executor_service import ExecutorService
+            >>> service = ExecutorService()
+            >>> exec_result = service.scheduler.run_manifest(manifest)
+            >>> test_report = TestExecutionReport.from_executor_result(exec_result)
+            >>> print(f"Success rate: {test_report.success_rate:.2%}")
+        """
+        if executor_result is None:
+            raise ValueError("executor_result cannot be None")
+
+        # Import here to avoid circular dependency
+        try:
+            from src.executor.models import TaskStatus
+        except ImportError as e:
+            raise ImportError(
+                "executor module required for conversion. "
+                "Ensure src.executor is available."
+            ) from e
+
+        stats = executor_result.statistics
+
+        # Calculate percentiles from task_results
+        response_times = [
+            tr.execution_time * 1000  # Convert seconds to ms
+            for tr in executor_result.task_results
+            if tr.execution_time > 0
+        ]
+
+        p95 = None
+        p99 = None
+        if response_times:
+            response_times_sorted = sorted(response_times)
+            p95_idx = int(len(response_times_sorted) * 0.95)
+            p99_idx = int(len(response_times_sorted) * 0.99)
+            if p95_idx < len(response_times_sorted):
+                p95 = response_times_sorted[p95_idx]
+            if p99_idx < len(response_times_sorted):
+                p99 = response_times_sorted[p99_idx]
+
+        # Analyze error distribution
+        # Note: In executor, failed_tasks, timeout_tasks, and error_tasks are separate counts
+        # We map timeout_tasks -> timeout_errors, error_tasks -> api_errors
+        # total_errors should only be sum of these components, not failed_tasks
+        error_dist = ErrorDistribution(
+            timeout_errors=stats.timeout_tasks,
+            api_errors=stats.error_tasks,
+            validation_errors=0,  # Executor doesn't track this separately
+            llm_errors=0,  # Would need to parse error messages
+            total_errors=stats.timeout_tasks + stats.error_tasks,
+        )
+
+        return cls(
+            workflow_id=executor_result.workflow_id,
+            run_id=executor_result.run_id,
+            total_tests=stats.total_tasks,
+            successful_tests=stats.succeeded_tasks,
+            failed_tests=stats.failed_tasks + stats.timeout_tasks + stats.error_tasks,
+            success_rate=stats.success_rate,
+            avg_response_time_ms=stats.avg_execution_time * 1000,  # Convert to ms
+            p95_response_time_ms=p95,
+            p99_response_time_ms=p99,
+            total_tokens=stats.total_tokens,
+            avg_tokens_per_request=(
+                stats.total_tokens / stats.completed_tasks
+                if stats.completed_tasks > 0
+                else 0.0
+            ),
+            total_cost=stats.total_cost,
+            cost_per_request=(
+                stats.total_cost / stats.completed_tasks
+                if stats.completed_tasks > 0
+                else 0.0
+            ),
+            error_distribution=error_dist,
+            executed_at=executor_result.finished_at,
+            metadata={
+                "total_retries": stats.total_retries,
+                "cancelled_tasks": stats.cancelled_tasks,
+            },
+        )
+
+    def has_timeout_errors(self) -> bool:
+        """Check if execution had timeout errors.
+
+        Returns:
+            True if any timeout errors occurred.
+
+        Example:
+            >>> if report.has_timeout_errors():
+            ...     print("Consider optimizing prompt for clarity")
+        """
+        return self.error_distribution.timeout_errors > 0
+
+    def has_api_errors(self) -> bool:
+        """Check if execution had API errors.
+
+        Returns:
+            True if any API errors occurred.
+
+        Example:
+            >>> if report.has_api_errors():
+            ...     print("Infrastructure issues detected")
+        """
+        return self.error_distribution.api_errors > 0
+
+    def get_error_rate(self) -> float:
+        """Calculate overall error rate.
+
+        Returns:
+            Error rate as float (0.0-1.0).
+
+        Example:
+            >>> error_rate = report.get_error_rate()
+            >>> print(f"Error rate: {error_rate:.2%}")
+        """
+        return 1.0 - self.success_rate
+
+    def get_timeout_error_rate(self) -> float:
+        """Calculate timeout error rate.
+
+        Returns:
+            Timeout error rate as float (0.0-1.0).
+
+        Example:
+            >>> if report.get_timeout_error_rate() > 0.1:
+            ...     print("More than 10% timeouts - prompt may be too complex")
+        """
+        if self.total_tests == 0:
+            return 0.0
+        return self.error_distribution.timeout_errors / self.total_tests

@@ -9,7 +9,7 @@ Description: Unit tests for prompt optimization engine
 import pytest
 
 from src.optimizer.optimization_engine import OptimizationEngine
-from src.optimizer.models import Prompt, OptimizationStrategy
+from src.optimizer.models import Prompt, OptimizationStrategy, OptimizationChange
 from src.optimizer.exceptions import InvalidStrategyError, OptimizationFailedError
 
 
@@ -118,7 +118,7 @@ class TestChangeDetection:
     def test_changes_describe_modifications(self, engine, sample_prompt):
         """Test that changes describe what was modified."""
         result = engine.optimize(sample_prompt, "structure_focus")
-        changes_text = " ".join(result.changes).lower()
+        changes_text = " ".join(c.description for c in result.changes).lower()
         # Should mention structural changes
         assert any(word in changes_text for word in ["header", "structure", "format", "list"])
 

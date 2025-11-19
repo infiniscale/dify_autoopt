@@ -160,10 +160,24 @@ class PromptPatchEngine:
         return matched_paths
 
     def _get_prompt_fields(self, workflow_id: str, node_path: str) -> List[str]:
-        """Get prompt field paths for a node"""
+        """Get prompt field paths for a node with warning on unknown types."""
         for node in self._node_index.get(workflow_id, {}).values():
             if node.path == node_path:
+                # Add warning if prompt_fields is empty (unknown node type)
+                if not node.prompt_fields:
+                    logger.warning(
+                        "Node '{}' (type='{}') has no prompt fields configured. "
+                        "Patch will be skipped. This may indicate an unknown node type. "
+                        "workflow_id={}, node_id={}".format(
+                            node.node_id, node.type, workflow_id, node.node_id
+                        )
+                    )
                 return node.prompt_fields
+        logger.warning(
+            "Node not found at path '{}' - patch will be skipped. workflow_id={}".format(
+                node_path, workflow_id
+            )
+        )
         return []
 
     def _apply_strategy(

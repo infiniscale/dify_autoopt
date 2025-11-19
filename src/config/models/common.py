@@ -19,7 +19,25 @@ class RateLimit(BaseModel):
 
 
 class ModelEvaluator(BaseModel):
-    """High-level model configuration for evaluation"""
+    """High-level model configuration for evaluation.
+
+    Used by executor module for test result scoring with LLMs.
+
+    TODO: Consider extracting common base class with LLMConfig
+    when executor LLM evaluation is fully implemented.
+
+    Current status: Placeholder (executor not using LLM evaluation yet)
+
+    Field overlap with LLMConfig (src/optimizer/config/llm_config.py):
+    - provider, model_name, temperature, max_tokens (100% overlap)
+
+    Future refactoring:
+    - Create src/config/models/llm_base_config.py
+    - ModelEvaluator and LLMConfig both inherit from LLMBaseConfig
+    - Eliminates field duplication while maintaining separate concerns
+
+    See: config/README.md "LLM配置说明" for details
+    """
     model_config = ConfigDict(extra='forbid', validate_assignment=True)
 
     provider: str = Field(..., description="Model provider (e.g., 'openai', 'anthropic')")

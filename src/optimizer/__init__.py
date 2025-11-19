@@ -42,6 +42,9 @@ from .optimization_engine import OptimizationEngine
 from .version_manager import VersionManager
 from .prompt_patch_engine import PromptPatchEngine
 
+# Configuration
+from .config import LLMConfig, LLMProvider
+
 # Data models
 from .models import (
     Prompt,
@@ -93,6 +96,9 @@ __all__ = [
     "OptimizationEngine",
     "VersionManager",
     "PromptPatchEngine",
+    # Configuration
+    "LLMConfig",
+    "LLMProvider",
     # Models
     "Prompt",
     "PromptAnalysis",
@@ -144,14 +150,15 @@ def optimize_workflow(
     baseline_metrics: Optional[Dict[str, Any]] = None,
     config: Optional[OptimizationConfig] = None,
     llm_client: Optional[LLMClient] = None,
+    llm_config: Optional[LLMConfig] = None,
     storage: Optional[VersionStorage] = None,
 ) -> List[PromptPatch]:
-    """Convenience function for workflow optimization.
+    """Convenience function for workflow optimization with optional LLM support.
 
     High-level API that handles the complete optimization cycle:
         1. Extract prompts from workflow
         2. Analyze prompt quality
-        3. Optimize low-scoring prompts
+        3. Optimize low-scoring prompts (using rules or LLM)
         4. Generate PromptPatch objects
 
     Args:
@@ -160,7 +167,8 @@ def optimize_workflow(
         strategy: Optimization strategy (auto, clarity_focus, efficiency_focus, structure_focus).
         baseline_metrics: Optional baseline performance metrics.
         config: Optional optimization configuration.
-        llm_client: Optional LLM client (defaults to StubLLMClient).
+        llm_client: Optional LLM client (deprecated - use llm_config instead).
+        llm_config: Optional LLM configuration for LLM-driven optimization.
         storage: Optional version storage (defaults to InMemoryStorage).
 
     Returns:
@@ -172,15 +180,29 @@ def optimize_workflow(
 
     Example:
         >>> from src.config import ConfigLoader
-        >>> from src.optimizer import optimize_workflow
+        >>> from src.optimizer import optimize_workflow, LLMConfig, LLMProvider
         >>>
         >>> loader = ConfigLoader()
         >>> catalog = loader.load_workflow_catalog("config/workflows.yaml")
         >>>
+        >>> # Rule-based optimization (default)
         >>> patches = optimize_workflow(
         ...     workflow_id="wf_001",
         ...     catalog=catalog,
         ...     strategy="clarity_focus"
+        ... )
+        >>>
+        >>> # LLM-driven optimization
+        >>> llm_config = LLMConfig(
+        ...     provider=LLMProvider.OPENAI,
+        ...     model="gpt-4-turbo-preview",
+        ...     api_key_env="OPENAI_API_KEY"
+        ... )
+        >>> patches = optimize_workflow(
+        ...     workflow_id="wf_001",
+        ...     catalog=catalog,
+        ...     strategy="llm_guided",
+        ...     llm_config=llm_config
         ... )
         >>>
         >>> print(f"Generated {len(patches)} prompt patches")
@@ -188,6 +210,7 @@ def optimize_workflow(
     service = OptimizerService(
         catalog=catalog,
         llm_client=llm_client,
+        llm_config=llm_config,
         storage=storage,
     )
 

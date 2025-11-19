@@ -7,3 +7,10 @@ allpairspy>=2.5.0
 openpyxl>=3.1.0
 pytest>=7.4.0
 pytest-cov>=4.0.0
+
+# LLM Integration Dependencies
+openai>=1.0.0           # OpenAI GPT API client
+anthropic>=0.7.0        # Anthropic Claude API client
+tiktoken>=0.5.0         # Token counting for OpenAI models
+tenacity>=8.2.0         # Retry logic with exponential backoff
+python-dotenv>=1.0.0    # Environment variable management

@@ -2,16 +2,12 @@
 import json
 import sys
 import subprocess
-import os
 
 try:
     input_data = json.load(sys.stdin)
 except json.JSONDecodeError as e:
-    # If JSON parsing fails, allow the command (fail open for safety)
-    sys.exit(0)
-except Exception:
-    # Any other error, allow the command
-    sys.exit(0)
+    print(f"Error: Invalid JSON input: {e}", file=sys.stderr)
+    sys.exit(1)
 
 tool_name = input_data.get("tool_name", "")
 tool_input = input_data.get("tool_input", {})

@@ -1,0 +1,228 @@
+# LLM Configuration Example
+#
+# This file demonstrates how to configure LLM integration for the optimizer module.
+# Copy this file to config/llm.yaml and customize it for your environment.
+#
+# Security Notice:
+# - NEVER store actual API keys in this file
+# - Use environment variables for API keys
+# - Reference environment variable names using 'api_key_env' field
+# - Add config/llm.yaml to .gitignore
+#
+# Author: Backend Developer
+# Date: 2025-11-18
+
+# =============================================================================
+# Example 1: OpenAI GPT-4 Configuration (Production)
+# =============================================================================
+llm:
+  # Provider selection (openai, anthropic, local, stub)
+  provider: openai
+
+  # API Key Configuration
+  # IMPORTANT: This references an environment variable name, NOT the actual key
+  api_key_env: OPENAI_API_KEY
+
+  # Model Selection
+  # Options: gpt-4-turbo-preview, gpt-4, gpt-3.5-turbo, etc.
+  model: gpt-4-turbo-preview
+
+  # API Configuration
+  base_url: null  # Leave null for OpenAI's default endpoint
+  timeout: 60  # Request timeout in seconds
+
+  # Generation Parameters
+  temperature: 0.7  # Sampling temperature (0.0 = deterministic, 2.0 = creative)
+  max_tokens: 2000  # Maximum tokens to generate
+
+  # Caching Configuration
+  enable_cache: true  # Enable response caching to reduce API calls
+  cache_ttl: 86400  # Cache TTL in seconds (24 hours)
+
+  # Retry Configuration
+  max_retries: 3  # Maximum retry attempts for failed API calls
+
+  # Cost Control
+  cost_limits:
+    max_cost_per_request: 0.10  # Maximum cost per single request (USD)
+    max_cost_per_day: 100.0  # Maximum daily cost (USD)
+
+  # Provider-specific settings
+  provider_settings:
+    organization: null  # OpenAI organization ID (optional)
+
+# =============================================================================
+# Example 2: OpenAI GPT-3.5 Configuration (Cost-Effective)
+# =============================================================================
+# llm:
+#   provider: openai
+#   api_key_env: OPENAI_API_KEY
+#   model: gpt-3.5-turbo
+#   temperature: 0.7
+#   max_tokens: 2000
+#   enable_cache: true
+#   cache_ttl: 86400
+#   max_retries: 3
+#   timeout: 60
+#   cost_limits:
+#     max_cost_per_request: 0.05
+#     max_cost_per_day: 20.0
+
+# =============================================================================
+# Example 3: Anthropic Claude Configuration
+# =============================================================================
+# llm:
+#   provider: anthropic
+#   api_key_env: ANTHROPIC_API_KEY
+#   model: claude-3-opus-20240229  # or claude-3-sonnet-20240229
+#   temperature: 0.7
+#   max_tokens: 2000
+#   enable_cache: true
+#   cache_ttl: 86400
+#   max_retries: 3
+#   timeout: 60
+#   cost_limits:
+#     max_cost_per_request: 0.15
+#     max_cost_per_day: 150.0
+#   provider_settings:
+#     api_version: "2023-06-01"
+
+# =============================================================================
+# Example 4: Local LLM Configuration (Ollama/vLLM)
+# =============================================================================
+# llm:
+#   provider: local
+#   api_key_env: ""  # No API key needed for local models
+#   model: llama2  # Or your local model name
+#   base_url: http://localhost:11434/v1  # Ollama endpoint
+#   temperature: 0.7
+#   max_tokens: 2000
+#   enable_cache: true
+#   cache_ttl: 3600
+#   max_retries: 2
+#   timeout: 120  # Local models may need more time
+#   cost_limits: null  # No cost for local models
+#   provider_settings:
+#     num_ctx: 4096  # Context window size
+
+# =============================================================================
+# Example 5: Stub Configuration (Development/Testing)
+# =============================================================================
+# llm:
+#   provider: stub
+#   model: stub-model
+#   temperature: 0.7
+#   max_tokens: 2000
+#   enable_cache: false  # No caching needed for rule-based
+#   max_retries: 0
+#   timeout: 0
+
+# =============================================================================
+# Configuration Field Reference
+# =============================================================================
+#
+# provider: (required)
+#   - openai: Use OpenAI GPT models
+#   - anthropic: Use Anthropic Claude models
+#   - local: Use local LLM (Ollama, vLLM, etc.)
+#   - stub: Use rule-based optimization (no LLM, default)
+#
+# api_key_env: (required for openai, anthropic)
+#   - Name of environment variable containing API key
+#   - Example: OPENAI_API_KEY, ANTHROPIC_API_KEY
+#   - Set the actual key in .env file or system environment
+#
+# model: (required)
+#   - Model identifier
+#   - OpenAI: gpt-4-turbo-preview, gpt-4, gpt-3.5-turbo
+#   - Anthropic: claude-3-opus-20240229, claude-3-sonnet-20240229
+#   - Local: Your model name (e.g., llama2, mistral)
+#
+# base_url: (optional, required for local)
+#   - Custom API endpoint
+#   - Leave null for default provider endpoints
+#   - For Ollama: http://localhost:11434/v1
+#   - For vLLM: http://localhost:8000/v1
+#
+# temperature: (optional, default: 0.7)
+#   - Sampling temperature (0.0 - 2.0)
+#   - Lower = more deterministic
+#   - Higher = more creative/random
+#
+# max_tokens: (optional, default: 2000)
+#   - Maximum tokens to generate in response
+#   - Must be positive, <= 128000
+#
+# enable_cache: (optional, default: true)
+#   - Enable response caching
+#   - Reduces API calls and costs
+#   - Recommended: true for production
+#
+# cache_ttl: (optional, default: 86400)
+#   - Cache TTL in seconds
+#   - Default: 86400 (24 hours)
+#
+# max_retries: (optional, default: 3)
+#   - Maximum retry attempts for failed API calls
+#   - 0-10 retries allowed
+#
+# timeout: (optional, default: 60)
+#   - Request timeout in seconds
+#   - Increase for slower models or networks
+#
+# cost_limits: (optional)
+#   - Cost control limits
+#   - max_cost_per_request: Maximum cost per API call (USD)
+#   - max_cost_per_day: Maximum daily cost (USD)
+#   - max_cost_per_month: Maximum monthly cost (USD)
+#
+# provider_settings: (optional)
+#   - Provider-specific configuration
+#   - Varies by provider
+#   - See provider documentation for options
+
+# =============================================================================
+# Environment Variables (Alternative Configuration)
+# =============================================================================
+#
+# Instead of using this YAML file, you can configure via environment variables:
+#
+# LLM_PROVIDER=openai
+# LLM_MODEL=gpt-4-turbo-preview
+# LLM_API_KEY_ENV=OPENAI_API_KEY
+# LLM_TEMPERATURE=0.7
+# LLM_MAX_TOKENS=2000
+# LLM_ENABLE_CACHE=true
+# LLM_CACHE_TTL=86400
+# LLM_MAX_RETRIES=3
+# LLM_TIMEOUT=60
+# LLM_MAX_COST_PER_REQUEST=0.10
+# LLM_MAX_COST_PER_DAY=100.0
+#
+# Environment variables take precedence over this file.
+
+# =============================================================================
+# Security Best Practices
+# =============================================================================
+#
+# 1. API Key Security:
+#    - NEVER commit actual API keys to version control
+#    - Always use environment variables for API keys
+#    - Add .env and config/llm.yaml to .gitignore
+#    - Rotate API keys regularly
+#
+# 2. Cost Protection:
+#    - Always set cost_limits to prevent unexpected charges
+#    - Monitor usage regularly
+#    - Start with lower limits and increase as needed
+#
+# 3. Rate Limiting:
+#    - Respect provider rate limits
+#    - Use caching to reduce API calls
+#    - Consider batch processing for multiple requests
+#
+# 4. Configuration Management:
+#    - Use different configurations for dev/staging/production
+#    - Test with cheaper models (gpt-3.5-turbo) before using gpt-4
+#    - Keep this example file in version control
+#    - Keep actual config/llm.yaml out of version control

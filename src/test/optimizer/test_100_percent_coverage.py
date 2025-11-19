@@ -56,7 +56,7 @@ from src.optimizer.prompt_extractor import PromptExtractor
 from src.optimizer.optimization_engine import OptimizationEngine
 from src.optimizer.optimizer_service import OptimizerService
 from src.optimizer.version_manager import VersionManager
-from src.optimizer.interfaces.llm_client import LLMClient, StubLLMClient
+from src.optimizer.interfaces.llm_client import LLMClient, StubLLMClient, LLMResponse
 from src.optimizer.interfaces.storage import VersionStorage, InMemoryStorage
 
 from src.config.models import (
@@ -736,13 +736,16 @@ class TestLLMClientEdgeCases:
         # This tests the else branch that should not be reached
         # but we can verify the method works with valid strategies
         result = client.optimize_prompt("Test prompt", "clarity_focus")
-        assert isinstance(result, str)
+        assert isinstance(result, LLMResponse)
+        assert isinstance(result.content, str)
 
         result = client.optimize_prompt("Test prompt", "efficiency_focus")
-        assert isinstance(result, str)
+        assert isinstance(result, LLMResponse)
+        assert isinstance(result.content, str)
 
         result = client.optimize_prompt("Test prompt", "structure_focus")
-        assert isinstance(result, str)
+        assert isinstance(result, LLMResponse)
+        assert isinstance(result.content, str)
 
 
 # =============================================================================
@@ -1144,7 +1147,8 @@ class TestAdditionalCoverage:
         # All valid strategies should work
         for strategy in ["clarity_focus", "efficiency_focus", "structure_focus"]:
             result = client.optimize_prompt("Test", strategy)
-            assert isinstance(result, str)
+            assert isinstance(result, LLMResponse)
+            assert isinstance(result.content, str)
 
     def test_models_validators_lines_268_335(self):
         """Test model validators are triggered (lines 268, 335)."""

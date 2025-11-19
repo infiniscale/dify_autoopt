@@ -24,7 +24,7 @@ from src.optimizer.exceptions import (
     ValidationError,
     ConfigError,
 )
-from src.optimizer.interfaces.llm_client import LLMClient, StubLLMClient
+from src.optimizer.interfaces.llm_client import LLMClient, StubLLMClient, LLMResponse
 from src.optimizer.optimization_engine import OptimizationEngine
 from src.optimizer.prompt_analyzer import PromptAnalyzer
 from src.optimizer.models import Prompt
@@ -112,31 +112,37 @@ class TestStubLLMClient:
     def test_stub_analyze_prompt(self):
         """Test StubLLMClient analyze_prompt."""
         client = StubLLMClient()
-        analysis = client.analyze_prompt("Test prompt")
-        assert analysis is not None
-        assert 0.0 <= analysis.overall_score <= 100.0
+        response = client.analyze_prompt("Test prompt")
+        assert response is not None
+        assert isinstance(response, LLMResponse)
+        # Parse JSON content to verify structure
+        import json
+        analysis = json.loads(response.content)
+        assert 0.0 <= analysis["overall_score"] <= 100.0
 
     def test_stub_analyze_prompt_with_context(self):
         """Test StubLLMClient with context."""
         client = StubLLMClient()
-        analysis = client.analyze_prompt(
+        response = client.analyze_prompt(
             "Test prompt",
             context={"workflow_id": "wf_001", "node_id": "node_1"}
         )
-        assert analysis is not None
+        assert response is not None
+        assert isinstance(response, LLMResponse)
 
     def test_stub_optimize_prompt_clarity(self):
         """Test StubLLMClient optimize_prompt clarity."""
         client = StubLLMClient()
-        optimized = client.optimize_prompt("Test prompt", "clarity_focus")
-        assert optimized is not None
-        assert len(optimized) > 0
+        response = client.optimize_prompt("Test prompt", "clarity_focus")
+        assert response is not None
+        assert isinstance(response, LLMResponse)
+        assert len(response.content) > 0
 
     def test_stub_optimize_prompt_efficiency(self):
         """Test StubLLMClient optimize_prompt efficiency."""
         client = StubLLMClient()
-        optimized = client.optimize_prompt("Test prompt", "efficiency_focus")
-        assert optimized is not None
+        response = client.optimize_prompt("Test prompt", "efficiency_focus")
+        assert response is not None
 
     def test_stub_optimize_prompt_structure(self):
         """Test StubLLMClient optimize_prompt structure."""

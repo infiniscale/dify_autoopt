@@ -1,1363 +1,484 @@
-# Optimizer Module - Comprehensive Usage Guide
+# Optimizer模块实际使用链路和功能说明
 
-**Version**: 1.0.0
-**Last Updated**: 2025-01-17
-**Target Audience**: Developers, QA Engineers, System Architects
-
----
-
-## Table of Contents
-
-1. [Installation and Setup](#1-installation-and-setup)
-2. [Basic Tutorial](#2-basic-tutorial)
-3. [Advanced Usage](#3-advanced-usage)
-4. [Integration Examples](#4-integration-examples)
-5. [Real-World Case Studies](#5-real-world-case-studies)
-6. [Performance Tuning](#6-performance-tuning)
-7. [Production Deployment](#7-production-deployment)
-8. [FAQ](#8-faq)
+## 📋 目录
+1. [运行链路](#运行链路)
+2. [提取功能说明](#提取功能说明)
+3. [使用示例](#使用示例)
+4. [API参考](#api参考)
 
 ---
 
-## 1. Installation and Setup
+## 🔄 运行链路
 
-### 1.1 Prerequisites
-
-```bash
-# Python 3.10+
-python --version  # Python 3.10.0 or higher
-
-# Required dependencies (from pyproject.toml)
-- pydantic>=2.0
-- pyyaml>=6.0
-- loguru>=0.7.0
-```
-
-### 1.2 Project Structure
+### 完整优化流程
 
 ```
-dify_autoopt/
-├── src/
-│   ├── optimizer/
-│   │   ├── __init__.py              # Public API
-│   │   ├── models.py                # Data models
-│   │   ├── optimizer_service.py     # Main service
-│   │   ├── prompt_extractor.py      # DSL extraction
-│   │   ├── prompt_analyzer.py       # Quality analysis
-│   │   ├── optimization_engine.py   # Optimization logic
-│   │   ├── version_manager.py       # Version control
-│   │   ├── prompt_patch_engine.py   # Patch generation
-│   │   ├── exceptions.py            # Custom exceptions
-│   │   ├── interfaces/
-│   │   │   ├── llm_client.py       # LLM interface
-│   │   │   └── storage.py          # Storage interface
-│   │   └── utils/
-│   │       └── __init__.py
-│   └── config/
-│       ├── config_loader.py
-│       └── models.py
-├── config/
-│   ├── workflows.yaml               # Workflow catalog
-│   └── test_plan.yaml              # Test configuration
-├── tests/
-│   └── optimizer/
-│       ├── test_extractor.py
-│       ├── test_analyzer.py
-│       ├── test_engine.py
-│       └── test_service.py
-└── docs/
-    └── optimizer/
-        ├── optimizer_architecture.md
-        ├── optimizer_srs.md
-        └── optimizer_usage_guide.md  # This document
+用户调用
+   ↓
+OptimizerService.run_optimization_cycle(workflow_id)
+   ↓
+1️⃣ 提取阶段 (_extract_prompts)
+   → PromptExtractor.extract_from_workflow()
+   → 📦 提取 **所有** LLM节点的prompts
+   ↓
+2️⃣ 分析阶段 (对每个prompt)
+   → PromptAnalyzer.analyze_prompt()
+   → 📊 评分：清晰度、效率、信息密度
+   → 📝 创建baseline版本
+   ↓
+3️⃣ 决策阶段 (对每个prompt)
+   → ScoringRules.should_optimize()
+   → ❓ 分数 < 80分？有Critical问题？
+   → ✅ 需要优化 → 继续
+   → ❌ 不需要 → 跳过
+   ↓
+4️⃣ 优化阶段 (多策略+迭代)
+   → 尝试所有配置的策略
+   → OptimizationEngine.optimize()
+   → 🔄 最多迭代N次直到达到质量阈值
+   → 🎯 选择最佳结果
+   ↓
+5️⃣ 版本管理阶段
+   → VersionManager.create_version()
+   → 📚 保存优化后的版本
+   ↓
+6️⃣ 生成Patch阶段
+   → _create_prompt_patch()
+   → 🔧 生成PromptPatch对象
+   ↓
+返回 List[PromptPatch]
 ```
 
-### 1.3 Environment Setup
+### 关键流程细节
 
-```bash
-# 1. Clone repository
-git clone <repository-url>
-cd dify_autoopt
+```python
+# 伪代码展示内部逻辑
+def run_optimization_cycle(workflow_id):
+    # 1. 提取所有LLM prompts（一次性全部提取）
+    prompts = extractor.extract_from_workflow(workflow_dsl)
+    # 返回: [prompt1, prompt2, prompt3, ...]
 
-# 2. Create virtual environment
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+    patches = []
 
-# 3. Install dependencies
-pip install -e .
+    # 2. 遍历每个prompt（逐个处理）
+    for prompt in prompts:
+        # 2.1 分析baseline
+        analysis = analyzer.analyze_prompt(prompt)
 
-# 4. Verify installation
-python -c "from src.optimizer import OptimizerService; print('OK')"
-```
+        # 2.2 判断是否需要优化
+        if not should_optimize(analysis):
+            continue  # 跳过高质量prompt
 
-### 1.4 Configuration Files
+        # 2.3 尝试多种策略优化
+        best_result = None
+        for strategy in config.strategies:
+            result = optimize_with_iterations(
+                prompt,
+                strategy,
+                max_iterations=3
+            )
+            if result.is_better_than(best_result):
+                best_result = result
 
-Create workflow catalog (`config/workflows.yaml`):
+        # 2.4 保存最佳结果
+        if best_result.confidence >= threshold:
+            version_manager.create_version(optimized_prompt)
+            patch = create_patch(prompt, best_result)
+            patches.append(patch)
 
-```yaml
-workflows:
-  - workflow_id: "wf_customer_service"
-    name: "Customer Service Bot"
-    description: "AI-powered customer support"
-    dsl_path: "workflows/customer_service.yml"
-    tags: ["production", "chatbot"]
-
-  - workflow_id: "wf_summarizer"
-    name: "Document Summarizer"
-    description: "Summarize long documents"
-    dsl_path: "workflows/summarizer.yml"
-    tags: ["batch", "nlp"]
-```
-
-Create test plan (`config/test_plan.yaml`):
-
-```yaml
-plan_name: "Optimizer Validation"
-description: "Test prompt optimization"
-
-workflows:
-  - workflow_id: "wf_customer_service"
-    enabled: true
-    datasets:
-      - dataset_id: "ds_support_tickets"
-        enabled: true
-        data_path: "data/support_tickets.jsonl"
-        pairwise_dimensions:
-          - name: "category"
-            values: ["billing", "technical", "general"]
-          - name: "urgency"
-            values: ["low", "medium", "high"]
+    return patches  # 返回需要应用的patches
 ```
 
 ---
 
-## 2. Basic Tutorial
+## 🔍 提取功能说明
 
-### Tutorial 1: First Optimization
+### 问题回答：一次性提取 vs 指定节点？
 
-**Goal**: Optimize a single workflow and understand the complete process.
+#### ✅ **当前实现：一次性提取所有LLM节点**
 
-**Duration**: 10 minutes
+**提取策略：**
+```python
+# PromptExtractor.extract_from_workflow()
+def extract_from_workflow(workflow_dict, workflow_id):
+    """
+    提取逻辑：
+    1. 遍历workflow中的所有节点
+    2. 对每个节点调用 extract_from_node()
+    3. 只提取 node_type == "llm" 的节点
+    4. 忽略其他类型节点（code, http, template等）
+    """
+    nodes = find_all_nodes(workflow_dict)
+    prompts = []
 
-#### Step 1: Load Configuration
+    for node in nodes:
+        if node.type == "llm":  # 只处理LLM节点
+            prompt = extract_from_node(node)
+            prompts.append(prompt)
+
+    return prompts  # 返回所有LLM prompts
+```
+
+**支持的节点类型：**
+- ✅ `llm` - LLM节点（会提取）
+- ✅ `question-classifier` - 问题分类器（会提取）
+- ✅ `if-else` - 条件判断（会提取system_prompt）
+- ❌ `code` - 代码节点（跳过）
+- ❌ `http-request` - HTTP请求（跳过）
+- ❌ `template-transform` - 模板转换（跳过）
+- ❌ 其他非LLM节点（跳过）
+
+#### ⭐ **也支持单节点提取（通过API）**
+
+虽然主流程是全量提取，但你可以单独使用：
 
 ```python
-from src.config import ConfigLoader
+# 方式1: 提取所有LLM节点（推荐）
+prompts = extractor.extract_from_workflow(workflow_dict, "wf_001")
+# 返回: [prompt1, prompt2, prompt3]
 
-# Initialize loader
-loader = ConfigLoader()
-
-# Load workflow catalog
-catalog = loader.load_workflow_catalog("config/workflows.yaml")
-
-# Verify workflow exists
-workflow = catalog.get_workflow("wf_customer_service")
-if workflow:
-    print(f"Found workflow: {workflow.name}")
-    print(f"DSL Path: {workflow.dsl_path}")
-else:
-    print("Workflow not found")
+# 方式2: 提取单个节点（如果你只想优化特定节点）
+single_node = workflow_dict["graph"]["nodes"][0]
+prompt = extractor.extract_from_node(single_node, "wf_001")
+# 返回: 单个Prompt对象或None
 ```
 
-**Expected Output**:
-```
-Found workflow: Customer Service Bot
-DSL Path: workflows/customer_service.yml
-```
-
-#### Step 2: Analyze Workflow Quality
+### 提取后的数据结构
 
 ```python
-from src.optimizer import analyze_workflow
-
-# Analyze all prompts in workflow
-report = analyze_workflow("wf_customer_service", catalog)
-
-# Print summary
-print(f"Workflow: {report['workflow_id']}")
-print(f"Total Prompts: {report['prompt_count']}")
-print(f"Average Score: {report['average_score']:.1f}/100")
-print(f"Needs Optimization: {report['needs_optimization']}")
-
-# Review individual prompts
-for prompt_data in report['prompts']:
-    print(f"\n📝 Prompt: {prompt_data['node_id']}")
-    print(f"   Overall Score: {prompt_data['overall_score']:.1f}")
-    print(f"   Clarity: {prompt_data['clarity_score']:.1f}")
-    print(f"   Efficiency: {prompt_data['efficiency_score']:.1f}")
-    print(f"   Issues: {prompt_data['issues_count']}")
-```
-
-**Expected Output**:
-```
-Workflow: wf_customer_service
-Total Prompts: 3
-Average Score: 68.5/100
-Needs Optimization: True
-
-📝 Prompt: llm_greeting
-   Overall Score: 72.0
-   Clarity: 70.0
-   Efficiency: 75.0
-   Issues: 2
-
-📝 Prompt: llm_classify
-   Overall Score: 65.0
-   Clarity: 60.0
-   Efficiency: 72.0
-   Issues: 3
-```
-
-#### Step 3: Optimize Workflow
-
-```python
-from src.optimizer import optimize_workflow
-
-# Run optimization
-patches = optimize_workflow(
-    workflow_id="wf_customer_service",
-    catalog=catalog,
-    strategy="auto"  # Auto-select best strategy
+# 每个提取的Prompt对象包含：
+Prompt(
+    id="wf_001_llm_1",              # 唯一ID
+    workflow_id="wf_001",            # 所属workflow
+    node_id="llm_1",                 # 节点ID
+    node_type="llm",                 # 节点类型
+    text="You are a helpful...",     # prompt文本
+    role="system",                   # 角色（system/user/assistant）
+    variables=["user_input", "context"],  # 变量列表
+    context={                        # 上下文信息
+        "model": "gpt-4",
+        "temperature": 0.7
+    },
+    extracted_at=datetime.now()      # 提取时间
 )
-
-# Review patches
-print(f"\n✅ Generated {len(patches)} optimization patches")
-
-for patch in patches:
-    print(f"\n📦 Patch for node: {patch.selector.by_id}")
-    print(f"   Strategy: {patch.strategy.mode}")
-    print(f"   Content preview: {patch.strategy.content[:100]}...")
-```
-
-**Expected Output**:
-```
-✅ Generated 2 optimization patches
-
-📦 Patch for node: llm_greeting
-   Strategy: replace
-   Content preview: ## Task Instructions
-
-Please greet the customer warmly and ask how you can help them toda...
-
-📦 Patch for node: llm_classify
-   Strategy: replace
-   Content preview: ## Instructions
-
-Classify the customer inquiry into one of the following categories:...
-```
-
-#### Step 4: Verify Improvement
-
-```python
-# Re-analyze optimized prompts
-from src.optimizer import OptimizerService
-
-service = OptimizerService(catalog=catalog)
-
-# Get optimized prompt from version history
-for patch in patches:
-    node_id = patch.selector.by_id
-    prompt_id = f"wf_customer_service_{node_id}"
-
-    # Get latest version (optimized)
-    latest = service._version_manager.get_latest_version(prompt_id)
-
-    if latest:
-        print(f"\n🔄 Node: {node_id}")
-        print(f"   Version: {latest.version}")
-        print(f"   Score: {latest.analysis.overall_score:.1f}")
-        if latest.optimization_result:
-            print(f"   Improvement: +{latest.optimization_result.improvement_score:.1f}")
-            print(f"   Confidence: {latest.optimization_result.confidence:.2f}")
 ```
 
 ---
 
-### Tutorial 2: Multi-Strategy Comparison
+## 💡 使用示例
 
-**Goal**: Compare different optimization strategies to select the best one.
-
-**Duration**: 15 minutes
-
-```python
-from src.optimizer import OptimizerService, PromptExtractor
-import pandas as pd
-
-# Initialize service
-service = OptimizerService(catalog=catalog)
-
-# Extract prompts
-prompts = service._extract_prompts("wf_customer_service")
-
-# Test all strategies
-strategies = ["clarity_focus", "efficiency_focus", "structure_focus"]
-results = []
-
-for prompt in prompts[:1]:  # Test on first prompt
-    print(f"\n🔍 Testing prompt: {prompt.node_id}")
-
-    # Get baseline score
-    baseline_analysis = service._analyzer.analyze_prompt(prompt)
-    baseline_score = baseline_analysis.overall_score
-
-    print(f"Baseline Score: {baseline_score:.1f}")
-
-    # Try each strategy
-    for strategy in strategies:
-        result = service.optimize_single_prompt(prompt, strategy)
-
-        results.append({
-            "node_id": prompt.node_id,
-            "strategy": strategy,
-            "baseline_score": baseline_score,
-            "optimized_score": baseline_score + result.improvement_score,
-            "improvement": result.improvement_score,
-            "confidence": result.confidence,
-            "changes": ", ".join(result.changes)
-        })
-
-# Create comparison table
-df = pd.DataFrame(results)
-print("\n📊 Strategy Comparison:")
-print(df.to_string(index=False))
-
-# Find best strategy for each prompt
-best_strategies = df.loc[df.groupby('node_id')['improvement'].idxmax()]
-print("\n🏆 Best Strategies:")
-print(best_strategies[['node_id', 'strategy', 'improvement']].to_string(index=False))
-```
-
-**Expected Output**:
-```
-🔍 Testing prompt: llm_greeting
-Baseline Score: 72.0
-
-📊 Strategy Comparison:
-      node_id         strategy  baseline_score  optimized_score  improvement  confidence                                    changes
- llm_greeting    clarity_focus            72.0             78.5          6.5        0.75  Added section headers, Improved formatting
- llm_greeting  efficiency_focus            72.0             74.0          2.0        0.60          Reduced word count for efficiency
- llm_greeting  structure_focus            72.0             76.0          4.0        0.70                       Added bullet points
-
-🏆 Best Strategies:
-      node_id        strategy  improvement
- llm_greeting   clarity_focus          6.5
-```
-
----
-
-### Tutorial 3: Version Management Workflow
-
-**Goal**: Track prompt evolution and manage versions effectively.
-
-**Duration**: 12 minutes
-
-```python
-from src.optimizer import OptimizerService, VersionManager
-from datetime import datetime
-
-service = OptimizerService(catalog=catalog)
-manager = service._version_manager
-
-# Extract a single prompt
-prompts = service._extract_prompts("wf_customer_service")
-prompt = prompts[0]
-
-print(f"📝 Working with prompt: {prompt.node_id}")
-
-# Step 1: Create baseline version
-analysis = service._analyzer.analyze_prompt(prompt)
-v1 = manager.create_version(
-    prompt=prompt,
-    analysis=analysis,
-    optimization_result=None,
-    parent_version=None
-)
-
-# Tag as production baseline
-v1.metadata["tag"] = "production_baseline"
-v1.metadata["deployment_date"] = datetime.now().isoformat()
-
-print(f"\n✅ Created baseline v{v1.version}")
-print(f"   Score: {analysis.overall_score:.1f}")
-
-# Step 2: Create optimized version
-result = service.optimize_single_prompt(prompt, "clarity_focus")
-
-# Build optimized prompt object
-from src.optimizer import Prompt
-opt_prompt = Prompt(
-    id=prompt.id,
-    workflow_id=prompt.workflow_id,
-    node_id=prompt.node_id,
-    node_type=prompt.node_type,
-    text=result.optimized_prompt,
-    role=prompt.role,
-    variables=prompt.variables,
-    context=prompt.context
-)
-
-opt_analysis = service._analyzer.analyze_prompt(opt_prompt)
-v2 = manager.create_version(
-    prompt=opt_prompt,
-    analysis=opt_analysis,
-    optimization_result=result,
-    parent_version=v1.version
-)
-
-print(f"\n✅ Created optimized v{v2.version}")
-print(f"   Score: {opt_analysis.overall_score:.1f}")
-print(f"   Improvement: +{result.improvement_score:.1f}")
-
-# Step 3: Compare versions
-comparison = manager.compare_versions(prompt.id, v1.version, v2.version)
-
-print(f"\n📊 Version Comparison:")
-print(f"   Version 1: {comparison['version1']} (score: {comparison['version1_analysis']['overall_score']:.1f})")
-print(f"   Version 2: {comparison['version2']} (score: {comparison['version2_analysis']['overall_score']:.1f})")
-print(f"   Improvement: +{comparison['improvement']:.1f}")
-print(f"   Text Similarity: {comparison['text_diff']['similarity']:.2%}")
-print(f"   Changes: {', '.join(comparison['changes'])}")
-
-# Step 4: Get version history
-history = manager.get_version_history(prompt.id)
-
-print(f"\n📜 Version History ({len(history)} versions):")
-for v in history:
-    tag = v.metadata.get("tag", "")
-    print(f"   v{v.version}: score={v.analysis.overall_score:.1f} {tag}")
-
-# Step 5: Find best version
-best = manager.get_best_version(prompt.id)
-print(f"\n🏆 Best Version: v{best.version} (score: {best.analysis.overall_score:.1f})")
-
-# Step 6: Rollback demo (if needed)
-if opt_analysis.overall_score < analysis.overall_score:
-    print("\n⚠️ Optimization caused regression, rolling back...")
-    rolled_back = manager.rollback(prompt.id, v1.version)
-    print(f"   Rolled back to v{v1.version}, created v{rolled_back.version}")
-```
-
----
-
-## 3. Advanced Usage
-
-### 3.1 Custom LLM Integration
-
-Integrate with OpenAI GPT-4 for advanced analysis:
-
-```python
-from src.optimizer.interfaces import LLMClient
-from src.optimizer import PromptAnalysis, OptimizerService
-from typing import Dict, Any, Optional
-import openai
-import json
-
-class OpenAIClient(LLMClient):
-    """Production OpenAI integration."""
-
-    def __init__(self, api_key: str, model: str = "gpt-4", timeout: int = 30):
-        self.client = openai.OpenAI(api_key=api_key, timeout=timeout)
-        self.model = model
-
-    def analyze_prompt(
-        self,
-        prompt: str,
-        context: Optional[Dict[str, Any]] = None
-    ) -> PromptAnalysis:
-        """Analyze prompt quality using GPT-4."""
-
-        system_prompt = """You are a prompt quality analyst. Analyze the given prompt and provide scores (0-100) for:
-        1. Clarity: How clear and specific are the instructions?
-        2. Efficiency: Is the prompt concise without losing necessary information?
-
-        Also identify issues and provide actionable suggestions.
-        """
-
-        user_prompt = f"""Analyze this prompt:
-
-        {prompt}
-
-        Provide JSON output with this exact structure:
-        {{
-            "clarity_score": <0-100>,
-            "efficiency_score": <0-100>,
-            "issues": [
-                {{"severity": "critical|warning|info", "type": "issue_type", "description": "..."}}
-            ],
-            "suggestions": [
-                {{"type": "suggestion_type", "description": "...", "priority": <1-10>}}
-            ]
-        }}
-        """
-
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                response_format={"type": "json_object"},
-                temperature=0.3  # Low temperature for consistent analysis
-            )
-
-            result = json.loads(response.choices[0].message.content)
-
-            # Convert to PromptAnalysis model
-            from src.optimizer import PromptIssue, PromptSuggestion, IssueSeverity, IssueType, SuggestionType
-
-            issues = [
-                PromptIssue(
-                    severity=IssueSeverity(issue["severity"]),
-                    type=IssueType.VAGUE_LANGUAGE,  # Map appropriately
-                    description=issue["description"]
-                )
-                for issue in result.get("issues", [])
-            ]
-
-            suggestions = [
-                PromptSuggestion(
-                    type=SuggestionType.CLARIFY_INSTRUCTIONS,  # Map appropriately
-                    description=sug["description"],
-                    priority=sug["priority"]
-                )
-                for sug in result.get("suggestions", [])
-            ]
-
-            overall_score = (result["clarity_score"] + result["efficiency_score"]) / 2
-
-            return PromptAnalysis(
-                prompt_id=context.get("prompt_id", "unknown") if context else "unknown",
-                overall_score=overall_score,
-                clarity_score=result["clarity_score"],
-                efficiency_score=result["efficiency_score"],
-                issues=issues,
-                suggestions=suggestions,
-                metadata={"llm_model": self.model, "api": "openai"}
-            )
-
-        except Exception as e:
-            raise AnalysisError(
-                message=f"OpenAI analysis failed: {str(e)}",
-                error_code="OPENAI-001"
-            )
-
-    def optimize_prompt(
-        self,
-        prompt: str,
-        strategy: str,
-        context: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """Generate optimized prompt using GPT-4."""
-
-        strategy_prompts = {
-            "clarity_focus": "Make this prompt clearer and more specific",
-            "efficiency_focus": "Make this prompt more concise while preserving meaning",
-            "structure_focus": "Improve the structure and organization of this prompt"
-        }
-
-        system_prompt = f"""You are a prompt optimization expert. {strategy_prompts.get(strategy, 'Optimize this prompt')}.
-
-        Guidelines:
-        - Preserve all variable placeholders ({{variable}})
-        - Maintain the original intent
-        - Provide only the optimized prompt text
-        """
-
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.5
-            )
-
-            return response.choices[0].message.content.strip()
-
-        except Exception as e:
-            raise OptimizationError(
-                message=f"OpenAI optimization failed: {str(e)}",
-                error_code="OPENAI-002"
-            )
-
-# Usage
-openai_client = OpenAIClient(api_key="sk-...")
-service = OptimizerService(catalog=catalog, llm_client=openai_client)
-
-# Now service uses GPT-4 for analysis and optimization
-patches = service.run_optimization_cycle("wf_customer_service", strategy="auto")
-```
-
----
-
-### 3.2 Batch Processing Multiple Workflows
-
-Optimize all workflows in parallel:
-
-```python
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from src.optimizer import optimize_workflow
-from typing import List, Dict, Any
-import time
-
-def batch_optimize_workflows(
-    workflow_ids: List[str],
-    catalog,
-    strategy: str = "auto",
-    max_workers: int = 3
-) -> Dict[str, Any]:
-    """Optimize multiple workflows in parallel."""
-
-    results = {}
-    start_time = time.time()
-
-    def optimize_single(wf_id: str) -> tuple:
-        """Optimize single workflow and return result."""
-        try:
-            wf_start = time.time()
-            patches = optimize_workflow(wf_id, catalog, strategy)
-            wf_duration = time.time() - wf_start
-
-            return (wf_id, {
-                "status": "success",
-                "patches_count": len(patches),
-                "patches": patches,
-                "duration": wf_duration
-            })
-
-        except Exception as e:
-            return (wf_id, {
-                "status": "error",
-                "error": str(e),
-                "duration": time.time() - wf_start
-            })
-
-    # Parallel execution
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(optimize_single, wf_id): wf_id
-            for wf_id in workflow_ids
-        }
-
-        for future in as_completed(futures):
-            wf_id, result = future.result()
-            results[wf_id] = result
-            print(f"✅ Completed: {wf_id} ({result['status']})")
-
-    total_duration = time.time() - start_time
-
-    # Summary
-    summary = {
-        "total_workflows": len(workflow_ids),
-        "successful": sum(1 for r in results.values() if r['status'] == 'success'),
-        "failed": sum(1 for r in results.values() if r['status'] == 'error'),
-        "total_patches": sum(r.get('patches_count', 0) for r in results.values()),
-        "total_duration": total_duration,
-        "results": results
-    }
-
-    return summary
-
-# Usage
-workflow_ids = ["wf_customer_service", "wf_summarizer", "wf_classifier"]
-summary = batch_optimize_workflows(workflow_ids, catalog, max_workers=3)
-
-print(f"\n📊 Batch Optimization Summary:")
-print(f"   Total Workflows: {summary['total_workflows']}")
-print(f"   Successful: {summary['successful']}")
-print(f"   Failed: {summary['failed']}")
-print(f"   Total Patches: {summary['total_patches']}")
-print(f"   Duration: {summary['total_duration']:.2f}s")
-```
-
----
-
-### 3.3 Custom Persistent Storage
-
-Implement filesystem-based version storage:
-
-```python
-from src.optimizer.interfaces import VersionStorage
-from src.optimizer import PromptVersion, VersionConflictError
-from typing import List, Optional
-from pathlib import Path
-import json
-import fcntl  # For file locking on Unix
-
-class FileSystemStorage(VersionStorage):
-    """Thread-safe file-based storage with locking."""
-
-    def __init__(self, storage_dir: str):
-        self.storage_dir = Path(storage_dir)
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
-        self.lock_dir = self.storage_dir / ".locks"
-        self.lock_dir.mkdir(exist_ok=True)
-
-    def _get_lock_file(self, prompt_id: str) -> Path:
-        """Get lock file path for prompt."""
-        return self.lock_dir / f"{prompt_id}.lock"
-
-    def save_version(self, version: PromptVersion) -> None:
-        """Save version with file locking."""
-        prompt_dir = self.storage_dir / version.prompt_id
-        prompt_dir.mkdir(exist_ok=True)
-
-        version_file = prompt_dir / f"{version.version}.json"
-
-        # Check for duplicate
-        if version_file.exists():
-            raise VersionConflictError(
-                prompt_id=version.prompt_id,
-                version=version.version,
-                reason="Version file already exists"
-            )
-
-        # Serialize with proper datetime handling
-        data = version.model_dump(mode="json")
-
-        # Write with atomic operation
-        temp_file = version_file.with_suffix('.tmp')
-        with open(temp_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-        # Atomic rename
-        temp_file.replace(version_file)
-
-    def get_version(
-        self,
-        prompt_id: str,
-        version: str
-    ) -> Optional[PromptVersion]:
-        """Load version from file."""
-        version_file = self.storage_dir / prompt_id / f"{version}.json"
-
-        if not version_file.exists():
-            return None
-
-        with open(version_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
-        return PromptVersion(**data)
-
-    def list_versions(self, prompt_id: str) -> List[PromptVersion]:
-        """List all versions sorted by version number."""
-        prompt_dir = self.storage_dir / prompt_id
-
-        if not prompt_dir.exists():
-            return []
-
-        versions = []
-        for version_file in prompt_dir.glob("*.json"):
-            with open(version_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            versions.append(PromptVersion(**data))
-
-        # Sort by semantic version
-        versions.sort(key=lambda v: v.get_version_number())
-        return versions
-
-    def get_latest_version(self, prompt_id: str) -> Optional[PromptVersion]:
-        """Get latest version."""
-        versions = self.list_versions(prompt_id)
-        return versions[-1] if versions else None
-
-    def delete_version(self, prompt_id: str, version: str) -> bool:
-        """Delete version file."""
-        version_file = self.storage_dir / prompt_id / f"{version}.json"
-
-        if version_file.exists():
-            version_file.unlink()
-            return True
-        return False
-
-    def clear_all(self) -> None:
-        """Delete all versions."""
-        import shutil
-        if self.storage_dir.exists():
-            shutil.rmtree(self.storage_dir)
-        self.storage_dir.mkdir(parents=True)
-        self.lock_dir.mkdir(exist_ok=True)
-
-# Usage
-storage = FileSystemStorage("data/prompt_versions")
-manager = VersionManager(storage=storage)
-
-# Versions are now persisted to disk
-version = manager.create_version(prompt, analysis, None, None)
-print(f"Version saved to: data/prompt_versions/{prompt.id}/{version.version}.json")
-```
-
----
-
-## 4. Integration Examples
-
-### 4.1 Integration with Executor Module
-
-Complete workflow: optimize → generate test cases → execute → collect results.
-
-```python
-from src.config import ConfigLoader
-from src.optimizer import optimize_workflow
-from src.executor import TestCaseGenerator, RunManifestBuilder, TaskScheduler
-from src.collector import MetricsCollector
-
-# 1. Load configuration
-loader = ConfigLoader()
-catalog = loader.load_workflow_catalog("config/workflows.yaml")
-test_plan = loader.load_test_plan("config/test_plan.yaml")
-
-# 2. Optimize all workflows
-print("Step 1: Optimizing prompts...")
-for wf_config in test_plan.workflows:
-    patches = optimize_workflow(
-        workflow_id=wf_config.workflow_id,
-        catalog=catalog,
-        strategy="auto"
-    )
-
-    if patches:
-        # Add optimized variant to test plan
-        from src.config.models import PromptOptimizationConfig
-        opt_config = PromptOptimizationConfig(
-            variant_name="optimized_v1",
-            nodes=patches
-        )
-
-        if not wf_config.prompt_optimization:
-            wf_config.prompt_optimization = [opt_config]
-        else:
-            wf_config.prompt_optimization.append(opt_config)
-
-        print(f"  ✅ {wf_config.workflow_id}: {len(patches)} patches")
-
-# 3. Generate test cases
-print("\nStep 2: Generating test cases...")
-generator = TestCaseGenerator(test_plan, catalog)
-all_cases = generator.generate_all_cases()
-
-print(f"  Generated {sum(len(cases) for cases in all_cases.values())} test cases")
-
-# 4. Build execution manifests
-print("\nStep 3: Building execution manifests...")
-builder = RunManifestBuilder(test_plan, catalog, generator)
-manifests = builder.build_all_manifests()
-
-print(f"  Built {len(manifests)} execution manifests")
-
-# 5. Execute tests
-print("\nStep 4: Executing tests...")
-scheduler = TaskScheduler()
-
-for manifest in manifests:
-    print(f"  Running: {manifest.run_id}")
-    result = scheduler.run_manifest(manifest)
-
-    print(f"    Succeeded: {result.statistics.succeeded}")
-    print(f"    Failed: {result.statistics.failed}")
-
-# 6. Collect and analyze results
-print("\nStep 5: Analyzing results...")
-collector = MetricsCollector()
-
-# Compare baseline vs optimized
-baseline_results = [r for r in results if "baseline" in r.run_id]
-optimized_results = [r for r in results if "optimized" in r.run_id]
-
-print(f"\n📊 Performance Comparison:")
-print(f"  Baseline Success Rate: {baseline_success_rate:.1%}")
-print(f"  Optimized Success Rate: {optimized_success_rate:.1%}")
-print(f"  Improvement: {(optimized_success_rate - baseline_success_rate):.1%}")
-```
-
----
-
-### 4.2 Integration with Collector Module
-
-Export optimization results to Excel reports:
+### 场景1: 优化整个工作流（最常用）
 
 ```python
 from src.optimizer import OptimizerService
-from src.collector import ExcelExporter
-import pandas as pd
+from src.config.models import WorkflowCatalog
 
+# 1. 初始化服务
+catalog = WorkflowCatalog.from_yaml("workflows.yaml")
 service = OptimizerService(catalog=catalog)
 
-# Optimize workflow
-patches = service.run_optimization_cycle("wf_customer_service", strategy="auto")
-
-# Gather version data
-optimization_data = []
-
-for patch in patches:
-    node_id = patch.selector.by_id
-    prompt_id = f"wf_customer_service_{node_id}"
-
-    # Get version history
-    history = service.get_version_history(prompt_id)
-
-    for version in history:
-        optimization_data.append({
-            "Prompt ID": prompt_id,
-            "Node ID": node_id,
-            "Version": version.version,
-            "Overall Score": version.analysis.overall_score,
-            "Clarity Score": version.analysis.clarity_score,
-            "Efficiency Score": version.analysis.efficiency_score,
-            "Issues Count": len(version.analysis.issues),
-            "Is Optimized": version.optimization_result is not None,
-            "Strategy": version.metadata.get("strategy", "N/A"),
-            "Created At": version.created_at.isoformat()
-        })
-
-# Create DataFrame
-df = pd.DataFrame(optimization_data)
-
-# Export to Excel
-exporter = ExcelExporter()
-exporter.export(
-    df,
-    output_path="reports/optimization_results.xlsx",
-    sheet_name="Prompt Optimization",
-    include_summary=True
+# 2. 运行优化（自动提取所有LLM prompts）
+patches = service.run_optimization_cycle(
+    workflow_id="wf_001",
+    strategy="auto"  # 自动选择最佳策略
 )
 
-print("✅ Optimization results exported to reports/optimization_results.xlsx")
+# 3. 查看结果
+print(f"需要优化的prompts: {len(patches)}个")
+for patch in patches:
+    print(f"节点 {patch.selector.by_id}: {patch.strategy.content[:50]}...")
 ```
 
----
+**输出示例：**
+```
+需要优化的prompts: 2个
+节点 llm_1: You are a highly skilled assistant specializing in...
+节点 llm_3: Analyze the following text and extract key info...
+```
 
-## 5. Real-World Case Studies
-
-### Case Study 1: E-Commerce Customer Support Bot
-
-**Scenario**: Optimize a customer service chatbot with 12 LLM nodes across 4 workflows.
-
-**Challenge**: Inconsistent prompt quality leading to 68% success rate in production.
-
-**Solution**:
+### 场景2: 使用高级配置（多策略+迭代）
 
 ```python
-from src.optimizer import OptimizerService, OptimizationConfig
-from datetime import datetime
+from src.optimizer.models import OptimizationConfig, OptimizationStrategy
 
-# Define strict quality requirements
+# 配置多策略优化
 config = OptimizationConfig(
-    strategies=["clarity_focus", "structure_focus"],
-    min_confidence=0.75,  # High confidence required
-    max_iterations=3,
-    metadata={"project": "ecommerce_bot_v2", "deadline": "2025-02-01"}
+    strategies=[
+        OptimizationStrategy.CLARITY_FOCUS,
+        OptimizationStrategy.EFFICIENCY_FOCUS,
+        OptimizationStrategy.AUTO,
+    ],
+    max_iterations=3,      # 每个策略最多迭代3次
+    min_confidence=0.7,    # 置信度阈值
+    score_threshold=75.0   # 低于75分才优化
 )
 
-service = OptimizerService(catalog=catalog)
-
-# Workflow IDs
-workflows = [
-    "wf_greeting",
-    "wf_order_inquiry",
-    "wf_refund_request",
-    "wf_product_recommendation"
-]
-
-# Optimize each workflow
-results = {}
-
-for wf_id in workflows:
-    print(f"\n🔧 Optimizing {wf_id}...")
-
-    # Analyze baseline
-    baseline_report = service.analyze_workflow(wf_id)
-    baseline_score = baseline_report['average_score']
-
-    # Optimize
-    patches = service.run_optimization_cycle(
-        workflow_id=wf_id,
-        config=config,
-        baseline_metrics={"success_rate": 0.68}
-    )
-
-    # Re-analyze
-    # (Simulate re-analysis after optimization)
-    optimized_score = baseline_score + (len(patches) * 5)  # Estimated improvement
-
-    results[wf_id] = {
-        "baseline_score": baseline_score,
-        "optimized_score": optimized_score,
-        "improvement": optimized_score - baseline_score,
-        "patches_count": len(patches)
-    }
-
-    print(f"  Baseline: {baseline_score:.1f}")
-    print(f"  Optimized: {optimized_score:.1f}")
-    print(f"  Improvement: +{optimized_score - baseline_score:.1f}")
-
-# Overall summary
-total_improvement = sum(r['improvement'] for r in results.values()) / len(results)
-print(f"\n📈 Project Summary:")
-print(f"  Average Improvement: +{total_improvement:.1f} points")
-print(f"  Total Patches: {sum(r['patches_count'] for r in results.values())}")
-```
-
-**Results**:
-- Average prompt score: 68.5 → 82.3 (+13.8)
-- Production success rate: 68% → 85% (+17%)
-- Customer satisfaction: 3.8/5 → 4.4/5
-
----
-
-### Case Study 2: Document Summarization Pipeline
-
-**Scenario**: Batch processing pipeline for summarizing legal documents.
-
-**Challenge**: High token usage (avg 1200 tokens/prompt) causing cost issues.
-
-**Solution**: Focus on efficiency optimization.
-
-```python
-from src.optimizer import optimize_workflow
-
-# Target: Reduce token usage while maintaining quality
-patches = optimize_workflow(
-    workflow_id="wf_legal_summarizer",
-    catalog=catalog,
-    strategy="efficiency_focus"  # Focus on token reduction
-)
-
-# Analyze token savings
-token_savings = []
-
-service = OptimizerService(catalog=catalog)
-prompts = service._extract_prompts("wf_legal_summarizer")
-
-for prompt in prompts:
-    baseline_analysis = service._analyzer.analyze_prompt(prompt)
-    baseline_tokens = baseline_analysis.metadata["estimated_tokens"]
-
-    # Get optimized version
-    latest = service._version_manager.get_latest_version(prompt.id)
-    optimized_tokens = latest.analysis.metadata["estimated_tokens"]
-
-    reduction = baseline_tokens - optimized_tokens
-    reduction_pct = (reduction / baseline_tokens) * 100
-
-    token_savings.append({
-        "prompt_id": prompt.id,
-        "baseline_tokens": baseline_tokens,
-        "optimized_tokens": optimized_tokens,
-        "reduction": reduction,
-        "reduction_pct": reduction_pct
-    })
-
-    print(f"{prompt.node_id}:")
-    print(f"  Tokens: {baseline_tokens:.0f} → {optimized_tokens:.0f}")
-    print(f"  Savings: {reduction:.0f} ({reduction_pct:.1f}%)")
-
-# Calculate cost savings
-avg_reduction = sum(s['reduction_pct'] for s in token_savings) / len(token_savings)
-monthly_requests = 500000
-cost_per_1k_tokens = 0.03
-
-monthly_savings = (monthly_requests * avg_reduction / 100) * cost_per_1k_tokens
-print(f"\n💰 Estimated Monthly Cost Savings: ${monthly_savings:.2f}")
-```
-
-**Results**:
-- Average token usage: 1200 → 850 (-29%)
-- Monthly processing cost: $18,000 → $12,750 (-$5,250/month)
-- Quality maintained: 82 score (no significant degradation)
-
----
-
-### Case Study 3: Multi-Language Support
-
-**Scenario**: Add structure to multilingual chatbot prompts.
-
-**Solution**: Use structure_focus strategy to ensure consistent formatting across languages.
-
-```python
-# Optimize all language variants
-languages = ["en", "es", "fr", "de", "zh"]
-
-for lang in languages:
-    wf_id = f"wf_chatbot_{lang}"
-
-    patches = optimize_workflow(
-        workflow_id=wf_id,
-        catalog=catalog,
-        strategy="structure_focus"  # Ensure consistent structure
-    )
-
-    print(f"{lang.upper()}: {len(patches)} patches applied")
-```
-
-**Results**:
-- Consistent structure across all 5 languages
-- Easier maintenance and translation updates
-- Improved clarity scores by +15 points average
-
----
-
-## 6. Performance Tuning
-
-### 6.1 Parallel Optimization
-
-```python
-from concurrent.futures import ProcessPoolExecutor
-
-def optimize_with_multiprocessing(workflow_ids, catalog):
-    """Use multiprocessing for CPU-bound optimization."""
-
-    def optimize_worker(wf_id):
-        # Each process has its own Python interpreter
-        from src.optimizer import optimize_workflow
-        return optimize_workflow(wf_id, catalog, strategy="auto")
-
-    with ProcessPoolExecutor(max_workers=4) as executor:
-        results = executor.map(optimize_worker, workflow_ids)
-
-    return list(results)
-```
-
-### 6.2 Caching Strategy
-
-```python
-from functools import lru_cache
-import hashlib
-
-class CachedOptimizerService(OptimizerService):
-    """OptimizerService with LRU caching."""
-
-    @lru_cache(maxsize=128)
-    def _cached_analyze(self, prompt_text_hash: str, prompt_obj):
-        """Cache analysis results by prompt content hash."""
-        return self._analyzer.analyze_prompt(prompt_obj)
-
-    def analyze_workflow(self, workflow_id: str):
-        """Override with caching."""
-        prompts = self._extract_prompts(workflow_id)
-
-        for prompt in prompts:
-            # Create hash of prompt text
-            text_hash = hashlib.md5(prompt.text.encode()).hexdigest()
-
-            # Use cached analysis if available
-            analysis = self._cached_analyze(text_hash, prompt)
-
-            # ... rest of analysis logic
-```
-
----
-
-## 7. Production Deployment
-
-### 7.1 Environment Configuration
-
-```python
-# config/production.yaml
-optimizer:
-  llm_client:
-    provider: "openai"
-    api_key: "${OPENAI_API_KEY}"  # From environment variable
-    model: "gpt-4"
-    timeout: 30
-    max_retries: 3
-
-  storage:
-    backend: "filesystem"
-    path: "/var/lib/optimizer/versions"
-    backup_enabled: true
-    backup_interval: 86400  # 24 hours
-
-  optimization:
-    default_strategy: "auto"
-    min_confidence: 0.7
-    max_iterations: 3
-
-  monitoring:
-    log_level: "INFO"
-    metrics_enabled: true
-    metrics_port: 9090
-```
-
-### 7.2 Logging Configuration
-
-```python
-from loguru import logger
-import sys
-
-# Configure production logging
-logger.remove()  # Remove default handler
-
-# Console output (JSON format for log aggregation)
-logger.add(
-    sys.stdout,
-    format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {name}:{function}:{line} | {message}",
-    level="INFO",
-    serialize=True  # JSON output
-)
-
-# File output (with rotation)
-logger.add(
-    "logs/optimizer_{time:YYYY-MM-DD}.log",
-    rotation="00:00",  # New file at midnight
-    retention="30 days",
-    compression="zip",
-    level="DEBUG"
-)
-
-# Error-only file
-logger.add(
-    "logs/errors.log",
-    level="ERROR",
-    rotation="10 MB",
-    retention="90 days"
+# 运行优化
+patches = service.run_optimization_cycle(
+    workflow_id="wf_001",
+    config=config
 )
 ```
 
-### 7.3 Health Check Endpoint
+**内部行为：**
+```
+提取到3个LLM prompts → [llm_1, llm_2, llm_3]
+
+处理 llm_1:
+  分析: score=72 → 需要优化
+  尝试策略1 clarity_focus:
+    迭代1: score=75, confidence=0.65
+    迭代2: score=78, confidence=0.72 ✅ 达到阈值
+  尝试策略2 efficiency_focus:
+    迭代1: score=76, confidence=0.68
+  尝试策略3 auto:
+    选择strategy=clarity → 复用策略1结果
+  → 选择最佳结果: 策略1的迭代2
+
+处理 llm_2:
+  分析: score=85 → 跳过（分数够高）
+
+处理 llm_3:
+  分析: score=68 → 需要优化
+  （同样的多策略流程...）
+
+返回: [patch_for_llm_1, patch_for_llm_3]
+```
+
+### 场景3: 只分析不优化
 
 ```python
-from fastapi import FastAPI
-from src.optimizer import OptimizerService
+# 只想看看prompts质量如何
+report = service.analyze_workflow("wf_001")
 
-app = FastAPI()
+print(f"工作流包含 {report['prompt_count']} 个prompts")
+print(f"平均分数: {report['average_score']:.1f}")
+print(f"是否需要优化: {report['needs_optimization']}")
 
-@app.get("/health")
-def health_check():
-    """Health check endpoint for load balancers."""
-    try:
-        # Test basic functionality
-        service = OptimizerService(catalog=catalog)
-        test_prompt = Prompt(...)
-        analysis = service._analyzer.analyze_prompt(test_prompt)
+for prompt_info in report['prompts']:
+    print(f"""
+    Prompt: {prompt_info['prompt_id']}
+    总分: {prompt_info['overall_score']}
+    清晰度: {prompt_info['clarity_score']}
+    效率: {prompt_info['efficiency_score']}
+    问题数: {prompt_info['issues_count']}
+    """)
+```
 
-        return {
-            "status": "healthy",
-            "version": "1.0.0",
-            "components": {
-                "extractor": "ok",
-                "analyzer": "ok",
-                "engine": "ok",
-                "storage": "ok"
-            }
-        }
-    except Exception as e:
-        return {
-            "status": "unhealthy",
-            "error": str(e)
-        }, 503
+### 场景4: 手动提取和优化单个prompt
+
+```python
+# 如果你只想优化特定的prompt
+from src.optimizer.models import Prompt
+
+# 手动创建或提取单个prompt
+prompt = Prompt(
+    id="custom_prompt",
+    workflow_id="wf_001",
+    node_id="llm_1",
+    node_type="llm",
+    text="这是一个质量不高的prompt",
+    role="user",
+    variables=[]
+)
+
+# 优化单个prompt
+result = service.optimize_single_prompt(
+    prompt=prompt,
+    strategy="clarity_focus"
+)
+
+print(f"原始prompt: {result.original_prompt}")
+print(f"优化后: {result.optimized_prompt}")
+print(f"改进分数: {result.improvement_score}")
+print(f"置信度: {result.confidence}")
 ```
 
 ---
 
-## 8. FAQ
+## 📚 API参考
 
-### Q1: How do I choose the right optimization strategy?
+### OptimizerService 主要方法
 
-**A**: Use this decision tree:
-
-1. If prompt has low clarity score (< 70): Use `clarity_focus`
-2. If prompt is very long (> 500 tokens): Use `efficiency_focus`
-3. If prompt lacks structure: Use `structure_focus`
-4. If unsure: Use `auto` (analyzer will choose)
-
-### Q2: Can I optimize prompts written in non-English languages?
-
-**A**: Yes, the rule-based analyzer works for any language, but:
-- Vague language detection is primarily English-focused
-- Consider using custom LLM client for better multilingual support
-- Structure and efficiency optimization work language-agnostically
-
-### Q3: How do I rollback to a previous version in production?
-
-**A**:
+#### 1. `run_optimization_cycle()`
+**完整优化流程（推荐使用）**
 
 ```python
-# 1. Identify target version
-history = manager.get_version_history(prompt_id)
-for v in history:
-    print(f"v{v.version}: score={v.analysis.overall_score:.1f}")
-
-# 2. Rollback
-target_version = "1.0.0"  # Choose baseline or specific version
-new_version = manager.rollback(prompt_id, target_version)
-
-# 3. Update deployment
-# Re-generate patches from the new version and deploy
+def run_optimization_cycle(
+    workflow_id: str,
+    baseline_metrics: Optional[Dict[str, Any]] = None,
+    strategy: Optional[str] = None,  # "auto", "clarity_focus", "efficiency_focus", "structure_focus"
+    config: Optional[OptimizationConfig] = None
+) -> List[PromptPatch]
 ```
 
-### Q4: What's the performance impact of optimization?
+**功能：**
+- ✅ 自动提取所有LLM prompts
+- ✅ 逐个分析和优化
+- ✅ 生成可应用的patches
 
-**A**: Benchmarks (AMD Ryzen 9 5900X):
-- Extraction: ~50ms per workflow (10 nodes)
-- Analysis: ~10ms per prompt
-- Optimization: ~15ms per prompt
-- Version creation: ~5ms
+**返回：**
+- `List[PromptPatch]` - 需要应用到workflow的修改
 
-For 100 prompts: Total ~3 seconds
-
-### Q5: Can I use optimizer without a WorkflowCatalog?
-
-**A**: Yes, use low-level API:
+#### 2. `analyze_workflow()`
+**只分析不优化**
 
 ```python
-from src.optimizer import PromptExtractor, PromptAnalyzer, OptimizationEngine
-
-extractor = PromptExtractor()
-analyzer = PromptAnalyzer()
-engine = OptimizationEngine(analyzer)
-
-# Load DSL directly
-dsl_dict = extractor.load_dsl_file(Path("workflow.yml"))
-prompts = extractor.extract_from_workflow(dsl_dict)
-
-# Analyze and optimize
-for prompt in prompts:
-    analysis = analyzer.analyze_prompt(prompt)
-    if analysis.overall_score < 80:
-        result = engine.optimize(prompt, "clarity_focus")
-        print(f"Optimized: {result.optimized_prompt}")
+def analyze_workflow(
+    workflow_id: str
+) -> Dict[str, Any]
 ```
 
-### Q6: How do I integrate custom scoring rules?
+**功能：**
+- ✅ 提取所有prompts
+- ✅ 分析质量
+- ❌ 不进行优化
 
-**A**:
+**返回：**
+```python
+{
+    "workflow_id": "wf_001",
+    "prompt_count": 3,
+    "average_score": 76.5,
+    "needs_optimization": True,
+    "prompts": [
+        {
+            "prompt_id": "wf_001_llm_1",
+            "overall_score": 72.0,
+            "clarity_score": 68.0,
+            "efficiency_score": 76.0,
+            "issues_count": 2,
+            "issues": [...]
+        },
+        ...
+    ]
+}
+```
+
+#### 3. `optimize_single_prompt()`
+**优化单个prompt**
 
 ```python
-from src.optimizer import PromptAnalyzer
+def optimize_single_prompt(
+    prompt: Prompt,
+    strategy: str = "auto"
+) -> OptimizationResult
+```
 
-class CustomAnalyzer(PromptAnalyzer):
-    """Custom analyzer with domain-specific rules."""
+**功能：**
+- ✅ 只优化一个prompt
+- ✅ 不访问workflow
+- ✅ 返回优化结果
 
-    def _score_structure(self, text: str) -> float:
-        """Override structure scoring."""
-        score = super()._score_structure(text)
+### PromptExtractor 提取方法
 
-        # Add custom rule: Require specific headers
-        required_headers = ["## Context", "## Task", "## Output"]
-        for header in required_headers:
-            if header in text:
-                score += 5  # Bonus for required headers
+#### 1. `extract_from_workflow()`
+**提取所有LLM prompts（全量）**
 
-        return min(100.0, score)
+```python
+def extract_from_workflow(
+    workflow_dict: Dict[str, Any],
+    workflow_id: Optional[str] = None
+) -> List[Prompt]
+```
 
-# Use custom analyzer
-service = OptimizerService(catalog=catalog)
-service._analyzer = CustomAnalyzer()
+**行为：**
+- 遍历所有节点
+- 只提取LLM类型节点
+- 返回所有符合条件的prompts
+
+#### 2. `extract_from_node()`
+**提取单个节点（按需）**
+
+```python
+def extract_from_node(
+    node: Dict[str, Any],
+    workflow_id: str
+) -> Optional[Prompt]
+```
+
+**行为：**
+- 只处理一个节点
+- 非LLM节点返回None
+- 返回单个Prompt对象
+
+---
+
+## 🎯 设计理念
+
+### 为什么一次性提取所有prompts？
+
+**优势：**
+1. ✅ **批量优化效率高** - 一次分析整个workflow
+2. ✅ **上下文完整** - 可以考虑prompts之间的关系
+3. ✅ **结果一致** - 所有prompts使用相同的质量标准
+4. ✅ **版本管理** - 便于追踪整个workflow的演进
+
+**灵活性：**
+- 虽然一次性提取，但可以选择性优化
+- `should_optimize()` 会跳过高质量的prompts
+- 用户可以通过阈值控制优化范围
+
+### 提取 vs 优化的分离
+
+```
+提取阶段（PromptExtractor）:
+  → 目标: 找到所有LLM prompts
+  → 策略: 全量提取
+  → 输出: List[Prompt]
+
+优化阶段（OptimizerService）:
+  → 目标: 改进低质量prompts
+  → 策略: 选择性优化（基于分数）
+  → 输出: List[PromptPatch]（只包含需要修改的）
+```
+
+这种设计确保了：
+- 提取是全面的（不遗漏）
+- 优化是精准的（只改进需要的）
+
+---
+
+## 📊 总结
+
+### 提取功能
+
+| 功能 | 实现方式 | 使用场景 |
+|------|---------|----------|
+| **全量提取** | `extract_from_workflow()` | ✅ 主流程（推荐） |
+| **单节点提取** | `extract_from_node()` | ✅ 手动控制 |
+| **过滤非LLM** | 自动跳过 | ✅ 内置逻辑 |
+
+### 运行链路
+
+1. **输入**: workflow_id
+2. **提取**: 所有LLM prompts（一次性）
+3. **分析**: 逐个评分
+4. **筛选**: 只优化低分的
+5. **优化**: 多策略+迭代
+6. **输出**: PromptPatch列表（只包含需要修改的）
+
+### 实际使用
+
+**最简单的用法：**
+```python
+patches = service.run_optimization_cycle("wf_001")
+# 自动提取 → 自动分析 → 自动优化 → 返回patches
+```
+
+**最灵活的用法：**
+```python
+# 1. 先分析
+report = service.analyze_workflow("wf_001")
+
+# 2. 决定是否优化
+if report['average_score'] < 80:
+    # 3. 自定义配置
+    config = OptimizationConfig(strategies=[...])
+    patches = service.run_optimization_cycle("wf_001", config=config)
 ```
 
 ---
 
-## Next Steps
-
-1. **Explore Test Cases**: Review `tests/optimizer/` for more usage examples
-2. **Read Architecture**: See `docs/optimizer/optimizer_architecture.md`
-3. **Check API Reference**: See updated `src/optimizer/README.md`
-4. **View Test Reports**: See `docs/optimizer/TEST_REPORT_OPTIMIZER.md`
-
----
-
-**Document Version**: 1.0.0
-**Last Updated**: 2025-01-17
-**Feedback**: Report issues or suggestions to project tracker
+**生成时间**: 2025-11-18
+**适用版本**: Optimizer v1.0 (生产就绪)

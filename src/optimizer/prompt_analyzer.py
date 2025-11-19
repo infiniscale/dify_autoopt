@@ -73,8 +73,23 @@ class PromptAnalyzer:
         r"\bwhatever\b",
     ]
 
-    # Pre-compiled regex for performance
+    # Filler words for information density check
+    FILLER_WORDS = [
+        r"\bvery\b",
+        r"\breally\b",
+        r"\bjust\b",
+        r"\bactually\b",
+        r"\bbasically\b",
+        r"\bliterally\b",
+        r"\btotally\b",
+        r"\babsolutely\b",
+        r"\bdefinitely\b",
+        r"\bcertainly\b",
+    ]
+
+    # Pre-compiled regex for performance (class-level compilation)
     _VAGUE_REGEX = re.compile('|'.join(VAGUE_PATTERNS), re.IGNORECASE)
+    _FILLER_REGEX = re.compile('|'.join(FILLER_WORDS), re.IGNORECASE)
 
     # Action verb patterns
     ACTION_VERBS = [
@@ -295,11 +310,8 @@ class PromptAnalyzer:
         action_count = sum(1 for verb in self.ACTION_VERBS if verb in text_lower)
         score += min(20, action_count * 5)
 
-        # Penalize vague language
-        vague_count = sum(
-            len(re.findall(pattern, text_lower, re.IGNORECASE))
-            for pattern in self.VAGUE_PATTERNS
-        )
+        # Penalize vague language using pre-compiled regex
+        vague_count = len(self._VAGUE_REGEX.findall(text_lower))
         score -= min(30, vague_count * 5)
 
         # Check for specific numbers or quantities
@@ -407,6 +419,18 @@ class PromptAnalyzer:
 
         return min(100.0, max(0.0, score))
 
+    # Class-level stopwords constant (allocated once, shared across all instances)
+    _STOPWORDS = frozenset([
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "should",
+        "could", "might", "must", "shall", "can", "may", "need", "dare",
+        "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by",
+        "from", "as", "into", "through", "during", "before", "after", "above",
+        "below", "between", "under", "again", "further", "once", "and", "or",
+        "but", "if", "because", "while", "where", "when", "how", "which",
+        "who", "whom", "this", "that", "these", "those", "it", "its"
+    ])
+
     def _score_information_density(self, text: str) -> float:
         """Score information density (0-100).
 
@@ -427,97 +451,13 @@ class PromptAnalyzer:
         if not words:
             return 50.0
 
-        # Check for filler words
-        filler_words = [
-            "very",
-            "really",
-            "just",
-            "actually",
-            "basically",
-            "literally",
-            "totally",
-            "absolutely",
-            "definitely",
-            "certainly",
-        ]
-        filler_count = sum(1 for word in words if word in filler_words)
+        # Check for filler words using pre-compiled regex
+        filler_count = len(self._FILLER_REGEX.findall(' '.join(words)))
         filler_ratio = filler_count / len(words)
         score -= min(30, filler_ratio * 100)
 
-        # Check for meaningful content words
-        stopwords = {
-            "the",
-            "a",
-            "an",
-            "is",
-            "are",
-            "was",
-            "were",
-            "be",
-            "been",
-            "being",
-            "have",
-            "has",
-            "had",
-            "do",
-            "does",
-            "did",
-            "will",
-            "would",
-            "could",
-            "should",
-            "may",
-            "might",
-            "must",
-            "shall",
-            "can",
-            "need",
-            "dare",
-            "ought",
-            "used",
-            "to",
-            "of",
-            "in",
-            "for",
-            "on",
-            "with",
-            "at",
-            "by",
-            "from",
-            "as",
-            "into",
-            "through",
-            "during",
-            "before",
-            "after",
-            "above",
-            "below",
-            "between",
-            "under",
-            "again",
-            "further",
-            "once",
-            "and",
-            "or",
-            "but",
-            "if",
-            "because",
-            "while",
-            "where",
-            "when",
-            "how",
-            "which",
-            "who",
-            "whom",
-            "this",
-            "that",
-            "these",
-            "those",
-            "it",
-            "its",
-        }
-
-        content_words = [w for w in words if w not in stopwords]
+        # Use class-level constant (no allocation on every call)
+        content_words = [w for w in words if w not in self._STOPWORDS]
         content_ratio = len(content_words) / len(words) if words else 0
         score += min(20, content_ratio * 30)
 
@@ -559,18 +499,17 @@ class PromptAnalyzer:
                 )
             )
 
-        # 3. Check for vague language
-        vague_matches = []
-        for pattern in self.VAGUE_PATTERNS:
-            matches = re.findall(pattern, text.lower())
-            vague_matches.extend(matches)
+        # 3. Check for vague language using pre-compiled regex
+        vague_matches = self._VAGUE_REGEX.findall(text.lower())
 
         if vague_matches:
+            # Get unique matches for better reporting
+            unique_matches = list(set(vague_matches))
             issues.append(
                 PromptIssue(
                     severity=IssueSeverity.WARNING,
                     type=IssueType.VAGUE_LANGUAGE,
-                    description=f"Contains vague terms: {', '.join(set(vague_matches))}",
+                    description=f"Contains vague terms: {', '.join(unique_matches[:5])}",
                     location="Throughout prompt",
                     suggestion="Replace vague language with specific terms",
                 )

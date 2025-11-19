@@ -23,6 +23,7 @@ from src.optimizer.models import (
     PromptIssue,
     PromptSuggestion,
     OptimizationResult,
+    OptimizationChange,
     PromptVersion,
     OptimizationConfig,
     OptimizationStrategy,
@@ -374,7 +375,10 @@ def sample_optimization_result() -> OptimizationResult:
         strategy=OptimizationStrategy.CLARITY_FOCUS,
         improvement_score=12.5,
         confidence=0.85,
-        changes=["Added section headers", "Added specific output format"],
+        changes=[
+            OptimizationChange(rule_id="ADD_HEADERS", description="Added section headers"),
+            OptimizationChange(rule_id="ADD_OUTPUT_FORMAT", description="Added specific output format"),
+        ],
         metadata={
             "original_score": 65.0,
             "optimized_score": 77.5,

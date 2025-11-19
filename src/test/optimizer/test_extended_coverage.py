@@ -11,7 +11,7 @@ from datetime import datetime
 
 from src.optimizer.optimization_engine import OptimizationEngine
 from src.optimizer.prompt_analyzer import PromptAnalyzer
-from src.optimizer.models import Prompt, OptimizationConfig, OptimizationStrategy
+from src.optimizer.models import Prompt, OptimizationConfig, OptimizationStrategy, OptimizationChange
 
 
 class TestOptimizationEngineFullCoverage:
@@ -112,35 +112,35 @@ class TestOptimizationEngineFullCoverage:
         original = "Short"
         optimized = "Much longer text with lots of added content"
         changes = engine._detect_changes(original, optimized)
-        assert any("Added" in c for c in changes)
+        assert any("Added" in c.description for c in changes)
 
     def test_detect_changes_length_decrease(self, engine):
         """Test change detection for length decrease."""
         original = "This is a very long and verbose text with lots of unnecessary content"
         optimized = "Short"
         changes = engine._detect_changes(original, optimized)
-        assert any("Reduced" in c for c in changes)
+        assert any("Reduced" in c.description for c in changes)
 
     def test_detect_changes_added_headers(self, engine):
         """Test change detection for added headers."""
         original = "No headers"
         optimized = "# Header\nNo headers"
         changes = engine._detect_changes(original, optimized)
-        assert any("header" in c.lower() for c in changes)
+        assert any("header" in c.description.lower() for c in changes)
 
     def test_detect_changes_added_bullets(self, engine):
         """Test change detection for added bullets."""
         original = "No bullets"
         optimized = "- Bullet 1\n- Bullet 2"
         changes = engine._detect_changes(original, optimized)
-        assert any("bullet" in c.lower() for c in changes)
+        assert any("bullet" in c.description.lower() for c in changes)
 
     def test_detect_changes_added_numbers(self, engine):
         """Test change detection for added numbered list."""
         original = "No numbers"
         optimized = "1. First\n2. Second"
         changes = engine._detect_changes(original, optimized)
-        assert any("numbered" in c.lower() or "list" in c.lower() for c in changes)
+        assert any("numbered" in c.description.lower() or "list" in c.description.lower() for c in changes)
 
     def test_extract_variables_from_text(self, engine):
         """Test variable extraction."""
