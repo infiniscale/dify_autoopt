@@ -1,0 +1,307 @@
+import time
+import requests
+import logging
+
+from pathlib import Path
+from typing import Optional, Dict
+from apscheduler.schedulers.background import BackgroundScheduler
+from requests.exceptions import RequestException, Timeout, ConnectionError
+
+from src.config.loaders.config_loader import FileSystemReader
+from src.auth.token_opt import Token
+
+
+# 自定义异常类
+class AuthenticationError(Exception):
+    """认证失败异常"""
+    pass
+
+
+class SessionExpiredError(Exception):
+    """会话过期异常"""
+    pass
+
+
+class PermissionDeniedError(Exception):
+    """权限验证失败异常"""
+    pass
+
+
+class NetworkConnectionError(Exception):
+    """网络连接异常"""
+    pass
+
+
+class ConfigurationError(Exception):
+    """配置错误异常"""
+    pass
+
+
+
+
+# 设置模块日志
+logger = logging.getLogger(__name__)
+
+
+class DifyAuthClient:
+    def __init__(self, base_url: str, timeout: int = 10, email: str = None, password: str = None):
+        """
+        初始化 Dify 认证客户端。
+
+        Args:
+            base_url (str): Dify 实例地址，如 "http://localhost:3000"
+            timeout (int): 请求超时时间（秒）
+        """
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.email = email
+        self.password = password
+
+    def login(self) -> Optional[
+        Dict[str, str]]:
+        """
+        用户登录，获取访问令牌。
+
+        Returns:
+            dict: {"access_token": "...", "refresh_token": "..."} 或 None（失败）
+
+        Raises:
+            AuthenticationError: 认证失败时抛出
+            NetworkConnectionError: 网络连接异常时抛出
+            Timeout: 请求超时时抛出
+            RequestException: 其他请求异常时抛出
+        """
+        url = f"{self.base_url}/console/api/login"
+        payload = {
+            "email": self.email,
+            "password": self.password,
+            "language": "zh-Hans",
+            "remember_me": True
+        }
+        try:
+            response = requests.post(url, json=payload, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("result") == "success":
+                return data.get("data")
+            else:
+                error_msg = data.get("message", "Unknown error")
+                logger.error(f"Authentication Failed: {error_msg}")
+                raise AuthenticationError(error_msg)
+        except Timeout as e:
+            logger.error(f"Login Timeout: {e}")
+            raise NetworkConnectionError(f"登录请求超时: {e}")
+        except ConnectionError as e:
+            logger.error(f"Connection Error: {e}")
+            raise NetworkConnectionError(f"无法连接到服务器: {e}")
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 401:
+                raise AuthenticationError("用户名或密码错误")
+            elif response.status_code == 403:
+                raise PermissionDeniedError("访问被拒绝，权限不足")
+            elif response.status_code == 429:
+                raise AuthenticationError("请求过于频繁，请稍后再试")
+            else:
+                logger.error(f"HTTP Error: {e}")
+                raise AuthenticationError(f"服务器返回错误: {response.status_code}")
+        except RequestException as e:
+            logger.error(f"Request Error: {e}")
+            raise NetworkConnectionError(f"网络请求失败: {e}")
+        except ValueError as e:
+            logger.error(f"JSON Decode Error: {e}")
+            raise AuthenticationError("服务器响应格式错误")
+        except Exception as e:
+            logger.error(f"Login Error: {e}")
+            raise AuthenticationError(f"登录失败: {e}")
+
+    def logout(self, access_token: str) -> bool:
+        """
+        用户登出，清除服务端 Refresh Token。
+
+        Args:
+            access_token (str): 访问令牌
+
+        Returns:
+            bool: True 表示成功，False 表示失败
+
+        Raises:
+            AuthenticationError: 认证失败时抛出
+            SessionExpiredError: 会话过期时抛出
+            NetworkConnectionError: 网络连接异常时抛出
+        """
+        url = f"{self.base_url}/console/api/logout"
+        headers = {"Authorization": f"Bearer {access_token}"}
+        try:
+            response = requests.get(url, headers=headers, timeout=self.timeout)
+            response.raise_for_status()
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("result") == "success":
+                    return True
+                else:
+                    error_msg = data.get("message", "Logout failed")
+                    logger.error(f"Logout Failed: {error_msg}")
+                    raise AuthenticationError(error_msg)
+        except Timeout as e:
+            logger.error(f"Logout Timeout: {e}")
+            raise NetworkConnectionError(f"登出请求超时: {e}")
+        except ConnectionError as e:
+            logger.error(f"Logout Connection Error: {e}")
+            raise NetworkConnectionError(f"无法连接到服务器: {e}")
+        except requests.exceptions.HTTPError as e:
+            if response.status_code == 401:
+                raise SessionExpiredError("会话已过期，请重新登录")
+            elif response.status_code == 403:
+                raise PermissionDeniedError("登出权限不足")
+            elif response.status_code == 429:
+                raise AuthenticationError("请求过于频繁，请稍后再试")
+            else:
+                logger.error(f"Logout HTTP Error: {e}")
+                raise AuthenticationError(f"登出失败: HTTP {response.status_code}")
+        except RequestException as e:
+            logger.error(f"Logout Request Error: {e}")
+            raise NetworkConnectionError(f"登出网络请求失败: {e}")
+        except ValueError as e:
+            logger.error(f"Logout JSON Decode Error: {e}")
+            raise AuthenticationError("登出响应格式错误")
+        except Exception as e:
+            logger.error(f"Logout Error: {e}")
+            raise AuthenticationError(f"登出失败: {e}")
+
+        logger.warning(f"Logout unexpected response: Status: {response.status_code}, Response: {response.text}")
+        return False
+
+    def login_job(self):
+        """定时登录任务
+
+        Raises:
+            根据具体情况抛出相应的异常
+        """
+        logger.info("开始执行定时登录任务...")
+        try:
+            result = self.login()
+            if result:
+                # 检查result中是否包含access_token - 获取实际的数据结构
+                if isinstance(result, dict):
+                    # 检查是否是标准的API响应格式 {"result": "success", "data": {...}}
+                    if "result" in result and "data" in result and result.get("result") == "success":
+                        token_data = result["data"]
+                        if not isinstance(token_data, dict) or "access_token" not in token_data:
+                            logger.error("登录响应数据格式无效")
+                            raise AuthenticationError("登录响应数据格式无效")
+                        access_token = token_data["access_token"]
+                    else:
+                        # 直接检查是否有access_token字段
+                        if "access_token" not in result:
+                            logger.error("登录结果中缺少access_token")
+                            raise AuthenticationError("登录结果中缺少access_token")
+                        access_token = result["access_token"]
+                else:
+                    logger.error("登录结果格式无效")
+                    raise AuthenticationError("登录结果格式无效")
+
+                Token().rewrite_access_token(access_token)
+                logger.debug(f"已保存访问令牌: {access_token[:4]}****{access_token[-4:]}")
+                logger.info("登录成功")
+
+                if Token().validate_access_token():  # 修复拼写错误
+                    logger.info("访问令牌有效")
+                else:
+                    logger.error("访问令牌无效")
+                    raise AuthenticationError("访问令牌无效")
+            else:
+                logger.error("登录失败")
+        except AuthenticationError as e:
+            logger.error(f"认证失败: {e}")
+            raise AuthenticationError(f"认证失败: {e}")
+        except NetworkConnectionError as e:
+            logger.error(f"网络连接异常: {e}")
+            raise NetworkConnectionError(f"网络连接异常: {e}")
+        except SessionExpiredError as e:
+            logger.error(f"会话过期: {e}")
+            raise SessionExpiredError(f"会话过期: {e}")
+        except PermissionDeniedError as e:
+            logger.error(f"权限不足: {e}")
+            raise PermissionDeniedError(f"权限不足: {e}")
+        except Exception as e:
+            logger.error(f"登录任务执行出错: {e}")
+            raise Exception(f"登录任务执行出错: {e}")
+
+
+def run(config_path: str = "config/env_config.yaml"):
+    """运行认证客户端
+
+    Args:
+        config_path (str): 配置文件路径，默认为 "config/env_config.yaml"
+
+    Raises:
+        FileNotFoundError: 配置文件未找到时抛出
+        KeyError: 配置项缺失时抛出
+        ValueError: 配置值无效时抛出
+        Exception: 其他运行时异常
+    """
+    try:
+        yaml_data = FileSystemReader.read_yaml(Path(config_path))
+
+        # 安全获取配置项，避免None.get()错误
+        dify_config = yaml_data.get("dify")
+        if not dify_config:
+            raise KeyError("配置文件中缺少dify配置块")
+
+        auth_config = yaml_data.get("auth")
+        if not auth_config:
+            raise KeyError("配置文件中缺少auth配置块")
+
+        url = dify_config.get("base_url")
+        email = auth_config.get("username")
+        password = auth_config.get("password")
+
+        if not all([url, email, password]):
+            missing_configs = []
+            if not url:
+                missing_configs.append("dify.base_url")
+            if not email:
+                missing_configs.append("auth.username")
+            if not password:
+                missing_configs.append("auth.password")
+            raise ValueError(f"配置文件缺少必要的认证信息: {', '.join(missing_configs)}")
+
+        client = DifyAuthClient(url, email=email, password=password)
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(client.login_job, 'interval', hours=1, id='dify_login_job')
+        scheduler.start()
+        logger.info("调度器已启动...")
+
+    except FileNotFoundError as e:
+        logger.error(f"配置文件未找到: {e}")
+        raise FileNotFoundError(f"无法找到配置文件: {e}")
+    except KeyError as e:
+        logger.error(f"配置项缺失: {e}")
+        raise KeyError(f"配置文件中缺少必要的配置项: {e}")
+    except ValueError as e:
+        logger.error(f"配置值无效: {e}")
+        raise ValueError(f"配置文件中的值无效: {e}")
+    except Exception as e:
+        logger.error(f"运行时异常: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    """脚本入口点，提供完整的异常处理"""
+    try:
+        run("../../config/config.yaml")
+    except AuthenticationError as e:
+        logger.error(f"认证失败: {e}")
+        exit(1)
+    except NetworkConnectionError as e:
+        logger.error(f"网络连接异常: {e}")
+        exit(2)
+    except ConfigurationError as e:
+        logger.error(f"配置错误: {e}")
+        exit(3)
+    except KeyboardInterrupt:
+        logger.info("用户中断程序运行")
+        exit(0)
+    except Exception as e:
+        logger.error(f"程序运行失败: {e}")
+        exit(4)
