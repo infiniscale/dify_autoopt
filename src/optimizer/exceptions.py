@@ -549,3 +549,18 @@ class ConfigError(OptimizerError):
         )
         self.reason = reason
         self.config_key = config_key
+
+
+# ============================================================================
+# Patch Engine / Template Exceptions (ownership anchor)
+# ============================================================================
+
+
+class TemplateRenderError(OptimizerError):
+    """Template rendering error in prompt patching/template engine."""
+    pass
+
+
+class PatchTargetMissing(OptimizerError):
+    """Target node for prompt patch not found in DSL tree."""
+    pass

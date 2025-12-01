@@ -12,8 +12,8 @@ meta:
 
 # ===== Dify 平台配置 =====
 dify:
-  base_url: "http://localhost:3000"   # Dify 实例根地址
-  api_base: "http://localhost:3000/v1"
+  base_url: "http://xy.dnset.com:1280"   # Dify 实例根地址
+  api_base: "http://xy.dnset.com:1280/v1"
   tenant_id: null
 
 # ===== 登录与认证配置（演示用，建议使用环境变量替代） =====
