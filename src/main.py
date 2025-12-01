@@ -10,19 +10,35 @@ from pathlib import Path
 from datetime import datetime
 
 # 添加src目录到Python路径
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # 导入业务模块
-from src.utils.logger import setup_logging, get_logger
-from src.config.yaml_loader import load_config
+from src.utils.logger import (
+    setup_logging,
+    get_logger,
+    log_context,
+    log_performance,
+    log_workflow_trace,
+    log_exception,
+)
+from src.config.loaders.config_loader import FileSystemReader, ConfigLoader
+import argparse
 
 
-async def main():
-    """主程序入口，演示日志系统集成"""
+async def main(argv: list[str] | None = None) -> int:
+    """主程序入口，提供最小可用 CLI 与日志演示。"""
+
+    # CLI 参数
+    parser = argparse.ArgumentParser(description="Dify自动化测试与提示词优化工具")
+    parser.add_argument("--mode", "-m", choices=["test", "optimize", "report"], default="test")
+    parser.add_argument("--config", "-c", default="config/config.yaml", help="环境配置文件路径")
+    parser.add_argument("--catalog", default="config/workflow_repository.yaml", help="工作流目录文件路径（可选）")
+    parser.add_argument("--report", default=None, help="报告输出路径（json，可选）")
+    parser.add_argument("--log-config", default="config/logging_config.yaml", help="日志配置文件路径")
+    args = parser.parse_args(argv)
 
     # 1. 初始化日志系统（必须在程序开始时调用）
-    config_path = "config/logging_config.yaml"
-    await setup_logging(config_path)
+    await setup_logging(args.log_config)
 
     logger = get_logger("main")
 
@@ -48,26 +64,42 @@ async def main():
         )
 
         # 4. 记录配置加载
+        # 4. 配置加载（尽量不失败，作为提示）
         try:
-            config = load_config("config/config.yaml")
+            cfg = FileSystemReader.read_yaml(Path(args.config))
             logger.info(
                 "配置文件加载成功",
                 extra={
-                    "config_file": "config/config.yaml",
-                    "config_keys": list(config.keys()) if config else []
+                    "config_file": args.config,
+                    "config_keys": list(cfg.keys()) if isinstance(cfg, dict) else []
                 }
             )
         except Exception as e:
             logger.warning(
                 "配置文件加载失败，使用默认配置",
                 extra={
-                    "config_file": "config/config.yaml",
+                    "config_file": args.config,
                     "error": str(e)
                 }
             )
 
-        # 5. 模拟业务流程
-        await simulate_workflow_execution()
+        # 5. 按模式执行最小流程
+        if args.mode == "test":
+            results = await run_test_mode(args.catalog)
+            if args.report:
+                from src.report import generate_report, save_report_json
+                rep = generate_report([r for r in results])
+                save_report_json(rep, args.report)
+                logger.info("测试报告已生成", extra={"path": args.report})
+
+        elif args.mode == "optimize":
+            logger.info("进入优化模式（占位实现）", extra={"mode": args.mode})
+            # 仍使用模拟流程，以保持运行演示
+            await simulate_workflow_execution()
+
+        elif args.mode == "report":
+            logger.info("进入报告模式（占位实现）", extra={"mode": args.mode})
+            await simulate_workflow_execution()
 
         # 6. 记录应用关闭信息
         logger.info(
@@ -280,3 +312,45 @@ if __name__ == "__main__":
     # 运行主程序
     exit_code = asyncio.run(main())
     sys.exit(exit_code)
+
+
+# ============== 附加：最小 test 模式编排 ==============
+async def run_test_mode(catalog_path: str):
+    """最小可运行 test 模式：尝试加载 catalog 并运行 stub 工作流。
+
+    若 catalog 不存在，回退到内建模拟工作流执行。
+    返回值为结果字典列表。
+    """
+    logger = get_logger("cli.test")
+    from pathlib import Path
+    from src.workflow import discover_workflows, run_workflow
+
+    p = Path(catalog_path)
+    if not p.exists():
+        logger.warning("catalog 文件不存在，回退到模拟流程", extra={"catalog": catalog_path})
+        await simulate_workflow_execution()
+        return []
+
+    try:
+        # 使用 ConfigLoader 解析 catalog
+        loader = ConfigLoader()
+        catalog = loader.load_catalog(p)
+        wfs = discover_workflows(catalog)
+        logger.info("发现工作流", extra={"count": len(wfs)})
+
+        results = []
+        for wf in wfs[:3]:  # 限制最多执行3个，防止时间过长
+            r = await run_workflow(wf)
+            results.append({
+                "workflow_id": r.workflow_id,
+                "label": r.label,
+                "status": r.status,
+                "started_at": r.started_at,
+                "ended_at": r.ended_at,
+                "metrics": r.metrics,
+            })
+        return results
+    except Exception as e:
+        logger.warning("catalog 加载或运行失败，回退到模拟流程", extra={"error": str(e)})
+        await simulate_workflow_execution()
+        return []

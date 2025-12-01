@@ -161,6 +161,9 @@ python -m pytest -q
 # 仅运行日志相关测试
 pytest -q -k logger
 
+# 仅运行 utils 目录下的测试
+pytest -q -k utils
+
 # 覆盖率报告（推荐）
 pytest --cov=src --cov-report=term-missing
 ```
