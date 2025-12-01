@@ -65,7 +65,21 @@ class ConfigLoader:
         expanded_data = self._expand_env_vars(raw_data)
 
         try:
-            return EnvConfig(**expanded_data)
+            cfg = EnvConfig(**expanded_data)
+            # 日志记录（尽量不影响流程）
+            try:
+                from src.utils.logger import get_logger
+                get_logger("config.loader").info(
+                    "已加载 EnvConfig",
+                    extra={
+                        "path": str(path.resolve()),
+                        "base_url": cfg.dify.base_url,
+                        "has_primary_token": bool(cfg.dify.auth.primary_token.get_secret_value()),
+                    },
+                )
+            except Exception:
+                pass
+            return cfg
         except Exception as e:
             raise ConfigurationError(f"Failed to validate env_config: {e}")
 
@@ -86,7 +100,19 @@ class ConfigLoader:
         expanded_data = self._expand_env_vars(raw_data)
 
         try:
-            return WorkflowCatalog(**expanded_data)
+            catalog = WorkflowCatalog(**expanded_data)
+            try:
+                from src.utils.logger import get_logger
+                get_logger("config.loader").info(
+                    "已加载 WorkflowCatalog",
+                    extra={
+                        "path": str(path.resolve()),
+                        "workflows": len(catalog.workflows),
+                    },
+                )
+            except Exception:
+                pass
+            return catalog
         except Exception as e:
             raise ConfigurationError(f"Failed to validate workflow_repository: {e}")
 
@@ -107,7 +133,20 @@ class ConfigLoader:
         expanded_data = self._expand_env_vars(raw_data)
 
         try:
-            return TestPlan(**expanded_data)
+            plan = TestPlan(**expanded_data)
+            try:
+                from src.utils.logger import get_logger
+                get_logger("config.loader").info(
+                    "已加载 TestPlan",
+                    extra={
+                        "path": str(path.resolve()),
+                        "workflows": len(plan.workflows),
+                        "datasets": len(plan.test_data.datasets if plan.test_data else []),
+                    },
+                )
+            except Exception:
+                pass
+            return plan
         except Exception as e:
             raise ConfigurationError(f"Failed to validate test_plan: {e}")
 

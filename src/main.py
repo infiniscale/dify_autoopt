@@ -4,6 +4,7 @@
 描述: Dify自动化测试工具主程序，集成日志系统示例
 """
 
+import os
 import asyncio
 import sys
 from pathlib import Path
@@ -23,6 +24,11 @@ from src.utils.logger import (
 )
 from src.config.loaders.config_loader import FileSystemReader, ConfigLoader
 import argparse
+try:
+    from dotenv import load_dotenv as _load_dotenv
+except Exception:
+    def _load_dotenv(*args, **kwargs):
+        return False
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -34,10 +40,23 @@ async def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", "-c", default="config/config.yaml", help="环境配置文件路径")
     parser.add_argument("--catalog", default="config/workflow_repository.yaml", help="工作流目录文件路径（可选）")
     parser.add_argument("--report", default=None, help="报告输出路径（json，可选）")
-    parser.add_argument("--log-config", default="config/logging_config.yaml", help="日志配置文件路径")
+    parser.add_argument("--log-config", default=None, help="日志配置文件路径（留空将自动探测 logging_config.yaml 或 config.yaml）")
+    parser.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        help="覆盖配置项，格式: a.b.c=value，可重复（仅影响运行时配置，引导后生效）",
+    )
     args = parser.parse_args(argv)
 
+    # 0. 预加载 .env 环境变量，供 ${VAR} 展开
+    try:
+        _load_dotenv(dotenv_path=Path('.env'), override=False)
+    except Exception:
+        pass
+
     # 1. 初始化日志系统（必须在程序开始时调用）
+    # 如果未指定，将自动探测 logging_config.yaml 或 config.yaml
     await setup_logging(args.log_config)
 
     logger = get_logger("main")
@@ -50,11 +69,16 @@ async def main(argv: list[str] | None = None) -> int:
                 "version": "1.0.0",
                 "environment": "development",
                 "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
-                "startup_time": datetime.now().isoformat()
+                "startup_time": datetime.now().isoformat(),
+                "env": {
+                    "env_file": ".env",
+                    "has_DIFY_API_TOKEN": bool(os.getenv("DIFY_API_TOKEN")),
+                    "has_OPENAI_API_KEY": bool(os.getenv("OPENAI_API_KEY")),
+                }
             }
         )
 
-        # 3. 设置全局上下文
+        # 3. 设置全局上下文（初始）
         from src.utils.logger import _log_manager
         _log_manager.set_global_context(
             application_version="1.0.0",
@@ -64,15 +88,81 @@ async def main(argv: list[str] | None = None) -> int:
         )
 
         # 4. 记录配置加载
-        # 4. 配置加载（尽量不失败，作为提示）
+        # 4. 配置加载与初始化（统一 config.yaml）
+        from src.config.bootstrap import bootstrap_from_unified
+        effective_config = Path(args.config)
+
+        # 4.1 处理 --set 覆盖项（将覆盖写入临时文件，仅影响本次运行时引导）
+        if args.set:
+            try:
+                import yaml, tempfile
+
+                def _apply(d: dict, path: str, value: str):
+                    cur = d
+                    parts = path.split('.') if path else []
+                    for key in parts[:-1]:
+                        if key not in cur or not isinstance(cur[key], dict):
+                            cur[key] = {}
+                        cur = cur[key]
+                    # 尝试将字符串转换为基本类型
+                    v = value
+                    if value.lower() in {"true", "false"}:
+                        v = value.lower() == "true"
+                    else:
+                        try:
+                            if "." in value:
+                                v = float(value)
+                            else:
+                                v = int(value)
+                        except Exception:
+                            v = value
+                    if parts:
+                        cur[parts[-1]] = v
+
+                raw = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
+                for item in args.set:
+                    if "=" not in item:
+                        continue
+                    k, v = item.split("=", 1)
+                    _apply(raw, k.strip(), v.strip())
+
+                tf = tempfile.NamedTemporaryFile(prefix="config_overrides_", suffix=".yaml", delete=False)
+                Path(tf.name).write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+                effective_config = Path(tf.name)
+                logger.info("已应用配置覆盖项", extra={"overrides": args.set, "effective_config": str(effective_config)})
+            except Exception as e:
+                logger.warning("应用配置覆盖项失败，继续使用原始配置", extra={"error": str(e)})
         try:
-            cfg = FileSystemReader.read_yaml(Path(args.config))
+            runtime = bootstrap_from_unified(effective_config)
+
+            # 全局上下文增强
+            meta = runtime.app.meta or {}
+            _log_manager.set_global_context(
+                deployment_environment=meta.get("environment", "development"),
+                application_version=meta.get("version", "1.0.0"),
+                dify_base_url=runtime.dify_base_url,
+            )
+
+            # 详细日志
             logger.info(
-                "配置文件加载成功",
+                "配置初始化完成",
                 extra={
-                    "config_file": args.config,
-                    "config_keys": list(cfg.keys()) if isinstance(cfg, dict) else []
-                }
+                    "config_file": str(effective_config),
+                    "meta": {
+                        "version": meta.get("version"),
+                        "environment": meta.get("environment"),
+                    },
+                    "dify": {"base_url": runtime.dify_base_url},
+                    "auth": {
+                        "has_api_key": runtime.has_token_auth,
+                        "has_username_password": runtime.has_password_auth,
+                    },
+                    "workflows": runtime.workflows_count,
+                    "execution": runtime.app.execution or {},
+                    "optimization": runtime.app.optimization or {},
+                    "io_paths": runtime.app.io_paths or {},
+                    "logging": runtime.app.logging or {},
+                },
             )
         except Exception as e:
             logger.warning(
@@ -85,7 +175,7 @@ async def main(argv: list[str] | None = None) -> int:
 
         # 5. 按模式执行最小流程
         if args.mode == "test":
-            results = await run_test_mode(args.catalog)
+            results = await run_test_mode(args.catalog, args.config)
             if args.report:
                 from src.report import generate_report, save_report_json
                 rep = generate_report([r for r in results])
@@ -315,7 +405,7 @@ if __name__ == "__main__":
 
 
 # ============== 附加：最小 test 模式编排 ==============
-async def run_test_mode(catalog_path: str):
+async def run_test_mode(catalog_path: str, unified_config_path: str):
     """最小可运行 test 模式：尝试加载 catalog 并运行 stub 工作流。
 
     若 catalog 不存在，回退到内建模拟工作流执行。
@@ -327,9 +417,31 @@ async def run_test_mode(catalog_path: str):
 
     p = Path(catalog_path)
     if not p.exists():
-        logger.warning("catalog 文件不存在，回退到模拟流程", extra={"catalog": catalog_path})
-        await simulate_workflow_execution()
-        return []
+        logger.warning("catalog 文件不存在，尝试使用统一配置中的 workflows", extra={"catalog": catalog_path})
+        try:
+            from src.config.bootstrap import get_runtime
+            rt = get_runtime()
+            from src.workflow.runner import run_inline_workflow
+            results = []
+            if rt.workflows_count == 0:
+                logger.warning("统一配置中未定义 workflows，回退到模拟流程")
+                await simulate_workflow_execution()
+                return []
+            for w in rt.app.workflows[:3]:
+                r = await run_inline_workflow(w.id, w.name or w.id)
+                results.append({
+                    "workflow_id": r.workflow_id,
+                    "label": r.label,
+                    "status": r.status,
+                    "started_at": r.started_at,
+                    "ended_at": r.ended_at,
+                    "metrics": r.metrics,
+                })
+            return results
+        except Exception as e:
+            logger.warning("使用统一配置运行失败，回退到模拟流程", extra={"error": str(e)})
+            await simulate_workflow_execution()
+            return []
 
     try:
         # 使用 ConfigLoader 解析 catalog

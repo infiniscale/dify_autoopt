@@ -52,7 +52,12 @@ class SimpleLogManager:
                 raise LoggingException(f"Failed to initialize logging: {e}")
 
     def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
-        """加载配置文件"""
+        """加载配置文件
+
+        支持两种配置风格：
+        1) 高级配置（config/logging_config.yaml）：logging.global/outputs/...
+        2) 简化配置（config/config.yaml 下的 logging 简化字段）
+        """
         default_config = {
             "level": "INFO",
             "format": "simple",  # simple or structured
@@ -68,34 +73,79 @@ class SimpleLogManager:
             "date_format": "%Y-%m-%d %H:%M:%S"
         }
 
-        if config_path and os.path.exists(config_path):
+        # 自动探测配置路径：优先 logging_config.yaml，其次 config.yaml
+        candidate_paths = []
+        if config_path:
+            candidate_paths.append(config_path)
+        else:
+            candidate_paths.extend([
+                os.path.join("config", "logging_config.yaml"),
+                os.path.join("config", "config.yaml"),
+            ])
+
+        selected_path = None
+        for p in candidate_paths:
+            if p and os.path.exists(p):
+                selected_path = p
+                break
+
+        if selected_path:
             try:
                 import yaml
-                with open(config_path, 'r', encoding='utf-8') as f:
+                with open(selected_path, 'r', encoding='utf-8') as f:
                     config = yaml.safe_load(f)
 
-                if 'logging' in config:
-                    logging_config = config['logging']
-                    global_config = logging_config.get('global', {})
-                    outputs_config = logging_config.get('outputs', {})
+                if isinstance(config, dict) and 'logging' in config:
+                    logging_config = config['logging'] or {}
 
-                    # 更新配置
-                    default_config.update({
-                        "level": global_config.get('level', "INFO"),
-                        "format": global_config.get('format', 'simple'),
-                        "include_colors": outputs_config.get('console', {}).get('include_colors', True),
-                        "console_enabled": outputs_config.get('console', {}).get('enabled', True),
-                        "console_level": outputs_config.get('console', {}).get('level', "INFO"),
-                        "file_enabled": outputs_config.get('file', {}).get('enabled', True),
-                        "file_level": outputs_config.get('file', {}).get('level', "DEBUG"),
-                        "file_path": outputs_config.get('file', {}).get('path', "logs"),
-                        "rotation": outputs_config.get('file', {}).get('rotation', "1 day"),
-                        "retention": outputs_config.get('file', {}).get('retention', "30 days"),
-                        "compression": outputs_config.get('file', {}).get('compression', "zip")
-                    })
+                    # 风格 1：高级配置（有 global/outputs）
+                    if isinstance(logging_config, dict) and (
+                        'global' in logging_config or 'outputs' in logging_config
+                    ):
+                        global_config = logging_config.get('global', {})
+                        outputs_config = logging_config.get('outputs', {})
+                        default_config.update({
+                            "level": global_config.get('level', "INFO"),
+                            "format": global_config.get('format', 'simple'),
+                            "include_colors": outputs_config.get('console', {}).get('include_colors', True),
+                            "console_enabled": outputs_config.get('console', {}).get('enabled', True),
+                            "console_level": outputs_config.get('console', {}).get('level', "INFO"),
+                            "file_enabled": outputs_config.get('file', {}).get('enabled', True),
+                            "file_level": outputs_config.get('file', {}).get('level', "DEBUG"),
+                            "file_path": outputs_config.get('file', {}).get('path', "logs"),
+                            "rotation": outputs_config.get('file', {}).get('rotation', "1 day"),
+                            "retention": outputs_config.get('file', {}).get('retention', "30 days"),
+                            "compression": outputs_config.get('file', {}).get('compression', "zip")
+                        })
+
+                    # 风格 2：简化配置（config.yaml 下的扁平字段）
+                    else:
+                        default_config.update({
+                            "level": logging_config.get('level', default_config['level']),
+                            "format": logging_config.get('format', default_config['format']),
+                            "console_enabled": logging_config.get('console_enabled', default_config['console_enabled']),
+                            "file_enabled": logging_config.get('file_enabled', default_config['file_enabled']),
+                        })
+
+                        # 可选字段
+                        if 'file_path' in logging_config:
+                            default_config['file_path'] = logging_config['file_path']
+                        if 'console_level' in logging_config:
+                            default_config['console_level'] = logging_config['console_level']
+                        if 'file_level' in logging_config:
+                            default_config['file_level'] = logging_config['file_level']
+                        if 'rotation' in logging_config:
+                            default_config['rotation'] = logging_config['rotation']
+                        if 'retention' in logging_config:
+                            default_config['retention'] = logging_config['retention']
+                        if 'compression' in logging_config:
+                            default_config['compression'] = logging_config['compression']
+
+                # 记录生效的配置源（延后在 _setup_loguru 后输出）
+                self._config_source = selected_path
 
             except Exception as e:
-                print(f"Warning: Failed to load config from {config_path}: {e}")
+                print(f"Warning: Failed to load logging config from {selected_path}: {e}")
 
         return default_config
 
@@ -175,6 +225,23 @@ class SimpleLogManager:
                 compression=self._config["compression"],
                 catch=True
             )
+
+        # 输出初始化信息
+        try:
+            src = getattr(self, "_config_source", None)
+            loguru_logger.info(
+                "日志系统初始化完成",
+                extra={
+                    "config_source": src or "<defaults>",
+                    "level": self._config.get("level"),
+                    "format": self._config.get("format"),
+                    "console_enabled": self._config.get("console_enabled"),
+                    "file_enabled": self._config.get("file_enabled"),
+                    "file_path": str(Path(self._config.get("file_path", "logs")).resolve()),
+                },
+            )
+        except Exception:
+            pass
 
     def is_configured(self) -> bool:
         """检查是否已配置"""

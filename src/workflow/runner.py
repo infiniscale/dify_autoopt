@@ -73,3 +73,33 @@ async def run_workflow(workflow: WorkflowEntry) -> RunResult:
         },
     )
 
+
+@log_performance("workflow_run_inline")
+async def run_inline_workflow(workflow_id: str, label: str) -> RunResult:
+    """Run a workflow defined inline in unified config (no DSL/nodes)."""
+    logger = get_logger("workflow.runner")
+    start = datetime.now()
+    with log_workflow_trace(workflow_id, "full_execution", logger):
+        with log_workflow_trace(workflow_id, "input", logger):
+            await asyncio.sleep(0.02)
+            logger.info("输入准备完成", extra={"workflow_id": workflow_id, "records": 5})
+        with log_workflow_trace(workflow_id, "processing", logger):
+            await asyncio.sleep(0.04)
+            logger.info("处理完成", extra={"workflow_id": workflow_id, "nodes": 0})
+        with log_workflow_trace(workflow_id, "output", logger):
+            await asyncio.sleep(0.02)
+            logger.info("输出完成", extra={"workflow_id": workflow_id, "files": 1})
+    end = datetime.now()
+    return RunResult(
+        workflow_id=workflow_id,
+        label=label,
+        status="success",
+        started_at=start.isoformat(),
+        ended_at=end.isoformat(),
+        metrics={
+            "input_records": 5,
+            "nodes": 0,
+            "outputs": 1,
+            "duration_seconds": (end - start).total_seconds(),
+        },
+    )

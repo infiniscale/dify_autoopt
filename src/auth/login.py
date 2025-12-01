@@ -7,8 +7,8 @@ from typing import Optional, Dict
 from apscheduler.schedulers.background import BackgroundScheduler
 from requests.exceptions import RequestException, Timeout, ConnectionError
 
-from src.config.loaders.config_loader import FileSystemReader
 from src.auth.token_opt import Token
+from src.config.bootstrap import get_runtime, bootstrap_from_unified
 
 
 # 自定义异常类
@@ -228,7 +228,7 @@ class DifyAuthClient:
             raise Exception(f"登录任务执行出错: {e}")
 
 
-def run(config_path: str = "config/env_config.yaml"):
+def run(config_path: str = "config/config.yaml"):
     """运行认证客户端
 
     Args:
@@ -241,36 +241,42 @@ def run(config_path: str = "config/env_config.yaml"):
         Exception: 其他运行时异常
     """
     try:
-        yaml_data = FileSystemReader.read_yaml(Path(config_path))
+        # 确保 runtime 可用（若外部尚未引导，则本地引导）
+        try:
+            rt = get_runtime()
+        except Exception:
+            rt = bootstrap_from_unified(Path(config_path))
 
-        # 安全获取配置项，避免None.get()错误
-        dify_config = yaml_data.get("dify")
-        if not dify_config:
-            raise KeyError("配置文件中缺少dify配置块")
+        # 读取统一配置中的 dify/auth
+        url = (rt.app.dify or {}).get("base_url")
+        auth_cfg = rt.app.auth or {}
+        api_key = auth_cfg.get("api_key")
+        email = auth_cfg.get("username")
+        password = auth_cfg.get("password")
 
-        auth_config = yaml_data.get("auth")
-        if not auth_config:
-            raise KeyError("配置文件中缺少auth配置块")
+        if not url:
+            raise ValueError("配置文件缺少必要的认证信息: dify.base_url")
 
-        url = dify_config.get("base_url")
-        email = auth_config.get("username")
-        password = auth_config.get("password")
+        # 优先使用 api_key（无需网络请求）
+        if api_key:
+            Token().rewrite_access_token(api_key)
+            logger.info("已使用 API Key 完成认证并注入访问令牌")
+            return
 
-        if not all([url, email, password]):
-            missing_configs = []
-            if not url:
-                missing_configs.append("dify.base_url")
-            if not email:
-                missing_configs.append("auth.username")
-            if not password:
-                missing_configs.append("auth.password")
+        # 回退到用户名/密码登录
+        missing_configs = []
+        if not email:
+            missing_configs.append("auth.username")
+        if not password:
+            missing_configs.append("auth.password")
+        if missing_configs:
             raise ValueError(f"配置文件缺少必要的认证信息: {', '.join(missing_configs)}")
 
         client = DifyAuthClient(url, email=email, password=password)
         scheduler = BackgroundScheduler()
         scheduler.add_job(client.login_job, 'interval', hours=1, id='dify_login_job')
         scheduler.start()
-        logger.info("调度器已启动...")
+        logger.info("调度器已启动（用户名/密码模式）...")
 
     except FileNotFoundError as e:
         logger.error(f"配置文件未找到: {e}")
