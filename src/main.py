@@ -37,7 +37,12 @@ async def main(argv: list[str] | None = None) -> int:
     # CLI 参数
     parser = argparse.ArgumentParser(description="Dify自动化测试与提示词优化工具")
     parser.add_argument("--mode", "-m", choices=["test", "optimize", "report"], default="test")
-    parser.add_argument("--config", "-c", default="config/config.yaml", help="环境配置文件路径")
+    parser.add_argument(
+        "--config",
+        "-c",
+        default=None,
+        help="环境配置文件路径（未设置则自动尝试 config/config.yaml，不存在时使用内置默认配置）",
+    )
     parser.add_argument("--catalog", default="config/workflow_repository.yaml", help="工作流目录文件路径（可选）")
     parser.add_argument("--report", default=None, help="报告输出路径（json，可选）")
     parser.add_argument("--log-config", default=None, help="日志配置文件路径（留空将自动探测 logging_config.yaml 或 config.yaml）")
@@ -90,7 +95,36 @@ async def main(argv: list[str] | None = None) -> int:
         # 4. 记录配置加载
         # 4. 配置加载与初始化（统一 config.yaml）
         from src.config.bootstrap import bootstrap_from_unified
-        effective_config = Path(args.config)
+        # 4.0 解析实际配置路径
+        effective_config: Path
+        if args.config:
+            candidate = Path(args.config)
+            if candidate.exists():
+                effective_config = candidate
+            else:
+                logger.warning("指定的配置文件不存在，尝试默认路径", extra={"config": str(candidate)})
+                effective_config = Path("config/config.yaml")
+        else:
+            effective_config = Path("config/config.yaml")
+
+        if not effective_config.exists():
+            # 使用内置默认配置，避免启动失败
+            import yaml, tempfile
+            default_cfg = {
+                "meta": {"version": "1.0.0", "environment": "development"},
+                "dify": {"base_url": None},
+                "auth": {},
+                "variables": {},
+                "workflows": [],
+                "execution": {"concurrency": 5, "timeout": 300, "retry_count": 3},
+                "optimization": {"strategy": "auto", "max_iterations": 3},
+                "io_paths": {"output_dir": "./outputs", "logs_dir": "./logs"},
+                "logging": {"level": "INFO", "format": "simple", "console_enabled": True, "file_enabled": True},
+            }
+            tf = tempfile.NamedTemporaryFile(prefix="default_config_", suffix=".yaml", delete=False)
+            Path(tf.name).write_text(yaml.safe_dump(default_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            effective_config = Path(tf.name)
+            logger.info("未找到配置文件，已使用内置默认配置", extra={"effective_config": str(effective_config)})
 
         # 4.1 处理 --set 覆盖项（将覆盖写入临时文件，仅影响本次运行时引导）
         if args.set:
@@ -119,7 +153,13 @@ async def main(argv: list[str] | None = None) -> int:
                     if parts:
                         cur[parts[-1]] = v
 
-                raw = yaml.safe_load(Path(args.config).read_text(encoding="utf-8")) or {}
+                base_raw = {}
+                try:
+                    if effective_config.exists():
+                        base_raw = yaml.safe_load(effective_config.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    base_raw = {}
+                raw = base_raw
                 for item in args.set:
                     if "=" not in item:
                         continue
