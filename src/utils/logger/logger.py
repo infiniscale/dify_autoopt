@@ -31,6 +31,7 @@ class SimpleLogManager:
         self._configured = False
         self._config = {}
         self._lock = threading.Lock()
+        self._global_context: Dict[str, Any] = {}
 
     async def initialize(self, config_path: Optional[str] = None) -> None:
         """初始化日志系统"""
@@ -111,19 +112,21 @@ class SimpleLogManager:
         # 定义格式化器
         def simple_formatter(record: dict) -> str:
             """简单格式化器"""
+            logger_name = record.get('extra', {}).get('name', record['name'])
             return (
                 f"{record['time'].strftime(self._config['date_format'])} | "
                 f"{record['level'].name} | "
-                f"{record['name']} | "
-                f"{record['message']}"
+                f"{logger_name} | "
+                f"{record['message']}\n"
             )
 
         def structured_formatter(record: dict) -> str:
             """结构化格式化器"""
+            logger_name = record.get('extra', {}).get('name', record['name'])
             log_data = {
                 "timestamp": record["time"].strftime(self._config["date_format"]),
                 "level": record["level"].name,
-                "logger": record["name"],
+                "logger": logger_name,
                 "message": record["message"],
                 "module": record.get("module", ""),
                 "function": record.get("function", ""),
@@ -143,8 +146,7 @@ class SimpleLogManager:
                     "value": str(record["exception"].value),
                     "traceback": record["exception"].traceback
                 }
-
-            return json.dumps(log_data, ensure_ascii=False, default=str)
+            return json.dumps(log_data, ensure_ascii=False, default=str) + "\n"
 
         # 选择格式化器
         formatter = simple_formatter if self._config["format"] == "simple" else structured_formatter
@@ -185,6 +187,25 @@ class SimpleLogManager:
                 loguru_logger.remove()
                 self._configured = False
 
+    # ---- 额外的全局上下文与统计接口（最小实现） ----
+    def set_global_context(self, **context: Any) -> None:
+        """设置全局上下文（最小实现，用于附加到结构化日志extra中）"""
+        with self._lock:
+            self._global_context.update(context)
+
+    def get_global_context(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._global_context)
+
+    def get_stats(self) -> Dict[str, Any]:
+        """返回日志系统的基本统计信息（占位实现）。"""
+        return {
+            "configured": self._configured,
+            "format": self._config.get("format"),
+            "console_enabled": self._config.get("console_enabled"),
+            "file_enabled": self._config.get("file_enabled"),
+        }
+
 
 # 全局日志管理器实例
 _log_manager = SimpleLogManager()
@@ -201,15 +222,20 @@ def get_logger(name: str) -> loguru_logger:
     if not _log_manager.is_configured():
         raise LoggingException("Logging system not initialized. Call setup_logging() first.")
 
-    return loguru_logger.bind(name=name)
+    # 绑定logger名称与全局上下文（如已设置）
+    bound = loguru_logger.bind(name=name)
+    global_ctx = _log_manager.get_global_context()
+    if global_ctx:
+        bound = bound.bind(**global_ctx)
+    return bound
 
 
 @contextmanager
 def log_context(**context):
-    """日志上下文管理器"""
-    logger = loguru_logger.bind(context=context)
+    """日志上下文管理器：在上下文内对日志注入结构化字段（基于loguru.contextualize）。"""
     try:
-        yield logger
+        with loguru_logger.contextualize(**context):
+            yield
     finally:
         pass
 
@@ -247,12 +273,90 @@ def log_performance(operation_name: str):
     return decorator
 
 
+def log_exception(level: str = "ERROR", reraise: bool = True):
+    """异常捕获装饰器（最小实现）。
+
+    Args:
+        level: 记录级别（DEBUG/INFO/WARNING/ERROR/CRITICAL）。
+        reraise: 是否在记录后重新抛出异常。
+    """
+
+    def decorator(func):
+        if asyncio.iscoroutinefunction(func):
+            async def async_wrapper(*args, **kwargs):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    loguru_logger.opt(exception=True).log(level, f"Exception in {func.__name__}: {e}")
+                    if reraise:
+                        raise
+            return async_wrapper
+        else:
+            def sync_wrapper(*args, **kwargs):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    loguru_logger.opt(exception=True).log(level, f"Exception in {func.__name__}: {e}")
+                    if reraise:
+                        raise
+            return sync_wrapper
+
+    return decorator
+
+
+@contextmanager
+def log_workflow_trace(workflow_id: str, operation: str, logger: Optional[Any] = None):
+    """工作流阶段跟踪上下文管理器（最小实现）。
+
+    在进入/退出时记录开始与结束，并包含耗时信息。
+    """
+    _logger = logger or loguru_logger
+    from time import perf_counter
+
+    start = perf_counter()
+    _logger.info(
+        "工作流阶段开始",
+        extra={
+            "workflow_id": workflow_id,
+            "operation": operation,
+            "status": "start",
+        },
+    )
+    try:
+        yield
+        duration = perf_counter() - start
+        _logger.info(
+            "工作流阶段完成",
+            extra={
+                "workflow_id": workflow_id,
+                "operation": operation,
+                "status": "completed",
+                "duration_seconds": round(duration, 6),
+            },
+        )
+    except Exception:
+        duration = perf_counter() - start
+        _logger.error(
+            "工作流阶段失败",
+            extra={
+                "workflow_id": workflow_id,
+                "operation": operation,
+                "status": "error",
+                "duration_seconds": round(duration, 6),
+            },
+            exc_info=True,
+        )
+        raise
+
+
 # 导出的模块接口
 __all__ = [
     'setup_logging',
     'get_logger',
     'log_context',
     'log_performance',
+    'log_exception',
+    'log_workflow_trace',
     'LoggingException',
     '_log_manager'
 ]
