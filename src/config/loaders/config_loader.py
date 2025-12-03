@@ -63,6 +63,18 @@ class ConfigLoader:
         """
         raw_data = self.fs_reader.read_yaml(path)
         expanded_data = self._expand_env_vars(raw_data)
+        # Debug: basic structure after expansion
+        try:
+            from src.utils.logger import get_logger
+            get_logger("config.loader").debug(
+                "env_config loaded and expanded",
+                extra={
+                    "path": str(path.resolve()),
+                    "top_keys": list(raw_data.keys()) if isinstance(raw_data, dict) else [],
+                },
+            )
+        except Exception:
+            pass
 
         try:
             cfg = EnvConfig(**expanded_data)
@@ -98,6 +110,17 @@ class ConfigLoader:
         """
         raw_data = self.fs_reader.read_yaml(path)
         expanded_data = self._expand_env_vars(raw_data)
+        try:
+            from src.utils.logger import get_logger
+            get_logger("config.loader").debug(
+                "workflow_catalog loaded",
+                extra={
+                    "path": str(path.resolve()),
+                    "top_keys": list(raw_data.keys()) if isinstance(raw_data, dict) else [],
+                },
+            )
+        except Exception:
+            pass
 
         try:
             catalog = WorkflowCatalog(**expanded_data)
@@ -131,6 +154,17 @@ class ConfigLoader:
         """
         raw_data = self.fs_reader.read_yaml(path)
         expanded_data = self._expand_env_vars(raw_data)
+        try:
+            from src.utils.logger import get_logger
+            get_logger("config.loader").debug(
+                "test_plan loaded",
+                extra={
+                    "path": str(path.resolve()),
+                    "top_keys": list(raw_data.keys()) if isinstance(raw_data, dict) else [],
+                },
+            )
+        except Exception:
+            pass
 
         try:
             plan = TestPlan(**expanded_data)

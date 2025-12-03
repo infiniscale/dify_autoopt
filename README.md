@@ -69,7 +69,7 @@ src/
 │   ├── logger.py           # 日志管理
 │   ├── http_client.py      # HTTP客户端
 │   └── exceptions.py       # 异常定义
-└── main.py               # 主程序入口
+main.py               # 主程序入口（根目录）
 ```
 
 ## 技术栈
@@ -99,55 +99,75 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-### 2. 配置设置
+### 2. 配置设置（单一配置文件）
 
-编辑 `config/config.yaml` 文件：
+本项目使用单一配置文件 `config/config.yaml`，包含以下顶层块：
 
+- `meta`、`dify`、`auth`、`variables`、`workflows`、`execution`、`optimization`、`io_paths`、`logging`
+
+示例（节选）：
 ```yaml
-# Dify平台配置
+meta:
+  version: "1.0.0"
+  environment: "development"
+
 dify:
   base_url: "https://your-dify-instance.com"
-  api_base: "https://your-dify-instance.com/v1"
 
-# 认证配置
 auth:
-  username: "your_username"
-  password: "your_password"
-  api_key: "your_api_key"
+  # 二选一：优先 api_key；否则使用 username/password
+  api_key: "${DIFY_API_TOKEN}"
+  # username: "your_username"
+  # password: "your_password"
 
-# 工作流配置
 workflows:
-  - name: "test_workflow_1"
-    inputs:
-      file_list: ["path/to/file1", "path/to/file2"]
-      num_list: [1, 2, 3]
-      string_list: ["text1", "text2"]
+  - id: "wf_text_classify"
+    name: "文本分类工作流"
+    inputs: { }
+    parameters: { }
 
-# 优化配置
-optimization:
-  llm_model: "gpt-4"
-  max_iterations: 5
-  optimization_strategy: "gradient_descent"
-
-# 执行配置
 execution:
   concurrency: 5
   timeout: 300
   retry_count: 3
+
+optimization:
+  strategy: "auto"   # auto | clarity_focus | efficiency_focus | structure_focus | llm_guided
+  max_iterations: 3
+
+io_paths:
+  output_dir: "./outputs"
+  logs_dir: "./logs"
+
+logging:
+  level: "INFO"      # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  format: "simple"   # simple | structured
+  console_enabled: true
+  file_enabled: true
 ```
 
-### 3. 运行测试
+### 3. 运行
 
 ```bash
-# 运行基础测试
-python src/main.py --mode test
+# 基础运行（使用默认配置路径 config/config.yaml）
+python main.py --mode test
 
-# 运行提示词优化
-python src/main.py --mode optimize --workflow-id <workflow_id>
+# 指定配置路径
+python main.py --mode test --config config/config.yaml
 
-# 生成测试报告
-python src/main.py --mode report --output report.xlsx
+# 覆盖运行时配置（可多次 --set，使用 dot-path）
+python main.py --mode test --config config/config.yaml \
+  --set logging.level=DEBUG \
+  --set optimization.strategy=auto
+
+# 生成测试报告（JSON）
+python main.py --mode test --report report.json
 ```
+
+说明：
+- 未设置 `--config` 时自动尝试 `config/config.yaml`；如不存在则使用内置默认配置（会在日志中提示）。
+- `.env` 会在启动前自动加载（如未安装 `python-dotenv`，则忽略）。
+- 日志配置优先从 `config/config.yaml` 的 `logging` 块读取。
 
 ## 单元测试
 
@@ -171,7 +191,7 @@ pytest --cov=src --cov-report=term-missing
 约定与提示
 - 测试目录：`src/test/`（与 `src/` 结构对应）。
 - 命名规范：文件 `test_*.py`，函数 `test_*`。
-- 日志模块样例：参见 `src/test/test_logger_basic.py`，验证初始化与文件写入。
+- 日志模块样例：参见 `src/test/utils/test_logger_basic.py` 与扩展用例；验证初始化、文件写入与上下文功能。
 - 测试不应访问真实 Dify 端点，对 I/O 或网络进行隔离/伪造。
 
 ## 使用指南
@@ -248,12 +268,12 @@ class CustomOptimizer(BaseOptimizer):
 
 ## 配置参考
 
-### 完整配置示例
+### 配置校验
+启动时会对关键配置进行严格校验并输出结构化日志（`config.bootstrap`）：
+- 必填：`dify.base_url`；`auth.api_key` 或 `auth.username/password` 二者其一
+- 建议：`logging.level`、`optimization.strategy`、`execution` 参数范围
 
-详见 `config/examples/full_config.yaml`
-
-### 配置验证
-
+如需运行时覆盖配置，可通过 `--set a.b.c=value` 多次指定，覆盖会写入临时 YAML 并作为本次引导的有效配置。
 ```bash
 # 验证配置文件是否正确
 python -m dify_opt.utils.validator config/config.yaml

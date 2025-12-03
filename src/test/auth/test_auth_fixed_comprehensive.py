@@ -49,10 +49,8 @@ class TestAuthenticationModuleFixed:
     def test_config_validation_improved(self):
         """验证配置验证逻辑已改进"""
         from src.auth.login import run
-        from src.config.loaders.config_loader import FileSystemReader
-
-        # 测试安全的配置获取
-        with pytest.raises(KeyError, match="配置文件中缺少dify配置块"):
+        # 统一配置加载器在文件不存在时抛出 FileNotFoundError
+        with pytest.raises(FileNotFoundError):
             run("nonexistent_config.yaml")
 
     def test_token_improvements(self):
@@ -70,7 +68,8 @@ class TestAuthenticationModuleFixed:
 
     def test_fixed_login_job_data_structure(self):
         """测试修复后的login_job数据处理"""
-        with patch('src.auth.token.FileSystemReader') as mock_reader:
+        # Token 模块路径为 src.auth.token_opt
+        with patch('src.auth.token_opt.FileSystemReader') as mock_reader:
             # 模拟配置
             mock_reader.read_yaml.return_value = {
                 "dify": {"base_url": "https://test.dify.com"},

@@ -55,6 +55,12 @@ def get_runtime() -> AppRuntime:
 def bootstrap_from_unified(path: Path | str) -> AppRuntime:
     """Load unified config.yaml and initialize runtime with detailed logs."""
     cfg_path = Path(path)
+    # Debug: bootstrap start
+    try:
+        from src.utils.logger import get_logger
+        get_logger("config.bootstrap").debug("bootstrap_from_unified start", extra={"path": str(cfg_path.resolve())})
+    except Exception:
+        pass
     loader = UnifiedConfigLoader()
     app_cfg = loader.load(cfg_path)
 
@@ -90,9 +96,15 @@ def bootstrap_from_unified(path: Path | str) -> AppRuntime:
             lg.warning("配置引导存在必填项缺失", extra=payload)
         else:
             lg.info("配置引导完成", extra=payload)
+        lg.debug("配置引导校验结果", extra={"errors": errors, "warnings": warnings})
     except Exception:
         pass
 
     global _runtime
     _runtime = AppRuntime(app=app_cfg)
+    try:
+        from src.utils.logger import get_logger
+        get_logger("config.bootstrap").debug("runtime initialized")
+    except Exception:
+        pass
     return _runtime
