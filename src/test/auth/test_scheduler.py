@@ -32,142 +32,160 @@ class TestLoginJob:
 
     def test_login_job_success(self, client, mock_login_result):
         """测试登录任务成功执行"""
-        with patch.object(client, 'login') as mock_login_method:
-            mock_login_method.return_value = mock_login_result
+        with patch('src.auth.token_opt.FileSystemReader') as mock_reader:
+            mock_reader.read_yaml.return_value = {
+                "dify": {"base_url": "https://test.dify.com"},
+                "auth": {"access_token_path": "access_token.txt"},
+            }
+            with patch.object(client, 'login') as mock_login_method:
+                mock_login_method.return_value = mock_login_result
+                with patch('logging.getLogger') as mock_logger:
+                    logger = Mock()
+                    mock_logger.return_value = logger
+                    # 令牌写入通过 Token 管理器
+                    with patch('src.auth.login.Token') as MockToken:
+                        token_instance = Mock()
+                        token_instance.rewrite_access_token.return_value = True
+                        token_instance.validate_access_token.return_value = True
+                        MockToken.return_value = token_instance
 
-            with patch('builtins.open', mock_open()) as mock_file:
+                        client.login_job()
+
+                        # 验证登录方法被调用
+                        mock_login_method.assert_called_once()
+                        # 验证令牌通过Token管理器被写入
+                        token_instance.rewrite_access_token.assert_called_once_with("test_access_token_123456")
+                        token_instance.validate_access_token.assert_called_once()
+                        # 验证日志记录
+                        assert logger.info.call_count >= 2  # 开始任务 + 登录成功
+
+    def test_login_job_failure(self, client):
+        """测试登录任务失败"""
+        with patch('src.auth.token_opt.FileSystemReader') as mock_reader:
+            mock_reader.read_yaml.return_value = {
+                "dify": {"base_url": "https://test.dify.com"},
+                "auth": {"access_token_path": "access_token.txt"},
+            }
+            with patch.object(client, 'login') as mock_login_method:
+                mock_login_method.return_value = None
                 with patch('logging.getLogger') as mock_logger:
                     logger = Mock()
                     mock_logger.return_value = logger
 
                     client.login_job()
 
-                    # 验证登录方法被调用
-                    mock_login_method.assert_called_once()
-
-                    # 验证令牌被写入文件
-                    mock_file.assert_called_once_with("access_token.txt", "w", encoding="utf-8")
-                    mock_file().write.assert_called_once_with("test_access_token_123456")
-
-                    # 验证日志记录
-                    assert logger.info.call_count >= 2  # 开始任务 + 登录成功
-
-    def test_login_job_failure(self, client):
-        """测试登录任务失败"""
-        with patch.object(client, 'login') as mock_login_method:
-            mock_login_method.return_value = None
-
-            with patch('logging.getLogger') as mock_logger:
-                logger = Mock()
-                mock_logger.return_value = logger
-
-                client.login_job()
-
-                # 验证错误日志被记录
-                logger.error.assert_called_with("登录失败")
+                    # 验证错误日志被记录
+                    logger.error.assert_called_with("登录失败")
 
     def test_login_job_authentication_error(self, client):
         """测试登录任务处理认证错误"""
-        with patch.object(client, 'login') as mock_login_method:
-            mock_login_method.side_effect = AuthenticationError("用户名或密码错误")
+        with patch('src.auth.token_opt.FileSystemReader') as mock_reader:
+            mock_reader.read_yaml.return_value = {
+                "dify": {"base_url": "https://test.dify.com"},
+                "auth": {"access_token_path": "access_token.txt"},
+            }
+            with patch.object(client, 'login') as mock_login_method:
+                mock_login_method.side_effect = AuthenticationError("用户名或密码错误")
+                with patch('logging.getLogger') as mock_logger:
+                    logger = Mock()
+                    mock_logger.return_value = logger
 
-            with patch('logging.getLogger') as mock_logger:
-                logger = Mock()
-                mock_logger.return_value = logger
+                    # 应该抛出异常
+                    with pytest.raises(Exception, match="认证失败: 用户名或密码错误"):
+                        client.login_job()
 
-                # 应该抛出异常
-                with pytest.raises(Exception, match="认证失败: 用户名或密码错误"):
-                    client.login_job()
-
-                # 验证错误日志被记录
-                logger.error.assert_called()
+                    # 验证错误日志被记录
+                    logger.error.assert_called()
 
     def test_login_job_network_error(self, client):
         """测试登录任务处理网络错误"""
-        with patch.object(client, 'login') as mock_login_method:
-            mock_login_method.side_effect = NetworkConnectionError("网络不可达")
+        with patch('src.auth.token_opt.FileSystemReader') as mock_reader:
+            mock_reader.read_yaml.return_value = {
+                "dify": {"base_url": "https://test.dify.com"},
+                "auth": {"access_token_path": "access_token.txt"},
+            }
+            with patch.object(client, 'login') as mock_login_method:
+                mock_login_method.side_effect = NetworkConnectionError("网络不可达")
+                with patch('logging.getLogger') as mock_logger:
+                    logger = Mock()
+                    mock_logger.return_value = logger
 
-            with patch('logging.getLogger') as mock_logger:
-                logger = Mock()
-                mock_logger.return_value = logger
+                    # 应该抛出异常
+                    with pytest.raises(Exception, match="网络连接异常: 网络不可达"):
+                        client.login_job()
 
-                # 应该抛出异常
-                with pytest.raises(Exception, match="网络连接异常: 网络不可达"):
-                    client.login_job()
-
-                # 验证错误日志被记录
-                logger.error.assert_called()
+                    # 验证错误日志被记录
+                    logger.error.assert_called()
 
     def test_login_job_session_expired(self, client):
         """测试登录任务处理会话过期"""
         from src.auth.login import SessionExpiredError
-
-        with patch.object(client, 'login') as mock_login_method:
-            mock_login_method.side_effect = SessionExpiredError("会话已过期")
-
-            with patch('logging.getLogger') as mock_logger:
-                logger = Mock()
-                mock_logger.return_value = logger
-
-                # 应该抛出异常
-                with pytest.raises(Exception, match="会话过期: 会话已过期"):
-                    client.login_job()
-
-                # 验证错误日志被记录
-                logger.error.assert_called()
-
-    def test_login_job_permission_denied(self, client):
-        """测试登录任务处理权限拒绝"""
-        from src.auth.login import PermissionDeniedError
-
-        with patch.object(client, 'login') as mock_login_method:
-            mock_login_method.side_effect = PermissionDeniedError("权限不足")
-
-            with patch('logging.getLogger') as mock_logger:
-                logger = Mock()
-                mock_logger.return_value = logger
-
-                # 应该抛出异常
-                with pytest.raises(Exception, match="权限不足: 权限不足"):
-                    client.login_job()
-
-                # 验证错误日志被记录
-                logger.error.assert_called()
-
-    def test_login_job_file_write_error(self, client, mock_login_result):
-        """测试登录任务文件写入错误"""
-        with patch.object(client, 'login') as mock_login_method:
-            mock_login_method.return_value = mock_login_result
-
-            with patch('builtins.open', mock_open()) as mock_file:
-                mock_file.side_effect = IOError("文件写入失败")
-
+        with patch('src.auth.token_opt.FileSystemReader') as mock_reader:
+            mock_reader.read_yaml.return_value = {
+                "dify": {"base_url": "https://test.dify.com"},
+                "auth": {"access_token_path": "access_token.txt"},
+            }
+            with patch.object(client, 'login') as mock_login_method:
+                mock_login_method.side_effect = SessionExpiredError("会话已过期")
                 with patch('logging.getLogger') as mock_logger:
                     logger = Mock()
                     mock_logger.return_value = logger
 
-                    # 应该抛出IOError
-                    with pytest.raises(IOError, match="文件写入失败"):
+                    # 应该抛出异常
+                    with pytest.raises(Exception, match="会话过期: 会话已过期"):
                         client.login_job()
+
+                    # 验证错误日志被记录
+                    logger.error.assert_called()
+
+    def test_login_job_permission_denied(self, client):
+        """测试登录任务处理权限拒绝"""
+        from src.auth.login import PermissionDeniedError
+        with patch('src.auth.token_opt.FileSystemReader') as mock_reader:
+            mock_reader.read_yaml.return_value = {
+                "dify": {"base_url": "https://test.dify.com"},
+                "auth": {"access_token_path": "access_token.txt"},
+            }
+            with patch.object(client, 'login') as mock_login_method:
+                mock_login_method.side_effect = PermissionDeniedError("权限不足")
+                with patch('logging.getLogger') as mock_logger:
+                    logger = Mock()
+                    mock_logger.return_value = logger
+
+                    # 应该抛出异常
+                    with pytest.raises(Exception, match="权限不足: 权限不足"):
+                        client.login_job()
+
+                    # 验证错误日志被记录
+                    logger.error.assert_called()
+
 
     def test_login_job_token_masking(self, client, mock_login_result):
         """测试访问令牌掩码显示"""
         mask_token = "test_access_token_123456"
         mock_login_result["access_token"] = mask_token
 
-        with patch.object(client, 'login') as mock_login_method:
-            mock_login_method.return_value = mock_login_result
-
-            with patch('builtins.open', mock_open()):
+        with patch('src.auth.token_opt.FileSystemReader') as mock_reader:
+            mock_reader.read_yaml.return_value = {
+                "dify": {"base_url": "https://test.dify.com"},
+                "auth": {"access_token_path": "access_token.txt"},
+            }
+            with patch.object(client, 'login') as mock_login_method:
+                mock_login_method.return_value = mock_login_result
                 with patch('logging.getLogger') as mock_logger:
                     logger = Mock()
                     mock_logger.return_value = logger
+                    with patch('src.auth.login.Token') as MockToken:
+                        token_instance = Mock()
+                        token_instance.rewrite_access_token.return_value = True
+                        token_instance.validate_access_token.return_value = True
+                        MockToken.return_value = token_instance
 
-                    client.login_job()
+                        client.login_job()
 
-                    # 验证调试日志中的令牌被掩码
-                    debug_calls = [str(call) for call in logger.debug.call_args_list]
-                    assert any("test****3456" in call for call in debug_calls)
+                        # 验证调试日志中的令牌被掩码
+                        debug_calls = [str(call) for call in logger.debug.call_args_list]
+                        assert any("test****3456" in call for call in debug_calls)
 
 
 class TestScheduler:

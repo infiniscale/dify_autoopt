@@ -39,8 +39,42 @@ class ConfigurationError(Exception):
 
 
 
-# 设置模块日志
-logger = logging.getLogger(__name__)
+def _get_logger():
+    """获取登录模块日志句柄
+
+    优先使用项目内的 loguru 日志管理器；若未初始化或不可用，回退到标准 logging。
+    """
+    try:
+        from src.utils.logger import get_logger as _get, _log_manager
+        if _log_manager.is_configured():
+            return _get("auth.login")
+    except Exception:
+        pass
+    # 统一名称为 auth.login；已通过 logger 桥接将标准 logging 转发至 loguru
+    return logging.getLogger("auth.login")
+
+
+def _mask_secret(secret: Optional[str], keep: int = 2) -> str:
+    """掩码敏感信息，避免在日志中泄露明文。
+
+    规则：
+    - None/空：返回 "<empty>"
+    - 长度<=keep*2：返回 "<masked>"
+    - 其他：保留前 keep 和后 keep 个字符，中间以 **** 替代，并附带长度信息
+    """
+    try:
+        if not secret:
+            return "<empty>"
+        s = str(secret)
+        if len(s) <= keep * 2:
+            return "<masked>"
+        return f"{s[:keep]}****{s[-keep:]} (len={len(s)})"
+    except Exception:
+        return "<masked>"
+
+
+# 默认初始化一次，以便静态分析与基础运行；函数内会在需要时刷新至最新句柄
+logger = _get_logger()
 
 
 class DifyAuthClient:
@@ -79,11 +113,57 @@ class DifyAuthClient:
             "remember_me": True
         }
         try:
+            # 刷新日志句柄，确保使用集中式日志系统
+            global logger
+            logger = _get_logger()
+
+            # 在 DEBUG 级别输出账户与部分敏感信息（已掩码）
+            try:
+                masked_pw = _mask_secret(self.password, keep=2)
+                logger.debug(
+                    "开始登录请求",
+                    extra={
+                        "email": self.email,
+                        "base_url": self.base_url,
+                        "timeout": self.timeout,
+                        "language": payload['language'],
+                        "remember_me": payload['remember_me'],
+                        "password": masked_pw,
+                    },
+                )
+            except Exception:
+                logger.debug(
+                    f"开始登录请求: {self.email} @ {self.base_url} (timeout={self.timeout}, lang={payload['language']}, remember={payload['remember_me']})"
+                )
+            t0 = time.perf_counter()
             response = requests.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
+            t1 = time.perf_counter()
+            logger.debug(
+                f"登录请求完成: status={response.status_code}, duration_ms={(t1 - t0)*1000:.1f}, keys={list(data.keys())}"
+            )
             if data.get("result") == "success":
-                return data.get("data")
+                # 登录成功日志（不泄露完整令牌）
+                returned = data.get("data")
+                masked_token = None
+                try:
+                    if isinstance(returned, dict):
+                        token_candidate = returned.get("access_token")
+                        if isinstance(token_candidate, str) and len(token_candidate) >= 8:
+                            masked_token = f"{token_candidate[:4]}****{token_candidate[-4:]}"
+                except Exception:
+                    pass
+                if masked_token:
+                    logger.info(f"登录成功: 用户 {self.email} @ {self.base_url} (token={masked_token})")
+                else:
+                    logger.info(f"登录成功: 用户 {self.email} @ {self.base_url}")
+                if isinstance(returned, dict):
+                    try:
+                        logger.debug(f"登录成功返回字段: {list(returned.keys())}")
+                    except Exception:
+                        pass
+                return returned
             else:
                 error_msg = data.get("message", "Unknown error")
                 logger.error(f"Authentication Failed: {error_msg}")
@@ -95,6 +175,10 @@ class DifyAuthClient:
             logger.error(f"Connection Error: {e}")
             raise NetworkConnectionError(f"无法连接到服务器: {e}")
         except requests.exceptions.HTTPError as e:
+            try:
+                logger.debug(f"HTTPError detail: status={response.status_code}, body_len={len(getattr(response, 'text', '') or '')}")
+            except Exception:
+                pass
             if response.status_code == 401:
                 raise AuthenticationError("用户名或密码错误")
             elif response.status_code == 403:
@@ -132,11 +216,19 @@ class DifyAuthClient:
         url = f"{self.base_url}/console/api/logout"
         headers = {"Authorization": f"Bearer {access_token}"}
         try:
+            global logger
+            logger = _get_logger()
+            masked = f"{access_token[:4]}****{access_token[-4:]}" if isinstance(access_token, str) and len(access_token) >= 8 else "<masked>"
+            logger.debug(f"开始登出请求: token={masked}")
+            t0 = time.perf_counter()
             response = requests.get(url, headers=headers, timeout=self.timeout)
             response.raise_for_status()
+            t1 = time.perf_counter()
+            logger.debug(f"登出请求完成: status={response.status_code}, duration_ms={(t1 - t0)*1000:.1f}")
             if response.status_code == 200:
                 data = response.json()
                 if data.get("result") == "success":
+                    logger.info("登出成功")
                     return True
                 else:
                     error_msg = data.get("message", "Logout failed")
@@ -177,12 +269,18 @@ class DifyAuthClient:
         Raises:
             根据具体情况抛出相应的异常
         """
+        global logger
+        logger = _get_logger()
         logger.info("开始执行定时登录任务...")
         try:
             result = self.login()
             if result:
                 # 检查result中是否包含access_token - 获取实际的数据结构
                 if isinstance(result, dict):
+                    try:
+                        logger.debug(f"login_job: 登录返回字段: {list(result.keys())}")
+                    except Exception:
+                        pass
                     # 检查是否是标准的API响应格式 {"result": "success", "data": {...}}
                     if "result" in result and "data" in result and result.get("result") == "success":
                         token_data = result["data"]
@@ -241,6 +339,8 @@ def run(config_path: str = "config/config.yaml"):
         Exception: 其他运行时异常
     """
     try:
+        global logger
+        logger = _get_logger()
         # 确保 runtime 可用（若外部尚未引导，则本地引导）
         try:
             rt = get_runtime()

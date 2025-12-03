@@ -62,10 +62,25 @@ class UnifiedConfigLoader:
         if not p.exists():
             raise FileNotFoundError(f"Unified config not found: {p}")
         raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        # Debug: raw top-level keys (do not log sensitive values)
+        try:
+            from src.utils.logger import get_logger
+            get_logger("config.loader").debug(
+                "unified_config loaded (raw)", extra={"path": str(p.resolve()), "top_keys": list(raw.keys())}
+            )
+        except Exception:
+            pass
         if not isinstance(raw, dict):
             raise ValueError("config.yaml must be a mapping at root level")
 
         expanded = self._expand_env_vars(raw)
+        try:
+            from src.utils.logger import get_logger
+            get_logger("config.loader").debug(
+                "unified_config expanded", extra={"has_logging": bool((expanded or {}).get("logging"))}
+            )
+        except Exception:
+            pass
 
         # 基础类型校验（更严格的提示）
         def _expect_mapping(name: str):
@@ -153,6 +168,23 @@ class UnifiedConfigLoader:
                 },
             }
             lg.info("已加载统一配置文件", extra=details)
+            # 进一步调试输出：各段键数量
+            lg.debug(
+                "配置段统计",
+                extra={
+                    "sections": {
+                        "meta": len(app.meta or {}),
+                        "dify": len(app.dify or {}),
+                        "auth": len(app.auth or {}),
+                        "variables": len(app.variables or {}),
+                        "workflows": len(app.workflows or []),
+                        "execution": len(app.execution or {}),
+                        "optimization": len(app.optimization or {}),
+                        "io_paths": len(app.io_paths or {}),
+                        "logging": len(app.logging or {}),
+                    }
+                },
+            )
         except Exception:
             # 不阻断主流程
             pass
@@ -206,4 +238,11 @@ class UnifiedConfigLoader:
         if strat and strat not in allowed:
             warnings.append("optimization.strategy not in allowed set")
 
+        try:
+            from src.utils.logger import get_logger
+            get_logger("config.loader").debug(
+                "配置校验完成", extra={"errors": len(errors), "warnings": len(warnings)}
+            )
+        except Exception:
+            pass
         return {"errors": errors, "warnings": warnings}

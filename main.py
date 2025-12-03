@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from datetime import datetime
 import argparse
+import requests
 
 try:
     from dotenv import load_dotenv as _load_dotenv
@@ -183,6 +184,52 @@ async def main(argv: list[str] | None = None) -> int:
                 "logging": runtime.app.logging or {},
             },
         )
+
+        # 4.3 Dify 登录与状态校验
+        async def _validate_token_async(base_url: str, token: str, timeout: int = 10) -> bool:
+            def _do_validate() -> bool:
+                try:
+                    url = f"{base_url.rstrip('/')}/console/api/apps"
+                    headers = {"Authorization": f"Bearer {token}"}
+                    params = {"page": 1, "limit": 1}
+                    resp = requests.get(url, headers=headers, params=params, timeout=timeout)
+                    return resp.status_code == 200
+                except Exception:
+                    return False
+            return await asyncio.to_thread(_do_validate)
+
+        try:
+            base_url = runtime.dify_base_url
+            auth_cfg = runtime.app.auth or {}
+            if base_url and (auth_cfg.get("api_key") or (auth_cfg.get("username") and auth_cfg.get("password"))):
+                logger.info("开始Dify登录校验", extra={"base_url": base_url, "auth_mode": "api_key" if auth_cfg.get("api_key") else "password"})
+
+                access_token: str | None = None
+                if auth_cfg.get("api_key"):
+                    access_token = str(auth_cfg.get("api_key"))
+                else:
+                    from src.auth.login import DifyAuthClient
+                    client = DifyAuthClient(base_url=base_url, email=auth_cfg.get("username"), password=auth_cfg.get("password"), timeout=10)
+                    # 使用线程避免阻塞事件循环
+                    def _do_login():
+                        return client.login()
+                    login_result = await asyncio.to_thread(_do_login)
+                    if isinstance(login_result, dict):
+                        # login() 约定返回包含 access_token 的 data 字典
+                        access_token = login_result.get("access_token") or login_result.get("data", {}).get("access_token")
+
+                if access_token:
+                    ok = await _validate_token_async(base_url, access_token)
+                    if ok:
+                        logger.info("Dify 登录验证成功")
+                    else:
+                        logger.warning("Dify 登录验证失败，请检查凭据或网络")
+                else:
+                    logger.warning("未获取到访问令牌，跳过验证")
+            else:
+                logger.info("未配置 Dify 认证信息，跳过登录校验")
+        except Exception as e:
+            logger.warning("Dify 登录校验出现异常", extra={"error": str(e)})
 
         # 5. 模式执行
         if args.mode == "test":

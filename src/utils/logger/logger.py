@@ -10,6 +10,7 @@ import sys
 import json
 import threading
 import asyncio
+import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional, Union
@@ -104,18 +105,25 @@ class SimpleLogManager:
                     ):
                         global_config = logging_config.get('global', {})
                         outputs_config = logging_config.get('outputs', {})
+
+                        # 读取输出配置，若未显式设置级别，则回退到全局级别
+                        gl_level = global_config.get('level', "INFO")
+                        console_conf = outputs_config.get('console', {}) or {}
+                        file_conf = outputs_config.get('file', {}) or {}
+
+                        # 读取输出配置并允许级别继承
                         default_config.update({
-                            "level": global_config.get('level', "INFO"),
+                            "level": gl_level,
                             "format": global_config.get('format', 'simple'),
-                            "include_colors": outputs_config.get('console', {}).get('include_colors', True),
-                            "console_enabled": outputs_config.get('console', {}).get('enabled', True),
-                            "console_level": outputs_config.get('console', {}).get('level', "INFO"),
-                            "file_enabled": outputs_config.get('file', {}).get('enabled', True),
-                            "file_level": outputs_config.get('file', {}).get('level', "DEBUG"),
-                            "file_path": outputs_config.get('file', {}).get('path', "logs"),
-                            "rotation": outputs_config.get('file', {}).get('rotation', "1 day"),
-                            "retention": outputs_config.get('file', {}).get('retention', "30 days"),
-                            "compression": outputs_config.get('file', {}).get('compression', "zip")
+                            "include_colors": console_conf.get('include_colors', True),
+                            "console_enabled": console_conf.get('enabled', True),
+                            "console_level": console_conf.get('level', gl_level),
+                            "file_enabled": file_conf.get('enabled', True),
+                            "file_level": file_conf.get('level', gl_level),
+                            "file_path": file_conf.get('path', "logs"),
+                            "rotation": file_conf.get('rotation', "1 day"),
+                            "retention": file_conf.get('retention', "30 days"),
+                            "compression": file_conf.get('compression', "zip")
                         })
 
                     # 风格 2：简化配置（config.yaml 下的扁平字段）
@@ -140,6 +148,14 @@ class SimpleLogManager:
                             default_config['retention'] = logging_config['retention']
                         if 'compression' in logging_config:
                             default_config['compression'] = logging_config['compression']
+
+                        # 若仅提供了全局 level，则将其作为各输出的默认级别
+                        lvl = logging_config.get('level')
+                        if lvl:
+                            if 'console_level' not in logging_config:
+                                default_config['console_level'] = lvl
+                            if 'file_level' not in logging_config:
+                                default_config['file_level'] = lvl
 
                 # 记录生效的配置源（延后在 _setup_loguru 后输出）
                 self._config_source = selected_path
@@ -170,46 +186,30 @@ class SimpleLogManager:
                 f"{record['message']}\n"
             )
 
-        def structured_formatter(record: dict) -> str:
-            """结构化格式化器"""
-            logger_name = record.get('extra', {}).get('name', record['name'])
-            log_data = {
-                "timestamp": record["time"].strftime(self._config["date_format"]),
-                "level": record["level"].name,
-                "logger": logger_name,
-                "message": record["message"],
-                "module": record.get("module", ""),
-                "function": record.get("function", ""),
-                "line": record.get("line", 0),
-                "thread": threading.current_thread().name
-            }
-
-            # 添加额外信息
-            extra = record.get("extra", {})
-            if extra:
-                log_data["extra"] = extra
-
-            # 添加异常信息
-            if "exception" in record and record["exception"] is not None:
-                log_data["exception"] = {
-                    "type": record["exception"].type,
-                    "value": str(record["exception"].value),
-                    "traceback": record["exception"].traceback
-                }
-            return json.dumps(log_data, ensure_ascii=False, default=str) + "\n"
-
-        # 选择格式化器
-        formatter = simple_formatter if self._config["format"] == "simple" else structured_formatter
+        # 选择格式化策略
+        use_structured = self._config["format"] != "simple"
 
         # 控制台输出
         if self._config["console_enabled"]:
             loguru_logger.add(
                 sys.stdout,
                 level=self._config["console_level"],
-                format=formatter,
-                colorize=self._config["include_colors"],
-                catch=True
+                format=(simple_formatter if not use_structured else "{message}"),
+                colorize=(self._config["include_colors"] if not use_structured else False),
+                serialize=True if use_structured else False,
+                catch=True,
             )
+            try:
+                loguru_logger.debug(
+                    "Console sink enabled",
+                    extra={
+                        "level": self._config["console_level"],
+                        "format": self._config["format"],
+                        "colorize": self._config["include_colors"],
+                    },
+                )
+            except Exception:
+                pass
 
         # 文件输出
         if self._config["file_enabled"]:
@@ -219,12 +219,26 @@ class SimpleLogManager:
             loguru_logger.add(
                 str(log_file),
                 level=self._config["file_level"],
-                format=formatter,
+                format=(simple_formatter if not use_structured else "{message}"),
                 rotation=self._config["rotation"],
                 retention=self._config["retention"],
                 compression=self._config["compression"],
-                catch=True
+                serialize=True if use_structured else False,
+                catch=True,
             )
+            try:
+                loguru_logger.debug(
+                    "File sink enabled",
+                    extra={
+                        "level": self._config["file_level"],
+                        "format": self._config["format"],
+                        "path": str(Path(self._config["file_path"]).resolve()),
+                        "rotation": self._config["rotation"],
+                        "retention": self._config["retention"],
+                    },
+                )
+            except Exception:
+                pass
 
         # 输出初始化信息
         try:
@@ -240,7 +254,43 @@ class SimpleLogManager:
                     "file_path": str(Path(self._config.get("file_path", "logs")).resolve()),
                 },
             )
+            # 细化初始化调试信息
+            loguru_logger.debug(
+                "Logger configuration resolved",
+                extra={
+                    "console_level": self._config.get("console_level"),
+                    "file_level": self._config.get("file_level"),
+                    "include_colors": self._config.get("include_colors"),
+                    "date_format": self._config.get("date_format"),
+                },
+            )
         except Exception:
+            pass
+
+        # 将标准 logging 日志桥接到 loguru，确保所有模块日志统一输出
+        try:
+            class InterceptHandler(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    try:
+                        level = loguru_logger.level(record.levelname).name
+                    except Exception:
+                        level = record.levelno
+                    frame, depth = logging.currentframe(), 2
+                    # 跳过 logging 包装栈帧
+                    while frame and frame.f_code.co_filename == logging.__file__:
+                        frame = frame.f_back
+                        depth += 1
+                    loguru_logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
+
+            # 覆盖根记录器的处理器
+            logging.basicConfig(handlers=[InterceptHandler()], level=logging.NOTSET, force=True)
+            # 停止标准 logging 的向上传播，避免重复
+            for name in list(logging.root.manager.loggerDict.keys()):
+                logging.getLogger(name).handlers = [InterceptHandler()]
+                logging.getLogger(name).propagate = False
+            loguru_logger.debug("Python logging bridged to loguru")
+        except Exception:
+            # 桥接失败不影响主日志功能
             pass
 
     def is_configured(self) -> bool:

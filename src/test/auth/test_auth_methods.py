@@ -103,7 +103,9 @@ class TestDifyAuthClient:
             status=403
         )
 
-        with pytest.raises(AuthenticationError, match="访问被拒绝，权限不足"):
+        # 403 在实现中映射为 PermissionDeniedError
+        from src.auth.login import PermissionDeniedError
+        with pytest.raises(PermissionDeniedError, match="权限"):
             client.login()
 
     @responses.activate
