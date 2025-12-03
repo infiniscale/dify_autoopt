@@ -34,7 +34,7 @@ variables:
 # ===== 工作流信息（最小示例） =====
 # 提示：如需使用 catalog（workflow_repository.yaml），可并行维护，CLI 会优先从 --catalog 加载。
 workflows:
-  - id: "wf_text_classify"
+  - id: "d787093d-3d99-4523-801b-d3cfcb6e9ea8"
     name: "文本分类工作流"
     description: "对输入文本进行类别判定"
     inputs:
@@ -95,8 +95,8 @@ io_paths:
 logging:
   # 若不使用下方内联配置，可通过 CLI 的 --log-config 指定 config/logging_config.yaml
   level: "DEBUG"
-  # format: "structured"               # simple | structured
-  format: "simple"               # simple | structured
+  format: "structured"               # simple | structured
+  # format: "simple"               # simple | structured
   file_enabled: true
   console_enabled: true
 
