@@ -101,50 +101,109 @@ cp .env.example .env
 
 ### 2. 配置设置（单一配置文件）
 
-本项目使用单一配置文件 `config/config.yaml`，包含以下顶层块：
+本项目使用单一配置文件 `config/config.yaml`，顶层包含：`meta`、`dify`、`auth`、`variables`、`workflows`、`execution`、`optimization`、`io_paths`、`logging`。
 
-- `meta`、`dify`、`auth`、`variables`、`workflows`、`execution`、`optimization`、`io_paths`、`logging`
-
-示例（节选）：
+示例（与当前实现一致）：
 ```yaml
 meta:
   version: "1.0.0"
   environment: "development"
 
 dify:
-  base_url: "https://your-dify-instance.com"
+  base_url: "http://xy.dnset.com:1280"   # 控制台（登录、导出DSL）
+  api_base: "http://xy.dnset.com:1280/v1" # 公共API根路径（运行工作流）
+  tenant_id: null
 
 auth:
-  # 二选一：优先 api_key；否则使用 username/password
-  api_key: "${DIFY_API_TOKEN}"
-  # username: "your_username"
-  # password: "your_password"
+  # 演示：使用用户名/密码登录控制台；推荐用环境变量注入
+  username: "${DIFY_USERNAME}"
+  password: "${DIFY_PASSWORD}"
+  # 或：api_key: "${DIFY_API_TOKEN}"
+
+variables:
+  base_path: "./assets"
+  default_language: "zh"
+  temperature: 0.7
+  batch_size: 16
+  retries: 2
 
 workflows:
-  - id: "wf_text_classify"
+  - id: "d787093d-3d99-4523-801b-d3cfcb6e9ea8"   # 建议使用纯 app/workflow id
     name: "文本分类工作流"
-    inputs: { }
-    parameters: { }
+    description: "对输入文本进行类别判定"
+    api_key: "${WF1_API_KEY}"       # 运行该工作流时使用（走 api_base）
+    inputs:                          # 输入变量按“变量名: {type, value}”组织
+      ContractFile:                  # 变量名（与 Dify 工作流的输入名一致）
+        type: file                   # 可选: file | string | number
+        value:
+          - "${BASE_PATH}/samples/texts/sample_1.txt"
+          - "${BASE_PATH}/samples/texts/sample_2.txt"
+      RulesetApiUrl:
+        type: string
+        value: ["https://example/api"]
+      ContractID:
+        type: string
+        value: ["A-001", "A-002"]
+      FileID:
+        type: string
+        value: ["test-{TIME}"]       # 可用占位符示例（由上层替换/注入）
+      ReviewBG:
+        type: string
+        value: ["default"]
+    reference:                       # 与多输入一一对应的参考/期望（可选）
+      - "case-1"
+      - "case-2"
+
+  - id: "wf_chat_assistant"
+    name: "对话助理工作流"
+    api_key: "${WF2_API_KEY}"
+    inputs:
+      prompt:
+        type: string
+        value:
+          - "请总结以下文本的要点：..."
+          - "列出本文的关键结论与证据。"
+      language:
+        type: string
+        value: ["${DEFAULT_LANGUAGE}"]
+    parameters:
+      temperature: 0.5
+      max_tokens: 512
 
 execution:
   concurrency: 5
   timeout: 300
   retry_count: 3
+  rate_limit: { per_minute: 60, burst: 10 }
+  backoff: { initial_delay: 0.5, max_delay: 4.0, factor: 2.0 }
 
 optimization:
-  strategy: "auto"   # auto | clarity_focus | efficiency_focus | structure_focus | llm_guided
+  strategy: "clarity_focus"   # auto | clarity_focus | efficiency_focus | structure_focus | llm_guided
   max_iterations: 3
+  llm:
+    url: "http://127.0.0.1"
+    model: "gpt-4-turbo-preview"
+    api_key_env: "OPENAI_API_KEY"
+    enable_cache: true
+    cache_ttl: 86400
 
 io_paths:
   output_dir: "./outputs"
   logs_dir: "./logs"
 
 logging:
-  level: "INFO"      # DEBUG | INFO | WARNING | ERROR | CRITICAL
-  format: "simple"   # simple | structured
+  level: "DEBUG"     # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  format: "structured" # simple | structured
   console_enabled: true
   file_enabled: true
 ```
+
+约束与校验（重要）：
+- workflows[].inputs 的每个变量使用 `{type, value}` 描述：
+  - type: `file` | `string` | `number`（决定处理方式；file 类型会在运行前先上传文件并替换为 file_id）。
+  - value: 单值或列表。若某些变量为列表，所有列表变量长度必须相同（记为 N），标量会在执行时广播到 N。
+- workflows[].reference 可选；若 inputs 中存在列表，则 reference 必须为长度 N 的列表或为标量。
+- 运行工作流走公共 API：使用 `dify.api_base` + 每个 workflow 的 `api_key`；导出/发布走控制台 API：使用 `dify.base_url` + 登录后 token。
 
 ### 3. 运行
 

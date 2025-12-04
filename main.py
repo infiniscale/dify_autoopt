@@ -271,6 +271,31 @@ async def main(argv: list[str] | None = None) -> int:
                                         logger.warning("导出 DSL 失败", extra={"workflow_id": wid, "error": str(ex)})
 
                                 logger.info("DSL 导出完成", extra={"exported": len(exported_paths), "paths": exported_paths[:10]})
+
+                                # 3) 根据配置的参数组合执行工作流（逐个 workflow）
+                                from src.workflow import execute_workflow_from_config
+
+                                exec_summaries = []
+                                for wid in workflow_ids:
+                                    try:
+                                        def _run_one():
+                                            return execute_workflow_from_config(
+                                                wid,
+                                                base_url=base_url,
+                                                token=access_token,
+                                                timeout=runtime.app.execution.get("timeout", 60) if runtime.app.execution else 60,
+                                            )
+                                        run_results = await asyncio.to_thread(_run_one)
+                                        # 聚合基本信息
+                                        exec_summaries.append({
+                                            "workflow_id": wid,
+                                            "runs": len(run_results),
+                                        })
+                                    except Exception as ex:
+                                        logger.warning("执行工作流失败", extra={"workflow_id": wid, "error": str(ex)})
+
+                                if exec_summaries:
+                                    logger.info("工作流执行完成", extra={"summaries": exec_summaries})
                             else:
                                 logger.info("配置中未发现 workflows，跳过 DSL 导出")
                         except Exception as e:

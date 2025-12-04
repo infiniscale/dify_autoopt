@@ -14,7 +14,6 @@ meta:
 dify:
   base_url: "http://xy.dnset.com:1280"   # Dify 实例根地址
   api_base: "http://xy.dnset.com:1280/v1"
-  tenant_id: null
 
 # ===== 登录与认证配置（演示用，建议使用环境变量替代） =====
 auth:
@@ -37,16 +36,28 @@ workflows:
   - id: "d787093d-3d99-4523-801b-d3cfcb6e9ea8"
     name: "文本分类工作流"
     description: "对输入文本进行类别判定"
+    api_key: "app-lhg7xZq0KRVk5frngV0MRCjW"
     inputs:
-      file_list:
-        - "${BASE_PATH}/samples/texts/sample_1.txt"
-        - "${BASE_PATH}/samples/texts/sample_2.txt"
-      language: "${DEFAULT_LANGUAGE}"
-      top_k: 3
-      max_length: 512
-    parameters:
-      temperature: "${TEMPERATURE}"
-      batch_size: "${BATCH_SIZE}"
+      ContractFile:
+        type: file
+        value:
+          - "./samples/texts/sample_1.txt"
+          - "./samples/texts/sample_2.txt"
+      RulesetApiUrl:
+        type: string
+        value: "test"
+      ContractID:
+        type: string
+        value: "test"
+      FilelD:
+        type: string
+        value: "test{TIME}"
+      ReviewBG:
+        type: string
+        value: "testtest"
+    reference:
+      - "1"
+      - "2"
 
   - id: "wf_chat_assistant"
     name: "对话助理工作流"
