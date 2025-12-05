@@ -190,7 +190,7 @@ logging:
       prometheus:
         enabled: false
         port: 9090
-        metrics_prefix: "dify_autoopt"""
+        metrics_prefix: "dify_autoopt"
 
       # 其他服务配置...
 """
@@ -276,7 +276,7 @@ class GlobalConfig(BaseModel):
 
 
 class LoggingConfig(BaseModel):
-    global: GlobalConfig = Field(default_factory=GlobalConfig)
+    global_config: GlobalConfig = Field(default_factory=GlobalConfig, alias="global")
     outputs: OutputsConfig = Field(default_factory=OutputsConfig)
     performance: PerformanceConfig = Field(default_factory=PerformanceConfig)
     context: ContextConfig = Field(default_factory=ContextConfig)
@@ -284,6 +284,9 @@ class LoggingConfig(BaseModel):
     advanced: Dict[str, Any] = Field(default_factory=dict)
     development: Dict[str, Any] = Field(default_factory=dict)
     production: Dict[str, Any] = Field(default_factory=dict)
+
+    class Config:
+        allow_population_by_field_name = True
 """
 
 
@@ -293,7 +296,7 @@ import os
 from typing import Any, Dict
 
 def load_config_with_env_override(config_path: str) -> Dict[str, Any]:
-    \"\"\"加载配置并应用环境变量覆盖\"\"\"
+    # 加载配置并应用环境变量覆盖
 
     # 加载基础配置
     base_config = load_config(config_path)
@@ -323,19 +326,19 @@ def load_config_with_env_override(config_path: str) -> Dict[str, Any]:
             final_key = config_path[-1]
             if final_key.endswith('_mode') or final_key.endswith('enabled'):
                 current[final_key] = env_value.lower() in ('true', '1', 'yes', 'on')
-            elif final_key.endswith('_size') or final_key.endswithinterval'):
+            elif final_key.endswith('_size') or final_key.endswith('_interval'):
                 current[final_key] = int(env_value)
             else:
                 current[final_key] = env_value
 
-    return base_config
+        return base_config
 """
 
 
 # ===== 配置验证和错误处理 =====
 """
 def validate_logging_config(config: Dict[str, Any]) -> None:
-    \"\"\"验证日志配置\"\"\"
+    # 验证日志配置
     errors = []
 
     try:
@@ -373,7 +376,7 @@ def validate_logging_config(config: Dict[str, Any]) -> None:
 # ===== 默认配置生成器 =====
 """
 def generate_default_config() -> str:
-    \"\"\"生成默认配置文件内容\"\"\"
+    # 生成默认配置文件内容
     return '''
 logging:
   global:
@@ -406,7 +409,7 @@ logging:
 # ===== 配置迁移工具 =====
 """
 def migrate_config_v1_to_v2(old_config_path: str, new_config_path: str):
-    \"\"\"从v1配置迁移到v2配置\"\"\"
+    # 从v1配置迁移到v2配置
     old_config = load_config(old_config_path)
 
     # 转换新的配置结构

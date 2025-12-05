@@ -1,0 +1,82 @@
+ ================================================================
+ ⚠️ 原 Bash 环境配置（已注释，不会生效）
+ ⚠️ 如果你在 Windows 下使用，请不要启用 Bash 版本
+ ================================================================
+
+ {
+   "permissions": {
+     "allow": [
+       "Bash(git remote add:*)",
+       "Bash(docker exec:*)",
+       "Bash(go test:*)",
+       "Bash(git add:*)",
+       "Bash(git checkout:*)",
+       "Bash(git merge:*)",
+       "Bash(curl:*)",
+       "Bash(timeout:*)",
+       "Bash(pkill:*)",
+       "Bash(git fetch:*)",
+       "Bash(go build:*)",
+       "Read(///**)",
+       "Bash(git log:*)",
+       "Bash(chmod:*)",
+       "Bash(./test-api-rollback.sh:*)",
+       "Bash(make test-api:*)",
+       "Bash(make test:*)",
+       "Bash(git commit:*)",
+       "Bash(git rm:*)",
+       "Bash(go mod:*)",
+       "Bash(make:*)",
+       "Bash(awk:*)",
+       "Bash(cat:*)"
+     ],
+     "deny": []
+   },
+   "statusLine": {
+     "type": "command",
+     "command": "bash -c 'input=$(cat); MODEL=$(echo \"$input\" | jq -r \".model.display_name\"); DIR=$(echo \"$input\" | jq -r \".workspace.current_dir\"); BRANCH=\"\"; if git rev-parse --git-dir >/dev/null 2>&1; then BRANCH=\" | 🌿 $(git branch --show-current 2>/dev/null)\"; CHANGES=$(git status --porcelain 2>/dev/null | wc -l); if [ $CHANGES -gt 0 ]; then BRANCH=\"$BRANCH ($CHANGES)\"; fi; fi; echo \"[$MODEL] 📁 ${DIR##*/}$BRANCH\"'"
+   },
+   "hooks": {
+     "PreToolUse": [
+       {
+         "matcher": "Bash",
+         "hooks": [
+           {
+             "type": "command",
+             "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/validate-branch-name.py"
+           }
+         ]
+       },
+       {
+         "matcher": "Bash",
+         "hooks": [
+           {
+             "type": "command",
+             "command": "python3 \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/prevent-direct-push.py"
+           }
+         ]
+       }
+     ]
+   }
+ }
+
+ ================================================================
+ 以上为原 Bash 版本配置
+ ================================================================
+
+
+
+ ================================================================
+ ✅ Windows 环境下使用的配置（建议启用）
+ ---------------------------------------------------------------
+ ⚠️ 注意：你必须在 Windows 的系统环境变量中手动设置：
+
+    CLAUDE_PROJECT_DIR = 你的项目根目录路径
+
+ 例如：C:\Users\YourName\myproject
+
+ ---------------------------------------------------------------
+ Windows 使用 PowerShell，所以 matcher 必须为 "PowerShell"
+ Python 调用使用 python 而不是 python3
+ 路径使用 Windows 风格路径：\\.claude\\hooks\\xxx.py
+ ================================================================

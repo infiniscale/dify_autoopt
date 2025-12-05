@@ -1,0 +1,346 @@
+# 测试计划示例文件
+#
+# 使用方法：
+# 1. 复制此文件并重命名
+#    cp config/examples/test_plan.example.yaml config/test_plan.yaml
+# 2. 根据你的测试需求修改配置
+# 3. 确保引用的 workflow catalog_id 在 workflow_catalog.yaml 中存在
+# 4. 设计测试数据集和 Prompt 优化变体
+
+meta:
+  plan_id: "regression_test_2025_q1"     # 测试计划唯一 ID
+  owner: "qa_team"                        # 负责人/团队
+  description: "2025年第一季度回归测试计划"
+  created_at: "2025-11-13"
+  priority: "high"                        # low | medium | high | critical
+
+# 要测试的 Workflow 列表
+workflows:
+  # ===== 示例 1: 完整配置（带 Prompt 优化） =====
+  - catalog_id: "customer_service_bot_v1"  # 必须匹配 workflow_catalog.yaml 中的 id
+    enabled: true                          # 是否启用此 workflow
+    weight: 1.0                            # 权重（用于采样/优先级）
+
+    # 绑定的数据集（引用 test_data.datasets[].name）
+    dataset_refs:
+      - "normal_customer_queries"
+      - "edge_case_queries"
+
+    # Prompt 优化变体（用于 A/B 测试）
+    prompt_optimization:
+      # --- 基线版本 ---
+      - variant_id: "baseline"
+        description: "原始 Prompt（不做修改）"
+        weight: 0.3                        # 30% 的测试用例使用此变体
+        nodes: []                          # 空列表表示不做任何修改
+
+      # --- 优化版本 1: 模板替换 ---
+      - variant_id: "enhanced_v1"
+        description: "使用模板优化的友好版本"
+        weight: 0.4                        # 40% 的测试用例
+        fallback_variant: "baseline"       # 如果应用失败，回退到 baseline
+
+        nodes:
+          # 修改主对话模型的 prompt
+          - selector:
+              by_id: "llm_main"            # 精确匹配节点 ID
+            strategy:
+              mode: "template"             # 使用模板渲染
+              template:
+                inline: |
+                  你是一个专业的{{ role }}。
+
+                  用户背景：
+                  - 语言偏好：{{ language }}
+                  - 服务等级：{{ service_level }}
+
+                  请遵循以下原则：
+                  {{ guidelines }}
+
+                  现在，请回答用户的问题。
+                variables:
+                  role: "客户服务专员"
+                  language: "简体中文"
+                  service_level: "VIP"
+                  guidelines: |
+                    1. 友好且专业
+                    2. 简洁明了
+                    3. 提供可操作的建议
+
+      # --- 优化版本 2: 前置/后置追加 ---
+      - variant_id: "enhanced_v2"
+        description: "在原 Prompt 前后添加指令"
+        weight: 0.3                        # 30% 的测试用例
+
+        nodes:
+          - selector:
+              by_id: "llm_main"
+            strategy:
+              mode: "prepend"              # 前置追加
+              content: "【重要】请用简洁的语言回答，不超过100字。\n\n"
+
+          - selector:
+              by_id: "llm_summary"
+            strategy:
+              mode: "append"               # 后置追加
+              content: "\n\n请确保回答包含行动建议。"
+
+  # ===== 示例 2: 简化配置（无 Prompt 优化） =====
+  - catalog_id: "content_analyzer_v2"
+    enabled: true
+    weight: 0.5
+
+    dataset_refs:
+      - "sample_articles"
+
+    # 不进行 Prompt 优化，使用原始配置
+    # prompt_optimization: null
+
+  # ===== 示例 3: 多种 Selector 方式 =====
+  - catalog_id: "simple_qa_bot"
+    enabled: true
+    dataset_refs:
+      - "qa_pairs"
+
+    prompt_optimization:
+      - variant_id: "multi_selector_demo"
+        nodes:
+          # 按节点类型匹配（匹配所有 LLM 节点）
+          - selector:
+              by_type: "llm"
+              constraints:
+                if_missing: "skip"         # 如果没有匹配，跳过而不报错
+            strategy:
+              mode: "replace"
+              content: "你是一个有帮助的AI助手。"
+
+          # 按标签模糊匹配
+          - selector:
+              by_label: "分析"             # 匹配标签包含"分析"的节点
+            strategy:
+              mode: "prepend"
+              content: "请进行详细分析：\n"
+
+          # 按路径直接指定
+          - selector:
+              by_path: "/graph/nodes/0"
+            strategy:
+              mode: "replace"
+              content: "特定节点的 Prompt"
+
+# 测试数据配置
+test_data:
+  # 数据集定义
+  datasets:
+    # ===== 示例 1: 参数化输入（用于 Workflow） =====
+    - name: "normal_customer_queries"
+      scenario: "normal"                   # normal | boundary | error | custom
+      description: "正常客户咨询场景"
+
+      # 参数化输入
+      parameters:
+        # 字符串参数
+        query:
+          type: "string"
+          values:
+            - "如何重置密码？"
+            - "你们的营业时间是？"
+            - "我的订单什么时候发货？"
+            - "如何申请退款？"
+
+        # 整数参数
+        user_id:
+          type: "int"
+          range:
+            min: 1
+            max: 1000
+            step: 1                        # 可选，默认 1
+
+        # 枚举参数
+        user_type:
+          type: "enum"
+          values: ["free", "basic", "premium", "vip"]
+
+      # Pairwise 维度（指定哪些参数参与组合测试）
+      pairwise_dimensions:
+        - "query"
+        - "user_type"
+
+      weight: 1.0
+
+    # ===== 示例 2: 边界情况 =====
+    - name: "edge_case_queries"
+      scenario: "boundary"
+      description: "边界和异常输入"
+
+      parameters:
+        query:
+          type: "string"
+          values:
+            - ""                           # 空输入
+            - "a"                          # 单字符
+            - "x" * 10000                  # 超长输入（10k字符）
+            - "特殊字符：<>&\"'\n\t"        # 特殊字符
+            - "中英混合 with emoji 😊"      # 多语言
+
+        user_id:
+          type: "int"
+          values: [0, -1, 999999]          # 边界值
+
+      weight: 0.5                          # 降低权重，减少测试用例
+
+    # ===== 示例 3: Chatflow 对话流 =====
+    - name: "multi_turn_conversations"
+      scenario: "normal"
+      description: "多轮对话场景（用于 Chatflow）"
+
+      # Chatflow 对话流
+      conversation_flows:
+        # 流程 1: 密码重置
+        - title: "密码重置场景"
+          metadata:
+            user_type: "premium"
+          steps:
+            - role: "user"
+              message: "我忘记密码了"
+              wait_for_response: true
+
+            - role: "user"
+              message: "我的邮箱是 user@example.com"
+              wait_for_response: true
+
+            - role: "user"
+              message: "谢谢"
+              wait_for_response: true
+
+        # 流程 2: 订单查询
+        - title: "订单状态查询"
+          metadata:
+            user_type: "vip"
+          steps:
+            - role: "user"
+              message: "我要查询订单状态"
+              wait_for_response: true
+
+            - role: "user"
+              message: "订单号是 #12345"
+              wait_for_response: true
+
+      weight: 1.0
+
+    # ===== 示例 4: 文章分析数据 =====
+    - name: "sample_articles"
+      scenario: "normal"
+
+      parameters:
+        content:
+          type: "string"
+          values:
+            - "这是一篇关于人工智能的文章..."
+            - "今日股市大涨，投资者情绪高涨..."
+
+        language:
+          type: "enum"
+          values: ["zh-CN", "en-US"]
+
+      pairwise_dimensions:
+        - "content"
+        - "language"
+
+  # 组合策略配置
+  strategy:
+    pairwise_mode: "PICT"                  # PICT | IPO | naive
+    sampling_method: "weighted"            # weighted | random | stratified
+    max_cases_per_variant: 100             # 每个变体最多生成的用例数
+
+# 执行策略配置
+execution:
+  # 并发控制
+  concurrency: 5                           # 并行执行的任务数
+  batch_size: 10                           # 批次大小
+
+  # 速率控制
+  rate_control:
+    per_minute: 100                        # 每分钟最多请求数
+    burst: 20                              # 突发请求数
+
+  # 延迟和回退
+  backoff_seconds: 2.0                     # 请求间隔（秒）
+
+  # 重试策略
+  retry_policy:
+    max_attempts: 3                        # 最大重试次数
+    backoff_seconds: 2.0                   # 初始回退时间
+    backoff_multiplier: 1.5                # 回退倍数（指数退避）
+    retry_on_errors:                       # 哪些错误需要重试
+      - "timeout"
+      - "rate_limit"
+      - "server_error"
+
+  # 停止条件
+  stop_conditions:
+    max_failures: 10                       # 最大失败数
+    timeout_minutes: 60                    # 总超时时间（分钟）
+    min_success_rate: 0.9                  # 最低成功率（0-1）
+
+# 验证规则
+validation:
+  # 输出格式检查
+  output_format_check: true
+
+  # 响应长度限制
+  min_response_length: 10                  # 最小响应长度（字符）
+  max_response_length: 5000                # 最大响应长度
+
+  # 关键词检查（可选）
+  # required_keywords: ["建议", "帮助"]
+  # forbidden_keywords: ["错误", "失败"]
+
+  # 自定义验证器（可选）
+  # custom_validators:
+  #   - name: "sentiment_check"
+  #     type: "python"
+  #     script: "validators/sentiment.py"
+
+# 输出配置
+outputs:
+  # 报告格式
+  report_format: "json"                    # json | html | markdown
+
+  # 是否保存中间结果
+  save_intermediate: true
+
+  # 制品目录
+  artifacts_dir: "./output/artifacts"
+
+  # 详细程度
+  verbosity: "normal"                      # minimal | normal | detailed
+
+  # 导出选项
+  export_options:
+    include_metadata: true
+    include_timings: true
+    include_prompts: false                 # 是否包含实际 Prompt（敏感）
+
+# ===== 使用提示 =====
+#
+# 1. Dataset 引用：
+#    workflows[].dataset_refs 必须匹配 test_data.datasets[].name
+#
+# 2. Variant 引用：
+#    fallback_variant 必须引用同一 workflow 中已定义的 variant_id
+#
+# 3. Selector 优先级：
+#    by_path > by_id > (by_label + by_type)
+#
+# 4. Strategy Mode：
+#    - replace: 完全替换
+#    - prepend: 前置追加
+#    - append: 后置追加
+#    - template: 使用 Jinja2 模板
+#
+# 5. Pairwise 说明：
+#    只有 pairwise_dimensions 中的参数会进行组合，其他参数使用第一个值
+#
+# 6. Weight 说明：
+#    weight 用于加权采样，值越大，被选中的概率越高
