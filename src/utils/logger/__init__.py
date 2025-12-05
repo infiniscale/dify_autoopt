@@ -21,10 +21,7 @@ from .logger import (
     setup_logging,
     log_context,
     log_performance,
-    log_exception,
-    log_workflow_trace,
-    LoggingException,
-    _log_manager,
+    LoggingException
 )
 
 __version__ = "1.0.0"
@@ -34,8 +31,5 @@ __all__ = [
     "setup_logging",
     "log_context",
     "log_performance",
-    "log_exception",
-    "log_workflow_trace",
-    "_log_manager",
     "LoggingException"
 ]
