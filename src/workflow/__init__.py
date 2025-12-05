@@ -11,11 +11,22 @@ from src.config.models import WorkflowCatalog, WorkflowEntry
 
 from .discovery import discover_workflows
 from .runner import run_workflow
+from .apps import list_all_apps
+from .export import export_app_dsl
+from .imports import import_app_yaml
+from .publish import publish_workflow
+from .execute import execute_workflow_v1, execute_workflow_from_config, upload_dify_file
 
 __all__ = [
     "discover_workflows",
     "run_workflow",
+    "list_all_apps",
+    "export_app_dsl",
+    "import_app_yaml",
+    "publish_workflow",
+    "upload_dify_file",
+    "execute_workflow_v1",
+    "execute_workflow_from_config",
     "WorkflowCatalog",
     "WorkflowEntry",
 ]
-

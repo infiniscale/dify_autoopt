@@ -222,6 +222,84 @@ async def main(argv: list[str] | None = None) -> int:
                     ok = await _validate_token_async(base_url, access_token)
                     if ok:
                         logger.info("Dify 登录验证成功")
+                        # 登录成功后获取并展示 App 列表（分页汇总）
+                        try:
+                            from src.workflow import list_all_apps, export_app_dsl
+                            # 1) 拉取全部应用列表（线程中执行同步 requests）
+                            def _fetch_all():
+                                return list_all_apps(base_url=base_url, limit=30, name="", is_created_by_me=False, token=access_token, timeout=10)
+                            apps = await asyncio.to_thread(_fetch_all)
+                            # 提取部分关键信息进行展示
+                            names = []
+                            ids = []
+                            for it in apps:
+                                if isinstance(it, dict):
+                                    n = it.get("name") or (it.get("app") or {}).get("name") if isinstance(it.get("app"), dict) else None
+                                    i = it.get("id") or (it.get("app") or {}).get("id") if isinstance(it.get("app"), dict) else None
+                                    if n:
+                                        names.append(n)
+                                    if i:
+                                        ids.append(i)
+                            logger.info(
+                                "已获取应用列表",
+                                extra={
+                                    "count": len(apps),
+                                    "sample_names": names[:10],
+                                    "sample_ids": ids[:10],
+                                },
+                            )
+
+                            # 2) 遍历配置中的 workflows，导出对应 DSL 至配置 io_paths.output_dir
+                            workflow_ids = []
+                            try:
+                                workflow_ids = [w.id for w in (runtime.app.workflows or []) if getattr(w, 'id', None)]
+                            except Exception:
+                                workflow_ids = []
+
+                            exported_paths = []
+                            if workflow_ids:
+                                logger.info("开始导出工作流 DSL", extra={"count": len(workflow_ids)})
+
+                                def _export_one(app_id: str):
+                                    return export_app_dsl(app_id, base_url=base_url, token=access_token, include_secret=False)
+
+                                for wid in workflow_ids:
+                                    try:
+                                        p = await asyncio.to_thread(_export_one, wid)
+                                        exported_paths.append(str(p))
+                                    except Exception as ex:
+                                        logger.warning("导出 DSL 失败", extra={"workflow_id": wid, "error": str(ex)})
+
+                                logger.info("DSL 导出完成", extra={"exported": len(exported_paths), "paths": exported_paths[:10]})
+
+                                # 3) 根据配置的参数组合执行工作流（逐个 workflow）
+                                from src.workflow import execute_workflow_from_config
+
+                                exec_summaries = []
+                                for wid in workflow_ids:
+                                    try:
+                                        def _run_one():
+                                            return execute_workflow_from_config(
+                                                wid,
+                                                base_url=base_url,
+                                                token=access_token,
+                                                timeout=runtime.app.execution.get("timeout", 60) if runtime.app.execution else 60,
+                                            )
+                                        run_results = await asyncio.to_thread(_run_one)
+                                        # 聚合基本信息
+                                        exec_summaries.append({
+                                            "workflow_id": wid,
+                                            "runs": len(run_results),
+                                        })
+                                    except Exception as ex:
+                                        logger.warning("执行工作流失败", extra={"workflow_id": wid, "error": str(ex)})
+
+                                if exec_summaries:
+                                    logger.info("工作流执行完成", extra={"summaries": exec_summaries})
+                            else:
+                                logger.info("配置中未发现 workflows，跳过 DSL 导出")
+                        except Exception as e:
+                            logger.warning("获取应用列表或导出 DSL 失败", extra={"error": str(e)})
                     else:
                         logger.warning("Dify 登录验证失败，请检查凭据或网络")
                 else:

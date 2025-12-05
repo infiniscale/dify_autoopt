@@ -14,7 +14,6 @@ meta:
 dify:
   base_url: "http://xy.dnset.com:1280"   # Dify 实例根地址
   api_base: "http://xy.dnset.com:1280/v1"
-  tenant_id: null
 
 # ===== 登录与认证配置（演示用，建议使用环境变量替代） =====
 auth:
@@ -34,19 +33,31 @@ variables:
 # ===== 工作流信息（最小示例） =====
 # 提示：如需使用 catalog（workflow_repository.yaml），可并行维护，CLI 会优先从 --catalog 加载。
 workflows:
-  - id: "wf_text_classify"
+  - id: "d787093d-3d99-4523-801b-d3cfcb6e9ea8"
     name: "文本分类工作流"
     description: "对输入文本进行类别判定"
+    api_key: "app-lhg7xZq0KRVk5frngV0MRCjW"
     inputs:
-      file_list:
-        - "${BASE_PATH}/samples/texts/sample_1.txt"
-        - "${BASE_PATH}/samples/texts/sample_2.txt"
-      language: "${DEFAULT_LANGUAGE}"
-      top_k: 3
-      max_length: 512
-    parameters:
-      temperature: "${TEMPERATURE}"
-      batch_size: "${BATCH_SIZE}"
+      ContractFile:
+        type: file
+        value:
+          - "./samples/texts/sample_1.txt"
+          - "./samples/texts/sample_2.txt"
+      RulesetApiUrl:
+        type: string
+        value: "test"
+      ContractID:
+        type: string
+        value: "test"
+      FilelD:
+        type: string
+        value: "test{TIME}"
+      ReviewBG:
+        type: string
+        value: "testtest"
+    reference:
+      - "1"
+      - "2"
 
   - id: "wf_chat_assistant"
     name: "对话助理工作流"
@@ -95,8 +106,8 @@ io_paths:
 logging:
   # 若不使用下方内联配置，可通过 CLI 的 --log-config 指定 config/logging_config.yaml
   level: "DEBUG"
-  # format: "structured"               # simple | structured
-  format: "simple"               # simple | structured
+  format: "structured"               # simple | structured
+  # format: "simple"               # simple | structured
   file_enabled: true
   console_enabled: true
 

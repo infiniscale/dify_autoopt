@@ -23,6 +23,8 @@ class WorkflowInline:
     description: Optional[str] = None
     inputs: Optional[Dict[str, Any]] = None
     parameters: Optional[Dict[str, Any]] = None
+    reference: Optional[Any] = None
+    api_key: Optional[str] = None
 
 
 @dataclass
@@ -115,6 +117,8 @@ class UnifiedConfigLoader:
                         description=w.get("description"),
                         inputs=w.get("inputs"),
                         parameters=w.get("parameters"),
+                        reference=w.get("reference"),
+                        api_key=w.get("api_key"),
                     )
                 )
 
@@ -189,6 +193,9 @@ class UnifiedConfigLoader:
             # 不阻断主流程
             pass
 
+        # 额外校验：工作流 inputs/reference 的多元素配对规则
+        self._validate_workflow_multiplicity(app)
+
         return app
 
     # ---------------------- Validation Helpers ----------------------
@@ -246,3 +253,58 @@ class UnifiedConfigLoader:
         except Exception:
             pass
         return {"errors": errors, "warnings": warnings}
+
+    # ---------------------- Workflow Inputs Validation ----------------------
+    def _validate_workflow_multiplicity(self, app: AppConfig) -> None:
+        """Ensure list-typed inputs are aligned in length and reference matches.
+
+        Rules:
+        - Each workflow's inputs can be scalars or lists.
+        - If any input is a list, then all list-typed inputs must have the same length N.
+        - Scalars are allowed and are considered broadcastable.
+        - If `reference` is provided, it must be either a scalar or a list of length N (when N exists).
+        Violations raise ValueError with a helpful message.
+        """
+        for wf in app.workflows or []:
+            inputs = (wf.inputs or {}) if isinstance(wf.inputs, dict) else {}
+
+            def _extract_value(x):
+                # Support new shape: {'type': 'file|string|number', 'value': ...}
+                if isinstance(x, dict) and 'value' in x:
+                    return x.get('value')
+                return x
+
+            # Collect lengths for list-typed values after extraction
+            list_lengths = []
+            for k, v in inputs.items():
+                val = _extract_value(v)
+                if isinstance(val, list):
+                    list_lengths.append((k, len(val)))
+
+            if not list_lengths:
+                # All scalars -> ok
+                continue
+
+            lengths = [n for _, n in list_lengths]
+            uniq = set(lengths)
+            if len(uniq) > 1:
+                raise ValueError(
+                    f"Workflow '{wf.id}': list inputs must have equal length, got: "
+                    + ", ".join(f"{k}={n}" for k, n in list_lengths)
+                )
+
+            N = lengths[0]
+            # Ensure every list-typed input length == N
+            for k, v in inputs.items():
+                val = _extract_value(v)
+                if isinstance(val, list) and len(val) != N:
+                    raise ValueError(
+                        f"Workflow '{wf.id}': input '{k}' length {len(val)} != expected {N}"
+                    )
+
+            # Validate reference field length if list
+            ref = getattr(wf, 'reference', None)
+            if ref is not None and isinstance(ref, list) and len(ref) != N:
+                raise ValueError(
+                    f"Workflow '{wf.id}': reference length {len(ref)} != expected {N}"
+                )

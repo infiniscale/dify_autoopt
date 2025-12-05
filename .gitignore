@@ -56,9 +56,9 @@ coverage.xml
 .cache
 nosetests.xml
 
-# Logs
-logs/
-log/
+# Logs (root)
+/logs/
+/log/
 
 # Environment variables (sensitive)
 .env
@@ -72,6 +72,7 @@ config/llm.yaml  # LLM configuration (may contain API keys or sensitive settings
 
 # Output and temporary files
 output/
+/outputs/
 artifacts/
 temp/
 tmp/

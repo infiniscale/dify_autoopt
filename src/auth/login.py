@@ -1,4 +1,5 @@
 import time
+import os
 import requests
 import logging
 
@@ -147,9 +148,11 @@ class DifyAuthClient:
                 # 登录成功日志（不泄露完整令牌）
                 returned = data.get("data")
                 masked_token = None
+                access_token_val = None
                 try:
                     if isinstance(returned, dict):
                         token_candidate = returned.get("access_token")
+                        access_token_val = token_candidate if isinstance(token_candidate, str) else None
                         if isinstance(token_candidate, str) and len(token_candidate) >= 8:
                             masked_token = f"{token_candidate[:4]}****{token_candidate[-4:]}"
                 except Exception:
@@ -158,6 +161,16 @@ class DifyAuthClient:
                     logger.info(f"登录成功: 用户 {self.email} @ {self.base_url} (token={masked_token})")
                 else:
                     logger.info(f"登录成功: 用户 {self.email} @ {self.base_url}")
+                # 如需在 DEBUG 日志中输出完整令牌，需显式开启环境变量 DEBUG_EXPOSE_TOKENS=true
+                try:
+                    expose = str(os.getenv("DEBUG_EXPOSE_TOKENS", "")).lower() in {"1", "true", "yes", "on"}
+                    if expose and access_token_val:
+                        logger.warning(
+                            "DEBUG_EXPOSE_TOKENS 已启用：将仅在 DEBUG 级别输出完整访问令牌（请勿在生产环境开启）"
+                        )
+                        logger.debug(f"access_token (debug only) = {access_token_val}")
+                except Exception:
+                    pass
                 if isinstance(returned, dict):
                     try:
                         logger.debug(f"登录成功返回字段: {list(returned.keys())}")
@@ -300,6 +313,16 @@ class DifyAuthClient:
 
                 Token().rewrite_access_token(access_token)
                 logger.debug(f"已保存访问令牌: {access_token[:4]}****{access_token[-4:]}")
+                # 可选：在 DEBUG 级别打印完整令牌，需显式开启 DEBUG_EXPOSE_TOKENS
+                try:
+                    expose = str(os.getenv("DEBUG_EXPOSE_TOKENS", "")).lower() in {"1", "true", "yes", "on"}
+                    if expose:
+                        logger.warning(
+                            "DEBUG_EXPOSE_TOKENS 已启用：将仅在 DEBUG 级别输出完整访问令牌（请勿在生产环境开启）"
+                        )
+                        logger.debug(f"access_token (debug only) = {access_token}")
+                except Exception:
+                    pass
                 logger.info("登录成功")
 
                 if Token().validate_access_token():  # 修复拼写错误
