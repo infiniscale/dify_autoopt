@@ -19,6 +19,7 @@ from src.utils.logger import get_logger, log_performance
 from .apps import _mask_token
 
 logger = get_logger("workflow.execute")
+RESULT_DIRNAME = "result"
 
 
 def _is_file_path(value: Any) -> bool:
@@ -138,6 +139,56 @@ def upload_dify_file(
             pass
 
 
+def _persist_result(
+    data: Any,
+    output_dir: Union[str, Path],
+    workflow_id: str,
+    index: int,
+    inputs: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist workflow run result (and inputs) to markdown file."""
+    try:
+        base = Path(output_dir).expanduser().resolve()
+        target_dir = base / str(workflow_id) / RESULT_DIRNAME
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_file = target_dir / f"{index}.md"
+        content_lines = [
+            "# Workflow Result\n",
+            f"- workflow_id: {workflow_id}\n",
+            f"- input_index: {index}\n",
+        ]
+        if inputs:
+            try:
+                import json as _json
+
+                content_lines.append("\n## Inputs\n")
+                content_lines.append("```json\n")
+                content_lines.append(_json.dumps(inputs, ensure_ascii=False, indent=2))
+                content_lines.append("\n```\n")
+            except Exception:
+                content_lines.append(f"\n## Inputs\n{inputs}\n")
+
+        content_lines.append("\n## Response\n")
+        try:
+            import json as _json
+
+            content_lines.append("```json\n")
+            content_lines.append(_json.dumps(data, ensure_ascii=False, indent=2))
+            content_lines.append("\n```\n")
+        except Exception:
+            content_lines.append(str(data))
+        target_file.write_text("".join(content_lines), encoding="utf-8")
+        logger.debug(
+            "Persisted workflow result",
+            extra={"file": str(target_file), "workflow_id": workflow_id, "index": index},
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            logger.warning("Failed to persist workflow result", extra={"error": str(exc)})
+        except Exception:
+            pass
+
+
 def _prepare_inputs_with_files(
     run_inputs: Dict[str, Any],
     *,
@@ -227,6 +278,8 @@ def execute_workflow_v1(
     user: Optional[str] = "autoopt",
     response_mode: str = "blocking",
     input_types: Optional[Dict[str, str]] = None,
+    output_dir: Optional[Union[str, Path]] = None,
+    persist_results: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Execute a workflow via the Dify public API (blocking).
@@ -274,19 +327,29 @@ def execute_workflow_v1(
             upload_path=upload_path,
             declared_types=declared,
         )
+        # Inject metadata for tracking/output if not already present
+        meta_fields: Dict[str, Any] = {}
+        if output_dir and "__output_dir" not in prepared_inputs:
+            meta_fields["__output_dir"] = str(Path(output_dir).resolve())
+        if "__workflow_id" not in prepared_inputs:
+            meta_fields["__workflow_id"] = app_id
+        if "__input_index" not in prepared_inputs:
+            meta_fields["__input_index"] = idx
+        prepared_inputs.update(meta_fields)
         logger.debug("Executing workflow row", extra={"index": idx, "keys": list(prepared_inputs.keys())})
-        results.append(
-            _run_workflow_once(
-                app_id,
-                prepared_inputs,
-                base_url=resolved_base,
-                api_key=api_key,
-                user=user,
-                timeout=timeout,
-                response_mode=response_mode,
-                run_path=run_path,
-            )
+        run_result = _run_workflow_once(
+            app_id,
+            prepared_inputs,
+            base_url=resolved_base,
+            api_key=api_key,
+            user=user,
+            timeout=timeout,
+            response_mode=response_mode,
+            run_path=run_path,
         )
+        results.append(run_result)
+        if persist_results and output_dir:
+            _persist_result(run_result, output_dir, app_id, idx, prepared_inputs)
 
     logger.info("Workflow execution finished", extra={"runs": len(results)})
     return results
@@ -299,6 +362,7 @@ def execute_workflow_from_config(
     timeout: int = 9000,
     upload_path: Optional[str] = None,
     run_path: Optional[str] = None,
+    persist_results: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Load inputs for a workflow from unified config and execute each row sequentially.
@@ -321,6 +385,7 @@ def execute_workflow_from_config(
     raw_inputs = getattr(workflow_entry, "inputs", {}) or {}
     rows, declared_types = _normalize_inputs(raw_inputs)
     api_key = getattr(workflow_entry, "api_key", None)
+    output_dir = (rt.app.io_paths or {}).get("output_dir")
     resolved_base = _resolve_base_url(base_url)
     if not api_key or not resolved_base:
         raise RuntimeError("Workflow execution requires dify.base_url and workflow.api_key in config")
@@ -334,4 +399,6 @@ def execute_workflow_from_config(
         upload_path=upload_path,
         run_path=run_path,
         input_types=declared_types,
+        output_dir=output_dir,
+        persist_results=persist_results and bool(output_dir),
     )

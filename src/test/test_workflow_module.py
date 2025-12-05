@@ -313,3 +313,47 @@ def test_execute_workflow_from_config_expands_rows(monkeypatch):
     assert calls["app_id"] == "wf-x"
     assert calls["input_types"]["file_field"] == "file"
     assert calls["input_types"]["FileID"] == "string"
+
+
+def test_execute_workflow_persists_results_and_meta(monkeypatch, tmp_path):
+    from src.workflow.execute import execute_workflow_v1
+
+    calls = {"runs": []}
+
+    class DummyResp:
+        def __init__(self, data):
+            self._data = data
+            self.status_code = 200
+            self.headers = {"Content-Type": "application/json"}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._data
+
+    def fake_post(url, headers=None, json=None, timeout=None, files=None, data=None):
+        if url.endswith("/workflows/run"):
+            calls["runs"].append(json)
+            return DummyResp({"data": {"status": "ok", "run": len(calls["runs"])}})
+        return DummyResp({"data": {"id": "fid"}})
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    res = execute_workflow_v1(
+        "wf-meta",
+        [{"note": "a"}, {"note": "b"}],
+        base_url="http://api",
+        api_key="KEY",
+        output_dir=tmp_path,
+        persist_results=True,
+    )
+    assert len(res) == 2
+    # meta injected
+    first_inputs = calls["runs"][0]["inputs"]
+    assert first_inputs["__workflow_id"] == "wf-meta"
+    assert first_inputs["__input_index"] == 1
+    assert str(first_inputs["__output_dir"]).startswith(str(tmp_path))
+    # files persisted
+    assert (tmp_path / "wf-meta" / "result" / "1.md").exists()
+    assert (tmp_path / "wf-meta" / "result" / "2.md").exists()
