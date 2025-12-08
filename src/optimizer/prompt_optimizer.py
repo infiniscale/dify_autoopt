@@ -180,21 +180,22 @@ def _load_reference_spec(path: Optional[str | Path]) -> ReferenceSpec:
     )
 
 
-def _extract_graph(tree: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract graph section from either root.graph or root.workflow.graph."""
+def _extract_graph(tree: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """Extract graph section and its pointer prefix (e.g., /graph or /workflow/graph)."""
+    default: Tuple[Dict[str, Any], str] = ({}, "/graph")
     if not isinstance(tree, dict):
-        return {}
+        return default
     if isinstance(tree.get("graph"), dict):
-        return tree.get("graph") or {}
+        return (tree.get("graph") or {}, "/graph")
     workflow = tree.get("workflow")
     if isinstance(workflow, dict) and isinstance(workflow.get("graph"), dict):
-        return workflow.get("graph") or {}
-    return {}
+        return (workflow.get("graph") or {}, "/workflow/graph")
+    return default
 
 
 def _iter_llm_prompts(workflow_yaml: Dict[str, Any]) -> Iterable[PromptLocation]:
     """Yield prompt locations for LLM nodes in a Dify workflow DSL."""
-    graph = _extract_graph(workflow_yaml or {})
+    graph, graph_pointer = _extract_graph(workflow_yaml or {})
     buckets = []
     if "nodes" in graph:
         buckets.append(("nodes", graph.get("nodes") or []))
@@ -262,7 +263,7 @@ def _iter_llm_prompts(workflow_yaml: Dict[str, Any]) -> Iterable[PromptLocation]
                         continue
                     # pointer path reflects underlying structure
                     sub_path = "messages" if isinstance(prompt_template, dict) else ""
-                    path = f"/graph/{bucket_name}/{idx}/data/prompt_template/{sub_path + '/' if sub_path else ''}{mi}/text"
+                    path = f"{graph_pointer}/{bucket_name}/{idx}/data/prompt_template/{sub_path + '/' if sub_path else ''}{mi}/text"
                     try:
                         logger.debug(
                             "LLM prompt匹配",
@@ -281,7 +282,7 @@ def _iter_llm_prompts(workflow_yaml: Dict[str, Any]) -> Iterable[PromptLocation]
                     pass
             # Some DSLs may have system_prompt fields
             if "system_prompt" in data:
-                path = f"/graph/{bucket_name}/{idx}/data/system_prompt"
+                path = f"{graph_pointer}/{bucket_name}/{idx}/data/system_prompt"
                 yield PromptLocation(node_id=node_id, path=path, text=str(data["system_prompt"]))
 
 
