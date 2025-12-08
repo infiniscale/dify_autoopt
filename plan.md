@@ -1,5 +1,7 @@
 # 项目开发计划（螺旋模型）
 
+> 更新时间：2025-01-18
+
 > 项目：dify_autoopt
 > 文档目的：记录当前完成度与待办，基于螺旋模型制定迭代计划与测试计划，指导后续交付。
 
@@ -8,19 +10,18 @@
 - 范围：`src/optimizer/`、`src/executor/`、`src/collector/`、`src/config/` 现有能力整合与打通主入口；补齐最小可用的 `workflow/` 与 `report/`；完善日志模块；补齐依赖与 CI；建立覆盖率与质量门禁。
 
 ## 二、现状快照（完成/未完成）
-- 已完成
-  - 优化器：提示词提取/分析/优化/版本管理与门面 API；接口与文档完善；大量单测。
-  - 执行器：并发执行、任务调度、限流、清单构建、用例生成、结果转换等分期组件；单测齐全。
-  - 配置系统：Pydantic 模型、Loader/Validator、YAML 解析工具；单测与示例完善。
-  - 采集器：数据收集、Excel 导出、分类；含性能与并发相关测试。
-  - 仓库结构与文档：模块 README、`docs/` 文档体系完整。
+- 已完成/近期调整
+  - 轻量规则优化器：基于执行结果生成补丁、副本写出 patched YAML，不改原文件；可选 LLM/dspy 重写；prompt 审核前置。
+  - 工作流执行：支持从 unified config 读取 inputs/api_key，执行并落盘 JSON + summary；optimize 模式可调度执行→优化→报告。
+  - YAML 读取：`optimizer/yaml_loader` 支持 output_dir/output 键，安全目录名。
+  - 依赖更新：`requirements.txt` 补齐 LLM/dspy 及核心库版本。
 - 未完成/差距
-  - 入口程序：`src/main.py` 为演示版，无 `--mode test|optimize|report` CLI 分发；导入不存在的 `yaml_loader`；调用未实现日志方法。
-  - 日志模块：实现仅含 `setup_logging/get_logger/log_context/log_performance`，文档/示例中使用的 `log_exception/log_workflow_trace/get_logger_with_context/_log_manager.set_global_context/get_stats` 未实现。
-  - 工作流/报告：`workflow/`、`report/` 仅 README，无可调用实现与主程序对接。
-  - 依赖：`auth/login.py` 依赖 `requests`、`apscheduler`，`requirements.txt` 未声明。
-  - CI：缺少 Python 测试/格式化流水线与覆盖率门禁。
-  - 工具链：缺少 `pyproject.toml` 中的 `black/ruff` 配置与 CI 集成。
+  - 调度器缺失：无统一的 dry_run/optimize 调度、并发/迭代控制、验证回路。
+  - 日志模块：部分示例 API 仍未实现/对齐。
+  - 文档/配置：大量 docs 被删，示例配置键不统一（output vs output_dir），用户指引不足。
+  - 测试：未跑最新单测；大量 legacy optimizer 测试被 skip/依赖缺失模块。
+  - DSL 导出：optimize 流程未保证执行前自动导出 DSL，依赖已有文件。
+  - CI：仍缺流水线与覆盖率门禁。
 
 ## 三、约束与风险
 - 约束：
@@ -35,49 +36,30 @@
 
 > 每一轮包含：目标/约束识别 → 风险评估 → 开发与验证 → 计划下一轮。
 
-### 迭代 0：稳定化与可运行骨架（T+1 周）
-- 目标：打通最小可运行链路，统一入口/日志/依赖/CI。
+### 迭代 0：运行骨架与依赖收敛（T+1 周）
+- 目标：让三种模式可运行（允许 stub），日志与依赖对齐。
 - 交付物：
-  - 主入口 CLI：`--mode {test,optimize,report}` 与通用参数；使用 `src/config/loaders` 替代 `yaml_loader`。
-  - 日志最小补齐：提供简版 `@log_exception`、`log_workflow_trace` 与全局上下文/统计占位实现，或调整示例仅用已实现 API。
-  - 依赖修正：在 `requirements.txt` 增加 `requests`、`APScheduler`。
-  - CI 基线：GitHub Actions 安装依赖、`ruff`、`black --check`、`pytest --cov`。
-- 验证：
-  - 本地运行三种模式的最小流程（可输出 stub/示例结果）。
-  - 单测通过并产出覆盖率报告。
-- 风险&缓解：
-  - 入口改动影响广 → 渐进式提交，保持向后兼容。
+  - main：清理注释逻辑，保证 `--mode test|optimize|report` 可跑；optimize 前自动导出 DSL。
+  - 日志：对齐示例所用 API（或降级示例），避免导入时抛未初始化异常。
+  - 依赖/CI：更新 requirements，初步 GH Actions（ruff/black/pytest -q）。
+- 验证：本地跑通三模式最小流程；单测基础套件通过。
 
-### 迭代 1：功能闭环（T+2 周）
-- 目标：完成“测试/优化/报告”的基本业务闭环与模块间对接。
+### 迭代 1：调度器与优化闭环（T+2 周）
+- 目标：引入 Scheduler 支持 dry_run/optimize，支持并发、迭代与验证闭环。
 - 交付物：
-  - `workflow/`：`discovery.py`、`runner.py` 最小实现，能从 Catalog 选择工作流并驱动执行器。
-  - `report/`：基于 Collector 输出生成简版报告（JSON/Excel 二选一）。
-  - `main.py` 模式分发接入执行器/优化器/采集器/报告。
-- 验证：
-  - 端到端 E2E 测试（使用 stub/workflow 样例，无真实网络）。
-  - 错误路径测试（配置缺失、执行失败、超时、速率限制）。
-- 风险&缓解：
-  - 集成复杂 → 对外暴露稳定门面，内部通过依赖注入解耦。
+  - Scheduler：配置化并发、模式切换、max_iterations、终止条件。
+  - Verifier：对 patched DSL 小样本重跑，评估失败率/相似度/约束覆盖。
+  - 输出契约：每轮 patched YAML、patches、validation 报告落盘。
+- 验证：E2E（stub/或最小真实）覆盖执行→优化→验证→迭代。
 
 ### 迭代 2：健壮性与可观测性（T+2 周）
-- 目标：增强稳定性、性能与可观测性。
-- 交付物：
-  - 日志增强：结构化字段、上下文传播、关键路径性能埋点、统计接口。
-  - 工作流发现/报告能力扩展（标签筛选、指标维度拓展）。
-  - 失败重试、速率/并发策略验证与压测脚本（stub）。
-- 验证：
-  - 并发/性能基准；日志与错误追踪的可追溯性用例。
-  - 覆盖率门槛 ≥ 80%，关键模块 ≥ 85%。
+- 目标：并发/速率控制、日志增强、错误隔离。
+- 交付物：速率/重试策略、结构化日志上下文、性能/错误指标、更多约束/策略切换（规则/LLM/dspy）。
+- 验证：并发压测，错误路径、回退路径验证，覆盖率提升。
 
-### 迭代 3：发布与文档对齐（T+1 周）
-- 目标：对齐文档与实现，完善配置示例，准备发布。
-- 交付物：
-  - `README` 与模块文档更新，增加操作指南与故障排除。
-  - `config/examples/` 提供 env/catalog/plan 的可运行样例。
-  - 发布清单与回滚方案；变更日志。
-- 验证：
-  - CI 全绿；质量门禁（lint、格式化、覆盖率）满足基线。
+### 迭代 3：文档/配置对齐与发布（T+1 周）
+- 目标：文档、示例、配置键统一（output_dir vs output），发布说明与回滚方案。
+- 验证：CI 全绿，文档与实现一致。
 
 ## 五、工作分解（WBS，按迭代）
 - 迭代 0
@@ -132,9 +114,30 @@
 - 发布：拟定 Release Notes 与回滚方案，必要时打 Tag。
 
 ## 九、开放问题（跟踪）
-- `workflow/` 与 `report/` 的最小接口定义需敲定（Runner 输入/输出契约）。
-- 日志模块究竟补齐哪些 API 与语义范围（与示例对齐），或统一下调示例范围。
-- 优化器 LLM 直连与成本控制是否在短期纳入 E2E（当前建议仅 stub）。
+- DSL 导出与 optimize 时机：是否强制 optimize 前导出？导出失败时的回退策略。
+- 配置键统一：`io_paths.output_dir` vs `io_paths.output`，需要统一或兼容方案。
+- Scheduler 策略：迭代终止条件、验证样本量、策略切换（规则/LLM/dspy）的默认值。
+- 日志 API：是否补齐示例中引用的所有接口，或调整示例。
+
+## 十、设计方案（入口瘦身 + 调度器接管）— 2025-01-18
+- 主入口职责最小化
+  - 仅解析 CLI 参数（config/catalg/mode/set/log-config 等），加载 .env，初始化日志，启动调度器。
+  - 禁止在 main 中直接调用执行/优化逻辑；main 只负责把配置路径/模式/覆盖项传递给调度器。
+- 调度器（Scheduler）职责
+  - 读取配置：统一入口，加载 runtime（unified config），解析 `scheduler` 段（mode、concurrency、max_iterations、validation_sample、criteria、strategies、dry_run 标志）。
+  - 模式分发：`mode=dry_run|optimize|report`，dry_run 仅做 DSL 导出/静态检查，optimize 走执行→优化→验证→迭代，report 调用报告生成。
+  - 工作流分发：按 concurrency 并行不同 workflow；单 workflow 内的迭代串行，保留每轮产物（runs、patches、patched.yml、validation 报告）。
+  - 迭代与终止：基于 criteria（failure_rate/similarity/constraint_coverage/latency）判断达标；不达标则按 strategies 切换（rule→LLM→dspy 或保守→激进），直到 max_iterations。
+  - 验证：Verifier 组件对 patched YAML 取样本重跑（可用 stub 或真实执行），生成验证指标。
+  - 产物：每轮写 `run_*.json`、`runs_summary.json`、`prompt_patches_iter_{n}.json`、`app_{id}_patched_iter_{n}.yml`、`validation_report_iter_{n}.json`，汇总 `scheduler_summary.json`。
+  - 回退策略：导出失败或执行失败时记录错误并跳过；LLM/dspy 不可用则回退规则；验证恶化则保留上一轮最佳补丁。
+- 配置接口（建议）
+  - `scheduler.mode`、`scheduler.concurrency`、`scheduler.max_iterations`、`scheduler.validation_sample_size`、`scheduler.criteria.{failure_rate,similarity,constraint_coverage,latency}`、`scheduler.strategies`、`scheduler.dry_run`。
+  - `optimization.llm` 保持用于 judge/rewrite/dspy；允许 disable。
+- 风险与缓解
+  - 并发/速率限制：调度器内置速率/重试策略；可配置节流。
+  - 成本控制：dry_run 默认不打真实 API；optimize 验证可用 stub/sample。
+  - 可追溯：所有修改写副本，不改原 YAML；日志上下文记录 workflow/iteration。
 
 ## 十、里程碑与时间线（建议）
 - 迭代 0：T+1 周 — 可运行骨架与 CI 基线。
@@ -143,4 +146,3 @@
 - 迭代 3：T+1 周 — 文档与发布。
 
 — 完 —
-

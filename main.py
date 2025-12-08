@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from datetime import datetime
 import argparse
+import json
 import requests
 
 try:
@@ -32,7 +33,13 @@ from src.config.loaders.config_loader import ConfigLoader
 
 async def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Dify自动化测试与提示词优化工具")
-    parser.add_argument("--mode", "-m", choices=["test", "optimize", "report"], default="test")
+    parser.add_argument(
+        "--mode",
+        "-m",
+        choices=["run", "opt", "all"],
+        default="run",
+        help="运行模式：run=仅执行工作流并保存结果；opt=基于已有运行结果生成优化建议；all=先执行后优化",
+    )
     parser.add_argument(
         "--config",
         "-c",
@@ -258,44 +265,22 @@ async def main(argv: list[str] | None = None) -> int:
 
                             exported_paths = []
                             if workflow_ids:
-                                logger.info("开始导出工作流 DSL", extra={"count": len(workflow_ids)})
+                                if args.mode == "opt":
+                                    logger.info("opt 模式仅使用已有运行结果，跳过在线 DSL 导出与工作流执行", extra={"count": len(workflow_ids)})
+                                else:
+                                    logger.info("开始导出工作流 DSL", extra={"count": len(workflow_ids)})
 
-                                def _export_one(app_id: str):
-                                    return export_app_dsl(app_id, base_url=base_url, token=access_token, include_secret=False)
+                                    def _export_one(app_id: str):
+                                        return export_app_dsl(app_id, base_url=base_url, token=access_token, include_secret=False)
 
-                                for wid in workflow_ids:
-                                    try:
-                                        p = await asyncio.to_thread(_export_one, wid)
-                                        exported_paths.append(str(p))
-                                    except Exception as ex:
-                                        logger.warning("导出 DSL 失败", extra={"workflow_id": wid, "error": str(ex)})
+                                    for wid in workflow_ids:
+                                        try:
+                                            p = await asyncio.to_thread(_export_one, wid)
+                                            exported_paths.append(str(p))
+                                        except Exception as ex:
+                                            logger.warning("导出 DSL 失败", extra={"workflow_id": wid, "error": str(ex)})
 
-                                logger.info("DSL 导出完成", extra={"exported": len(exported_paths), "paths": exported_paths[:10]})
-
-                                # 3) 根据配置的参数组合执行工作流（逐个 workflow）
-                                from src.workflow import execute_workflow_from_config
-
-                                exec_summaries = []
-                                for wid in workflow_ids:
-                                    try:
-                                        def _run_one():
-                                            return execute_workflow_from_config(
-                                                wid,
-                                                base_url=base_url,
-                                                token=access_token,
-                                                timeout=runtime.app.execution.get("timeout", 60) if runtime.app.execution else 60,
-                                            )
-                                        run_results = await asyncio.to_thread(_run_one)
-                                        # 聚合基本信息
-                                        exec_summaries.append({
-                                            "workflow_id": wid,
-                                            "runs": len(run_results),
-                                        })
-                                    except Exception as ex:
-                                        logger.warning("执行工作流失败", extra={"workflow_id": wid, "error": str(ex)})
-
-                                if exec_summaries:
-                                    logger.info("工作流执行完成", extra={"summaries": exec_summaries})
+                                    logger.info("DSL 导出完成", extra={"exported": len(exported_paths), "paths": exported_paths[:10]})
                             else:
                                 logger.info("配置中未发现 workflows，跳过 DSL 导出")
                         except Exception as e:
@@ -308,25 +293,26 @@ async def main(argv: list[str] | None = None) -> int:
                 logger.info("未配置 Dify 认证信息，跳过登录校验")
         except Exception as e:
             logger.warning("Dify 登录校验出现异常", extra={"error": str(e)})
-
         # 5. 模式执行
-        if args.mode == "test":
-            results = await run_test_mode(args.catalog, str(effective_config))
-            if args.report:
+        if args.mode == "run":
+            logger.info("进入运行模式（仅执行工作流，不做优化）", extra={"mode": args.mode})
+            results = await run_optimize_mode(run_workflows=True, optimize=False)
+            if args.report and results is not None:
                 from src.report import generate_report, save_report_json
                 rep = generate_report([r for r in results])
                 save_report_json(rep, args.report)
                 logger.info("测试报告已生成", extra={"path": args.report})
 
-        elif args.mode == "optimize":
-            logger.info("进入优化模式（占位实现）", extra={"mode": args.mode})
-            await simulate_workflow_execution()
+        elif args.mode == "opt":
+            logger.info("进入优化模式（仅使用历史运行结果）", extra={"mode": args.mode})
+            await run_optimize_mode(run_workflows=False, optimize=True)
 
-        elif args.mode == "report":
-            logger.info("进入报告模式（占位实现）", extra={"mode": args.mode})
-            await simulate_workflow_execution()
+        elif args.mode == "all":
+            logger.info("进入全流程模式（先运行后优化）", extra={"mode": args.mode})
+            await run_optimize_mode(run_workflows=True, optimize=True)
 
         logger.info("Dify自动优化工具正常关闭", extra={"shutdown_time": datetime.now().isoformat(), "status": "graceful_shutdown"})
+        return 0
     except Exception as e:
         logger.critical(
             "应用运行时发生严重错误",
@@ -393,6 +379,234 @@ async def run_test_mode(catalog_path: str, unified_config_path: str):
         logger.warning("catalog 加载或运行失败，回退到模拟流程", extra={"error": str(e)})
         await simulate_workflow_execution()
         return []
+
+
+def _resolve_reference_file(opt_cfg: dict, workflow_id: str) -> str | None:
+    """Resolve reference expectation file for a workflow."""
+    if not opt_cfg:
+        return None
+    ref_path = opt_cfg.get("reference_path")
+    if ref_path:
+        p = Path(ref_path)
+        return str(p) if p.exists() else None
+    ref_dir = opt_cfg.get("reference_dir")
+    if not ref_dir:
+        return None
+    base = Path(ref_dir)
+    candidates = [
+        base / f"{_safe_dirname_from_id(workflow_id)}.yaml",
+        base / f"{_safe_dirname_from_id(workflow_id)}.yml",
+        base / f"{_safe_dirname_from_id(workflow_id)}.json",
+        base / f"{workflow_id}.yaml",
+        base / f"{workflow_id}.yml",
+        base / f"{workflow_id}.json",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+
+def _load_runs_from_disk(workflow_id: str, output_dir: str | Path) -> list[dict]:
+    """Load persisted run results from disk for offline optimization."""
+    root = Path(output_dir).expanduser()
+    run_dir = root / _safe_dirname_from_id(workflow_id) / "runs"
+    if not run_dir.exists():
+        return []
+    runs = []
+    for fp in sorted(run_dir.glob("run_*.json")):
+        try:
+            payload = json.loads(fp.read_text(encoding="utf-8"))
+            runs.append(payload.get("result", payload))
+        except Exception:
+            continue
+    return runs
+
+
+def _safe_dirname_from_id(app_id: str) -> str:
+    """Filesystem-safe directory name (local copy to avoid early workflow imports)."""
+    try:
+        import re
+
+        name = str(app_id)
+        name = name.replace("/", "_").replace("\\", "_")
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+        name = name.strip("._-") or "app"
+        return name
+    except Exception:
+        return "app"
+
+
+async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True):
+    """
+    Execute workflows and optionally generate prompt optimization patches.
+
+    Args:
+        run_workflows: Whether to execute workflows to produce fresh runs (persisted to disk).
+        optimize: Whether to run the prompt optimizer using available runs.
+    """
+    from src.config.bootstrap import get_runtime
+    from src.optimizer import PromptOptimizer, load_workflow_yaml
+    from src.workflow import execute_workflow_from_config
+
+    rt = get_runtime()
+    logger = get_logger("cli.optimize")
+
+    workflows = rt.app.workflows or []
+    if not workflows:
+        logger.info("未配置 workflows，跳过优化")
+        return
+
+    output_dir = (rt.app.io_paths or {}).get("output_dir") or "./outputs"
+    exec_timeout = rt.app.execution.get("timeout", 60) if rt.app.execution else 60
+    ref_cfg = rt.app.optimization or {}
+
+    optimizer = PromptOptimizer(default_output_root=output_dir, llm_config=ref_cfg.get("llm"))
+    summaries = []
+    run_records: list[dict] = []
+
+    for wf in workflows:
+        wid = getattr(wf, "id", None)
+        if not wid:
+            continue
+        wid = str(wid)
+        logger.info(
+            "开始处理工作流",
+            extra={"workflow_id": wid, "run_workflows": run_workflows, "optimize": optimize},
+        )
+
+        run_results: list[dict] = []
+        if run_workflows:
+            try:
+                def _run_one():
+                    return execute_workflow_from_config(
+                        wid,
+                        base_url=rt.dify_base_url,
+                        timeout=exec_timeout,
+                        persist_results=True,
+                    )
+                run_results = await asyncio.to_thread(_run_one)
+            except Exception as ex:
+                logger.warning("执行工作流失败", extra={"workflow_id": wid, "error": str(ex)})
+
+        if not run_results:
+            try:
+                run_results = _load_runs_from_disk(wid, output_dir)
+            except Exception as ex:
+                logger.warning("加载历史运行结果失败", extra={"workflow_id": wid, "error": str(ex)})
+
+        # 记录运行结果供报告使用
+        try:
+            from src.optimizer.prompt_optimizer import _status_from_run  # local import to avoid early logger use
+        except Exception:
+            _status_from_run = None  # type: ignore
+
+        for run in run_results:
+            metrics = {}
+            if isinstance(run, dict):
+                metrics = run.get("metrics") or {}
+                if not metrics:
+                    if isinstance(run.get("data"), dict):
+                        metrics = run.get("data", {}).get("metrics", {}) or {}
+                    elif isinstance(run.get("result"), dict) and isinstance(run["result"].get("data"), dict):
+                        metrics = run["result"]["data"].get("metrics", {}) or {}
+            status = "unknown"
+            if _status_from_run:
+                try:
+                    status = _status_from_run(run)
+                except Exception:
+                    status = str(run.get("status", "unknown")) if isinstance(run, dict) else "unknown"
+            elif isinstance(run, dict):
+                status = str(run.get("status", "unknown"))
+            run_records.append({"workflow_id": wid, "status": status, "metrics": metrics})
+
+        if not optimize:
+            summaries.append({"workflow_id": wid, "runs": len(run_results)})
+            logger.info("运行完成（未执行优化）", extra={"workflow_id": wid, "runs": len(run_results)})
+            continue
+
+        try:
+            yaml_tree, yaml_path = load_workflow_yaml(wid, output_dir=output_dir)
+        except FileNotFoundError as ex:
+            logger.warning("未找到工作流 DSL", extra={"workflow_id": wid, "error": str(ex)})
+            yaml_tree, yaml_path = None, None
+        except Exception as ex:
+            logger.warning("加载工作流 DSL 失败", extra={"workflow_id": wid, "error": str(ex)})
+            yaml_tree, yaml_path = None, None
+
+        reference_path = _resolve_reference_file(ref_cfg, wid)
+
+        reference_texts: list[str | None] | None = None
+        if optimize and run_results:
+            wf_ref = getattr(wf, "reference", None)
+            if wf_ref is not None:
+                ref_list = wf_ref if isinstance(wf_ref, list) else [wf_ref]
+                if len(ref_list) == 1 and len(run_results) > 1:
+                    ref_list = ref_list * len(run_results)
+                elif len(ref_list) != len(run_results):
+                    logger.warning(
+                        "reference 数量与运行结果数量不匹配，按最小长度对齐",
+                        extra={"workflow_id": wid, "references": len(ref_list), "runs": len(run_results)},
+                    )
+                reference_texts = []
+                for path in ref_list[: len(run_results)]:
+                    if not path:
+                        reference_texts.append(None)
+                        continue
+                    try:
+                        p = Path(path)
+                        reference_texts.append(p.read_text(encoding="utf-8") if p.exists() else None)
+                    except Exception as ex:
+                        logger.warning("读取 reference 失败", extra={"workflow_id": wid, "reference": path, "error": str(ex)})
+                        reference_texts.append(None)
+
+        if not run_results or yaml_tree is None or yaml_path is None:
+            summaries.append({"workflow_id": wid, "runs": len(run_results), "patches": 0})
+            continue
+
+        try:
+            report = optimizer.optimize_from_runs(
+                workflow_id=wid,
+                run_results=run_results,
+                workflow_yaml=(yaml_tree, yaml_path),
+                reference_path=reference_path,
+                reference_texts=reference_texts,
+                output_root=output_dir,
+            )
+            summaries.append(
+                {
+                    "workflow_id": wid,
+                    "runs": len(run_results),
+                    "issues": len(report.issues),
+                    "patches": len(report.patches),
+                    "yaml_path": str(report.yaml_path),
+                    "patched_path": str(report.patched_path) if report.patched_path else None,
+                    "reference_path": reference_path,
+                }
+            )
+            logger.info(
+                "优化完成",
+                extra={
+                    "workflow_id": wid,
+                    "runs": len(run_results),
+                    "issues": len(report.issues),
+                    "patches": len(report.patches),
+                },
+            )
+        except Exception as ex:
+            summaries.append({"workflow_id": wid, "runs": len(run_results), "patches": 0, "error": str(ex)})
+            logger.warning("生成优化报告失败", extra={"workflow_id": wid, "error": str(ex)})
+
+    logger.info(
+        "运行/优化流程完成",
+        extra={
+            "workflows": len(summaries),
+            "summaries": summaries[:10],
+            "optimize": optimize,
+            "run_workflows": run_workflows,
+        },
+    )
+    return run_records if run_records else summaries
 
 
 @log_performance("数据输入阶段")

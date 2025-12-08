@@ -17,6 +17,7 @@ import requests
 
 from src.utils.logger import get_logger, log_performance
 from .apps import _mask_token
+from .export import _safe_dirname_from_id
 
 logger = get_logger("workflow.execute")
 RESULT_DIRNAME = "result"
@@ -189,6 +190,40 @@ def _persist_result(
             pass
 
 
+def _persist_result_json(
+    data: Any,
+    output_dir: Union[str, Path],
+    workflow_id: str,
+    index: int,
+    inputs: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """Persist workflow run result to structured JSON for downstream optimization."""
+    base = Path(output_dir).expanduser().resolve()
+    target_dir = base / _safe_dirname_from_id(workflow_id) / "runs"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_file = target_dir / f"run_{index}.json"
+    payload = {
+        "workflow_id": workflow_id,
+        "index": index,
+        "inputs": inputs or {},
+        "result": data,
+    }
+    try:
+        import json as _json
+
+        target_file.write_text(_json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.debug(
+            "Persisted workflow result JSON",
+            extra={"file": str(target_file), "workflow_id": workflow_id, "index": index},
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            logger.warning("Failed to persist workflow JSON", extra={"error": str(exc)})
+        except Exception:
+            pass
+    return target_file
+
+
 def _prepare_inputs_with_files(
     run_inputs: Dict[str, Any],
     *,
@@ -317,6 +352,7 @@ def execute_workflow_v1(
     )
 
     results: List[Dict[str, Any]] = []
+    persisted_files: List[Path] = []
     for idx, row in enumerate(rows, start=1):
         prepared_inputs = _prepare_inputs_with_files(
             row,
@@ -350,8 +386,31 @@ def execute_workflow_v1(
         results.append(run_result)
         if persist_results and output_dir:
             _persist_result(run_result, output_dir, app_id, idx, prepared_inputs)
+            persisted_files.append(_persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs))
 
     logger.info("Workflow execution finished", extra={"runs": len(results)})
+    if persist_results and output_dir:
+        try:
+            import json as _json
+
+            base = Path(output_dir).expanduser().resolve()
+            summary_dir = base / _safe_dirname_from_id(app_id) / "runs"
+            summary_dir.mkdir(parents=True, exist_ok=True)
+            summary_file = summary_dir / "runs_summary.json"
+            failure_count = len([r for r in results if str(r.get("result", "")).lower() != "success" and r.get("status") not in {"success", "succeeded"}])
+            summary_payload = {
+                "workflow_id": app_id,
+                "total_runs": len(results),
+                "failures": failure_count,
+                "files": [str(p) for p in persisted_files],
+            }
+            summary_file.write_text(_json.dumps(summary_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.debug("Persisted workflow run summary", extra={"file": str(summary_file), "workflow_id": app_id})
+        except Exception as exc:  # noqa: BLE001
+            try:
+                logger.warning("Failed to write run summary", extra={"error": str(exc)})
+            except Exception:
+                pass
     return results
 
 

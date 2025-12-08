@@ -123,7 +123,8 @@ def export_app_dsl(
 
     content_disposition = resp.headers.get("Content-Disposition")
     content_type = resp.headers.get("Content-Type")
-    filename = _infer_filename(app_id, content_disposition, content_type)
+    # Ensure inferred filename is safe (no path components)
+    filename = Path(_infer_filename(app_id, content_disposition, content_type)).name
 
     out_root = _resolve_output_dir(output_dir)
     subdir = out_root / _safe_dirname_from_id(app_id)

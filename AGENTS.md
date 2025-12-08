@@ -35,3 +35,5 @@
 ## Security & Configuration Tips
 - Never commit credentials or API keys. Use environment variables and `.env` (git-ignored).
 - Store validated YAML config under `src/config/` (e.g., `config/logging_config.yaml`).
+
+Sepcialist.md
