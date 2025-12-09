@@ -14,6 +14,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import re
 import copy
 import json as _json
 
@@ -26,6 +27,10 @@ from src.workflow.export import _safe_dirname_from_id
 
 logger = get_logger("optimizer.prompt_optimizer")
 DEFAULT_DSPY_MAX_TOKENS = 4096
+_PLACEHOLDER_PATTERNS = [
+    re.compile(r"\{\{\s*[^{}]+\s*\}\}"),  # {{ var }} or {{a.b}}
+    re.compile(r"\$\{\s*[^${}]+\s*\}"),  # ${var}
+]
 
 
 # --------------------------------------------------------------------------- #
@@ -655,7 +660,8 @@ class PromptOptimizer:
             return None
         try:
             new_tree = copy.deepcopy(workflow_tree)
-            for patch in patches:
+            sorted_patches = sorted(patches, key=lambda p: _pointer_sort_key(p.field_path))
+            for patch in sorted_patches:
                 _set_by_pointer(new_tree, patch.field_path, patch.new)
             root = Path(output_root).expanduser()
             safe_id = _safe_dirname_from_id(workflow_id)
@@ -698,6 +704,17 @@ def _set_by_pointer(tree: Dict[str, Any], pointer: str, value: Any) -> None:
         cur[idx] = value
     else:
         cur[last] = value
+
+
+def _pointer_sort_key(pointer: str) -> List[Tuple[int, Any]]:
+    parts = [p for p in pointer.split("/") if p]
+    key: List[Tuple[int, Any]] = []
+    for part in parts:
+        if part.isdigit():
+            key.append((0, int(part)))
+        else:
+            key.append((1, part))
+    return key
 
 
 def _llm_output_judge(
@@ -1003,6 +1020,94 @@ def _adapt_dspy_api_base(url: Optional[str]) -> Optional[str]:
     return trimmed
 
 
+def _extract_placeholders(text: str) -> List[str]:
+    """Extract placeholder tokens (e.g., {{var}}, ${var}) in order of appearance."""
+    if not text:
+        return []
+    seen = set()
+    result: List[str] = []
+    for pattern in _PLACEHOLDER_PATTERNS:
+        for match in pattern.findall(text):
+            if match not in seen:
+                seen.add(match)
+                result.append(match)
+    return result
+
+
+def _mask_placeholders(text: str, placeholders: Sequence[str]) -> Tuple[str, Dict[str, str]]:
+    """Replace placeholders with unlikely tokens to avoid LLM tampering."""
+    masked = text
+    token_map: Dict[str, str] = {}
+    for idx, ph in enumerate(placeholders):
+        token = f"<<<PH_{idx}>>>"
+        masked = masked.replace(ph, token)
+        token_map[token] = ph
+    return masked, token_map
+
+
+def _restore_placeholders(text: str, token_map: Dict[str, str]) -> str:
+    restored = text
+    for token, ph in token_map.items():
+        restored = restored.replace(token, ph)
+    return restored
+
+
+def _tokens_intact(original_masked: str, rewritten: str, token_map: Dict[str, str]) -> bool:
+    for token in token_map:
+        if original_masked.count(token) != rewritten.count(token):
+            return False
+    return True
+
+
+def _placeholders_preserved(original_placeholders: Sequence[str], new_text: str) -> bool:
+    return set(original_placeholders) == set(_extract_placeholders(new_text))
+
+
+def _safe_rewrite_prompt(current: str, rewrite_fn) -> str:
+    """
+    Run rewrite_fn with placeholder masking. If placeholders are dropped/altered, fall back to original.
+    rewrite_fn receives the masked prompt and must return a string (masked or restored).
+    """
+    placeholders = _extract_placeholders(current)
+    if not placeholders:
+        try:
+            return rewrite_fn(current) or current
+        except Exception:
+            return current
+
+    masked, token_map = _mask_placeholders(current, placeholders)
+    try:
+        rewritten = rewrite_fn(masked) or masked
+    except Exception as exc:  # noqa: BLE001
+        try:
+            logger.warning("Prompt rewrite failed, keep original", extra={"error": str(exc)})
+        except Exception:
+            pass
+        return current
+
+    if not _tokens_intact(masked, rewritten, token_map):
+        try:
+            logger.warning(
+                "Prompt rewrite dropped/duplicated placeholders, keep original",
+                extra={"original": current[:200], "rewritten": rewritten[:200]},
+            )
+        except Exception:
+            pass
+        return current
+
+    restored = _restore_placeholders(rewritten, token_map)
+    if not _placeholders_preserved(placeholders, restored):
+        try:
+            logger.warning(
+                "Prompt rewrite altered placeholder set, keep original",
+                extra={"original": current[:200], "restored": restored[:200]},
+            )
+        except Exception:
+            pass
+        return current
+    return restored
+
+
 def _coerce_text(value: Any) -> str:
     """Convert arbitrary values (dict/list/objects) to a printable text string."""
     if value is None:
@@ -1079,38 +1184,40 @@ class _LlmRewriter:
     def rewrite(self, current: str, issues: Sequence[DetectedIssue], constraints: Sequence[str]) -> str:
         import requests
 
-        prompt_lines = [
-            "You are a prompt editor. Improve the prompt to address the following issues:",
-        ]
-        for it in issues:
-            prompt_lines.append(f"- {it.kind}: {it.message}")
-        if constraints:
-            prompt_lines.append("Ensure these constraints are included:")
-            for c in constraints:
-                prompt_lines.append(f"- {c}")
-        prompt_lines.append("Original prompt:")
-        prompt_lines.append(current)
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are a prompt editor. Improve the prompt."},
-                {"role": "user", "content": "\n".join(prompt_lines)},
-            ],
-            "stream": False,
-        }
-        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        try:
-            logger.info(
-                "调用 LLM 重写提示词",
-                extra={"model": self.model, "url": self.url, "has_api_key": bool(self.api_key)},
-            )
-        except Exception:
-            pass
-        resp = requests.post(self.url, json=payload, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        # Best-effort extraction
-        return _extract_llm_text_response(data) or current
+        def _do_rewrite(masked_prompt: str) -> str:
+            prompt_lines = [
+                "You are a prompt editor. Improve the prompt to address the following issues:",
+            ]
+            for it in issues:
+                prompt_lines.append(f"- {it.kind}: {it.message}")
+            if constraints:
+                prompt_lines.append("Ensure these constraints are included:")
+                for c in constraints:
+                    prompt_lines.append(f"- {c}")
+            prompt_lines.append("Original prompt:")
+            prompt_lines.append(masked_prompt)
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "You are a prompt editor. Improve the prompt."},
+                    {"role": "user", "content": "\n".join(prompt_lines)},
+                ],
+                "stream": False,
+            }
+            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            try:
+                logger.info(
+                    "调用 LLM 重写提示词",
+                    extra={"model": self.model, "url": self.url, "has_api_key": bool(self.api_key)},
+                )
+            except Exception:
+                pass
+            resp = requests.post(self.url, json=payload, headers=headers, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            return _extract_llm_text_response(data) or masked_prompt
+
+        return _safe_rewrite_prompt(current, _do_rewrite)
 
 
 class _LlmPromptJudge:
@@ -1183,25 +1290,29 @@ class _DspyRewriter:
     def rewrite(self, current: str, issues: Sequence[DetectedIssue], constraints: Sequence[str]) -> str:
         if not self.available:
             return current
-        # Minimal dspy-based rewrite: use LM to propose a revised prompt
-        lm = self._dspy.LM(  # type: ignore[attr-defined]
-            model=self.cfg.get("model"),
-            api_base=self.cfg.get("url"),
-            api_key=self.cfg.get("api_key"),
-        )
-        class RewriteSpec(self._dspy.Signature):  # type: ignore[attr-defined]
-            """Rewrite a prompt to address issues and constraints."""
 
-            issues: str
-            constraints: str
-            original_prompt: str
-            improved_prompt: str
+        def _do_rewrite(masked_prompt: str) -> str:
+            # Minimal dspy-based rewrite: use LM to propose a revised prompt
+            lm = self._dspy.LM(  # type: ignore[attr-defined]
+                model=self.cfg.get("model"),
+                api_base=self.cfg.get("url"),
+                api_key=self.cfg.get("api_key"),
+            )
+            class RewriteSpec(self._dspy.Signature):  # type: ignore[attr-defined]
+                """Rewrite a prompt to address issues and constraints."""
 
-        chain = self._dspy.ChainOfThought(RewriteSpec, lm=lm)  # type: ignore[attr-defined]
-        issues_text = "; ".join(f"{it.kind}: {it.message}" for it in issues) or "none"
-        constraints_text = "; ".join(constraints) or "none"
-        res = chain(issues=issues_text, constraints=constraints_text, original_prompt=current)
-        return getattr(res, "improved_prompt", current) or current
+                issues: str
+                constraints: str
+                original_prompt: str
+                improved_prompt: str
+
+            chain = self._dspy.ChainOfThought(RewriteSpec, lm=lm)  # type: ignore[attr-defined]
+            issues_text = "; ".join(f"{it.kind}: {it.message}" for it in issues) or "none"
+            constraints_text = "; ".join(constraints) or "none"
+            res = chain(issues=issues_text, constraints=constraints_text, original_prompt=masked_prompt)
+            return getattr(res, "improved_prompt", masked_prompt) or masked_prompt
+
+        return _safe_rewrite_prompt(current, _do_rewrite)
 
 
 class _DspyPromptOptimizer:
@@ -1440,33 +1551,18 @@ class _DspyPromptOptimizer:
             if not failures:
                 break
             feedback_text = "\n".join(f"- {item}" for item in failures)
-            try:
+            def _do_rewrite(masked_prompt: str) -> str:
                 rewrite = rewriter(
-                    current_prompt=prompt_text,
+                    current_prompt=masked_prompt,
                     failures=feedback_text,
                     constraints="\n".join(constraints) if constraints else "None",
                 )
-                prompt_text = getattr(rewrite, "optimized_prompt", "") or prompt_text
-            except Exception as exc:  # noqa: BLE001
-                fallback_prompt = _extract_lm_response_from_exception(exc)
-                if fallback_prompt:
-                    prompt_text = fallback_prompt
-                    try:
-                        logger.debug(
-                            "DSPy rewriter 解析失败，使用回退提示词",
-                            extra={"fallback_preview": fallback_prompt[:200]},
-                        )
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        logger.warning(
-                            "DSPy rewriter 执行失败，保持原提示词",
-                            extra={"error": str(exc)},
-                        )
-                    except Exception:
-                        pass
-                    break
+                return getattr(rewrite, "optimized_prompt", "") or masked_prompt
+
+            new_prompt = _safe_rewrite_prompt(prompt_text, _do_rewrite)
+            if new_prompt == prompt_text:
+                break
+            prompt_text = new_prompt
         return prompt_text
 
     def _build_lm(self):
