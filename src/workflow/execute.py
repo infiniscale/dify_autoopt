@@ -12,6 +12,8 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 
 import requests
 
@@ -351,43 +353,67 @@ def execute_workflow_v1(
         },
     )
 
-    results: List[Dict[str, Any]] = []
-    persisted_files: List[Path] = []
-    for idx, row in enumerate(rows, start=1):
-        prepared_inputs = _prepare_inputs_with_files(
-            row,
-            base_url=resolved_base,
-            api_key=api_key,
-            user=user,
-            timeout=timeout,
-            upload_path=upload_path,
-            declared_types=declared,
-        )
-        # Inject metadata for tracking/output if not already present
-        meta_fields: Dict[str, Any] = {}
-        if output_dir and "__output_dir" not in prepared_inputs:
-            meta_fields["__output_dir"] = str(Path(output_dir).resolve())
-        if "__workflow_id" not in prepared_inputs:
-            meta_fields["__workflow_id"] = app_id
-        if "__input_index" not in prepared_inputs:
-            meta_fields["__input_index"] = idx
-        prepared_inputs.update(meta_fields)
-        logger.debug("Executing workflow row", extra={"index": idx, "keys": list(prepared_inputs.keys())})
-        run_result = _run_workflow_once(
-            app_id,
-            prepared_inputs,
-            base_url=resolved_base,
-            api_key=api_key,
-            user=user,
-            timeout=timeout,
-            response_mode=response_mode,
-            run_path=run_path,
-        )
-        results.append(run_result)
-        if persist_results and output_dir:
-            _persist_result(run_result, output_dir, app_id, idx, prepared_inputs)
-            persisted_files.append(_persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs))
+    workflow_cm = _get_concurrency_manager("workflow")
+    workflow_limit = workflow_cm.limit if workflow_cm else 1
 
+    def _execute_row(idx: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any], List[Path]]:
+        with (workflow_cm.slot() if workflow_cm else nullcontext()):
+            prepared_inputs = _prepare_inputs_with_files(
+                row,
+                base_url=resolved_base,
+                api_key=api_key,
+                user=user,
+                timeout=timeout,
+                upload_path=upload_path,
+                declared_types=declared,
+            )
+            # Inject metadata for tracking/output if not already present
+            meta_fields: Dict[str, Any] = {}
+            if output_dir and "__output_dir" not in prepared_inputs:
+                meta_fields["__output_dir"] = str(Path(output_dir).resolve())
+            if "__workflow_id" not in prepared_inputs:
+                meta_fields["__workflow_id"] = app_id
+            if "__input_index" not in prepared_inputs:
+                meta_fields["__input_index"] = idx
+            prepared_inputs.update(meta_fields)
+            logger.debug("Executing workflow row", extra={"index": idx, "keys": list(prepared_inputs.keys())})
+            run_result = _run_workflow_once(
+                app_id,
+                prepared_inputs,
+                base_url=resolved_base,
+                api_key=api_key,
+                user=user,
+                timeout=timeout,
+                response_mode=response_mode,
+                run_path=run_path,
+            )
+            persisted: List[Path] = []
+            if persist_results and output_dir:
+                _persist_result(run_result, output_dir, app_id, idx, prepared_inputs)
+                persisted.append(_persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs))
+            return idx, run_result, persisted
+
+    results: List[Optional[Dict[str, Any]]] = [None] * len(rows)
+    persisted_files: List[Path] = []
+
+    if len(rows) > 1 and workflow_limit > 1:
+        max_workers = min(len(rows), workflow_limit)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(_execute_row, idx, row): idx
+                for idx, row in enumerate(rows, start=1)
+            }
+            for future in as_completed(future_map):
+                idx, run_result, persisted = future.result()
+                results[idx - 1] = run_result
+                persisted_files.extend(persisted)
+    else:
+        for idx, row in enumerate(rows, start=1):
+            _, run_result, persisted = _execute_row(idx, row)
+            results[idx - 1] = run_result
+            persisted_files.extend(persisted)
+
+    results = [r for r in results if r is not None]
     logger.info("Workflow execution finished", extra={"runs": len(results)})
     if persist_results and output_dir:
         try:
@@ -461,3 +487,18 @@ def execute_workflow_from_config(
         output_dir=output_dir,
         persist_results=persist_results and bool(output_dir),
     )
+
+
+def _get_concurrency_manager(name: str):
+    """Return concurrency manager by name ('workflow'|'optimizer') if runtime is initialized."""
+    try:
+        from src.config.bootstrap import get_runtime
+
+        rt = get_runtime()
+        cm = getattr(rt, f"{name}_concurrency", None)
+        if cm:
+            return cm
+        conc_map = getattr(rt, "concurrency", None) or {}
+        return conc_map.get(name)
+    except Exception:
+        return None

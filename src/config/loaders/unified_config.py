@@ -238,6 +238,12 @@ class UnifiedConfigLoader:
         if retry is not None and (not isinstance(retry, int) or retry < 0):
             warnings.append("execution.retry_count should be integer >= 0")
 
+        # optimization optional concurrency
+        opt_cfg = app.optimization or {}
+        opt_conc = opt_cfg.get("concurrency")
+        if opt_conc is not None and (not isinstance(opt_conc, int) or opt_conc <= 0):
+            warnings.append("optimization.concurrency should be positive integer when set")
+
         # optimization strategy
         opt = app.optimization or {}
         strat = opt.get("strategy")
