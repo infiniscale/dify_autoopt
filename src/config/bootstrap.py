@@ -10,16 +10,18 @@ Responsibilities:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .loaders.unified_config import UnifiedConfigLoader, AppConfig
+from src.execution import ConcurrencyManager
 
 
 @dataclass
 class AppRuntime:
     app: AppConfig
+    concurrency: Dict[str, ConcurrencyManager] = field(default_factory=dict)
 
     @property
     def dify_base_url(self) -> Optional[str]:
@@ -41,6 +43,14 @@ class AppRuntime:
     @property
     def workflows_count(self) -> int:
         return len(self.app.workflows or [])
+
+    @property
+    def workflow_concurrency(self) -> Optional[ConcurrencyManager]:
+        return (self.concurrency or {}).get("workflow")
+
+    @property
+    def optimizer_concurrency(self) -> Optional[ConcurrencyManager]:
+        return (self.concurrency or {}).get("optimizer")
 
 
 _runtime: Optional[AppRuntime] = None
@@ -100,11 +110,47 @@ def bootstrap_from_unified(path: Path | str) -> AppRuntime:
     except Exception:
         pass
 
+    cm_map = _build_concurrency_managers(app_cfg)
+
     global _runtime
-    _runtime = AppRuntime(app=app_cfg)
+    _runtime = AppRuntime(app=app_cfg, concurrency=cm_map)
     try:
         from src.utils.logger import get_logger
         get_logger("config.bootstrap").debug("runtime initialized")
     except Exception:
         pass
     return _runtime
+
+
+def _build_concurrency_managers(app_cfg: AppConfig) -> Dict[str, ConcurrencyManager]:
+    """Create independent concurrency pools for workflow execution and optimizer."""
+
+    def _sanitize(value: Any, default: int) -> int:
+        try:
+            iv = int(value)
+            return iv if iv > 0 else default
+        except Exception:
+            return default
+
+    exec_cfg = app_cfg.execution or {}
+    opt_cfg = app_cfg.optimization or {}
+    workflow_limit = _sanitize(exec_cfg.get("concurrency"), default=1)
+    optimizer_limit = _sanitize(opt_cfg.get("concurrency"), default=workflow_limit)
+
+    try:
+        from src.utils.logger import get_logger
+
+        get_logger("config.bootstrap").debug(
+            "Initialized concurrency managers",
+            extra={
+                "workflow_limit": workflow_limit,
+                "optimizer_limit": optimizer_limit,
+            },
+        )
+    except Exception:
+        pass
+
+    return {
+        "workflow": ConcurrencyManager(workflow_limit),
+        "optimizer": ConcurrencyManager(optimizer_limit),
+    }
