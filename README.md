@@ -96,7 +96,20 @@ cd dify_autoopt
 pip install -r requirements.txt
 
 # 配置环境变量
-cp .env.example .env
+cp .env.example .env   # 复制后填写真实账号/密钥
+```
+
+.env.example 的作用与填法：
+- 复制为 `.env` 后，补齐你的 Dify 控制台账号密码或 Token，例如：
+  ```
+  DIFY_USERNAME=your_email@example.com
+  DIFY_PASSWORD=your_password
+  # 或：DIFY_API_TOKEN=app-xxxxxx
+  # 工作流运行用的 API Key 也可以放这里
+  WF1_API_KEY=app-xxxxxx
+  WF2_API_KEY=app-yyyyyy
+  ```
+- 启动时自动加载 `.env`，把 `${...}` 占位符注入到 `config/config.yaml`，避免在 YAML 中写明文。
 ```
 
 ### 2. 配置设置（单一配置文件）
@@ -227,6 +240,21 @@ python main.py --mode test --report report.json
 - 未设置 `--config` 时自动尝试 `config/config.yaml`；如不存在则使用内置默认配置（会在日志中提示）。
 - `.env` 会在启动前自动加载（如未安装 `python-dotenv`，则忽略）。
 - 日志配置优先从 `config/config.yaml` 的 `logging` 块读取。
+
+### main.py 使用手册（参数）
+- `--mode`：`run`（仅执行工作流，不做优化）、`opt`（使用已有运行结果做优化）、`all`（先执行工作流再做优化）、`test`（示例/回归）。
+- `--config`：配置文件路径（默认 `config/config.yaml`）。
+- `--report`：测试模式输出报告 JSON 路径。
+- `--set a.b.c=value`：启动时覆盖配置字段（可多次传入）。
+
+示例：
+```bash
+# 全流程：运行 workflows + 提示词优化（需配置好 .env 和 config/config.yaml）
+python main.py --mode all --config config/config.yaml
+
+# 仅优化：使用已存在的 outputs/*/runs 下的运行结果，生成补丁
+python main.py --mode opt --config config/config.yaml
+```
 
 ## 单元测试
 
