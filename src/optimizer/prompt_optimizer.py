@@ -19,11 +19,13 @@ import json as _json
 
 import yaml
 
+
 from src.optimizer.yaml_loader import load_workflow_yaml
 from src.utils.logger import get_logger
 from src.workflow.export import _safe_dirname_from_id
 
 logger = get_logger("optimizer.prompt_optimizer")
+DEFAULT_DSPY_MAX_TOKENS = 4096
 
 
 # --------------------------------------------------------------------------- #
@@ -117,6 +119,36 @@ def _extract_output_text(run: Dict[str, Any]) -> str:
     return str(run)
 
 
+def _extract_workflow_input(run: Dict[str, Any]) -> str:
+    """Best-effort extraction of workflow input/context for DSPy optimizer."""
+    if not isinstance(run, dict):
+        return str(run)
+
+    def _stringify(value: Any) -> str:
+        if isinstance(value, (dict, list)):
+            try:
+                return json.dumps(value, ensure_ascii=False)
+            except Exception:
+                return str(value)
+        return str(value)
+
+    candidates = []
+    for key in ("input", "inputs", "workflow_input", "payload"):
+        if key in run and run[key]:
+            candidates.append(_stringify(run[key]))
+    data = run.get("data")
+    if isinstance(data, dict):
+        for key in ("input", "inputs", "request"):
+            if key in data and data[key]:
+                candidates.append(_stringify(data[key]))
+    if candidates:
+        return "\n".join(candidates)
+    try:
+        return json.dumps(run, ensure_ascii=False)
+    except Exception:
+        return str(run)
+
+
 def _status_from_run(run: Dict[str, Any]) -> str:
     """Infer a coarse status string from a run payload."""
     if not isinstance(run, dict):
@@ -180,21 +212,22 @@ def _load_reference_spec(path: Optional[str | Path]) -> ReferenceSpec:
     )
 
 
-def _extract_graph(tree: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract graph section from either root.graph or root.workflow.graph."""
+def _extract_graph(tree: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """Extract graph section and its pointer prefix (e.g., /graph or /workflow/graph)."""
+    default: Tuple[Dict[str, Any], str] = ({}, "/graph")
     if not isinstance(tree, dict):
-        return {}
+        return default
     if isinstance(tree.get("graph"), dict):
-        return tree.get("graph") or {}
+        return (tree.get("graph") or {}, "/graph")
     workflow = tree.get("workflow")
     if isinstance(workflow, dict) and isinstance(workflow.get("graph"), dict):
-        return workflow.get("graph") or {}
-    return {}
+        return (workflow.get("graph") or {}, "/workflow/graph")
+    return default
 
 
 def _iter_llm_prompts(workflow_yaml: Dict[str, Any]) -> Iterable[PromptLocation]:
     """Yield prompt locations for LLM nodes in a Dify workflow DSL."""
-    graph = _extract_graph(workflow_yaml or {})
+    graph, graph_pointer = _extract_graph(workflow_yaml or {})
     buckets = []
     if "nodes" in graph:
         buckets.append(("nodes", graph.get("nodes") or []))
@@ -262,7 +295,7 @@ def _iter_llm_prompts(workflow_yaml: Dict[str, Any]) -> Iterable[PromptLocation]
                         continue
                     # pointer path reflects underlying structure
                     sub_path = "messages" if isinstance(prompt_template, dict) else ""
-                    path = f"/graph/{bucket_name}/{idx}/data/prompt_template/{sub_path + '/' if sub_path else ''}{mi}/text"
+                    path = f"{graph_pointer}/{bucket_name}/{idx}/data/prompt_template/{sub_path + '/' if sub_path else ''}{mi}/text"
                     try:
                         logger.debug(
                             "LLM prompt匹配",
@@ -281,17 +314,12 @@ def _iter_llm_prompts(workflow_yaml: Dict[str, Any]) -> Iterable[PromptLocation]
                     pass
             # Some DSLs may have system_prompt fields
             if "system_prompt" in data:
-                path = f"/graph/{bucket_name}/{idx}/data/system_prompt"
+                path = f"{graph_pointer}/{bucket_name}/{idx}/data/system_prompt"
                 yield PromptLocation(node_id=node_id, path=path, text=str(data["system_prompt"]))
 
 
 def _similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a or "", b or "").ratio()
-
-
-# --------------------------------------------------------------------------- #
-# Core pipeline
-# --------------------------------------------------------------------------- #
 
 
 class PromptDeltaDetector:
@@ -345,7 +373,7 @@ class PromptDeltaDetector:
                     if constraint and constraint.lower() not in sample.output_text.lower():
                         missing_runs[constraint].append(sample.index)
             for constraint, run_ids in missing_runs.items():
-                if len(run_ids) == len(samples):  # all missing -> strong signal
+                if len(run_ids) == len(samples):
                     issues.append(
                         DetectedIssue(
                             kind="constraint_missing",
@@ -355,7 +383,6 @@ class PromptDeltaDetector:
                         )
                     )
 
-        # Latency guard
         if self.reference.max_latency_seconds is not None:
             slow_runs = [
                 s.index
@@ -376,97 +403,6 @@ class PromptDeltaDetector:
                 )
 
         return issues
-
-
-class RuleBasedPatchGenerator:
-    """Generate simple prompt patches to address detected issues."""
-
-    def __init__(self, constraints: Sequence[str]) -> None:
-        self.constraints = list(constraints)
-
-    def generate(self, workflow_id: str, issues: Sequence[DetectedIssue], prompts: Sequence[PromptLocation]) -> List[PromptPatch]:
-        patches: List[PromptPatch] = []
-        if not issues or not prompts:
-            try:
-                logger.info(
-                    "未生成补丁，可能原因：无 issue 或未找到 LLM prompt",
-                    extra={
-                        "issues": len(issues),
-                        "prompts": len(prompts),
-                        "workflow_id": workflow_id,
-                        "prompt_samples": [p.text[:120] for p in prompts[:3]],
-                    },
-                )
-            except Exception:
-                pass
-            return patches
-
-        for prompt in prompts:
-            appended_segments: List[str] = []
-            rationales: List[str] = []
-            confidence = 0.55
-
-            for issue in issues:
-                if issue.kind == "constraint_missing":
-                    # add explicit constraint reminder
-                    for constraint in self.constraints:
-                        appended_segments.append(f"Ensure the response includes: {constraint}.")
-                    rationales.append("Enforce missing constraints in output.")
-                    confidence = max(confidence, 0.7)
-                elif issue.kind == "low_similarity":
-                    appended_segments.append("Align responses closely with the reference answer and avoid deviations.")
-                    rationales.append("Outputs diverge from reference expectation.")
-                    confidence = max(confidence, 0.65)
-                elif issue.kind == "high_failure_rate":
-                    appended_segments.append("Ensure robustness and handle edge cases explicitly.")
-                    rationales.append("Observed high failure rate across runs.")
-                    confidence = max(confidence, 0.6)
-                elif issue.kind == "latency_exceeded":
-                    appended_segments.append("Prioritize concise responses to reduce latency.")
-                    rationales.append("Response latency above target.")
-                    confidence = max(confidence, 0.6)
-                elif issue.kind == "llm_output_mismatch":
-                    appended_segments.append("Ensure the response aligns with the reference answer and satisfies listed constraints.")
-                    # Pull missing/incorrect hints if present in message
-                    hints = ""
-                    if "missing_items=" in issue.message or "incorrect_items=" in issue.message:
-                        hints = issue.message
-                    rationales.append("LLM judge flagged mismatch against reference/constraints." + (f" Details: {hints}" if hints else ""))
-                    confidence = max(confidence, 0.7)
-                    # Add checklist guidance
-                    appended_segments.append("Use a checklist: cover all must-have items from reference, fix incorrect interpretations, and respect required format if specified.")
-                else:
-                    rationales.append(f"Address issue: {issue.kind}")
-                    confidence = max(confidence, 0.55)
-
-            if not appended_segments:
-                continue
-
-            # dedupe while preserving order
-            seen = set()
-            unique_segments = []
-            for seg in appended_segments:
-                if seg in seen:
-                    continue
-                seen.add(seg)
-                unique_segments.append(seg)
-
-            new_text_parts = [prompt.text.strip(), ""]
-            new_text_parts.extend(f"- {seg}" for seg in unique_segments)
-            new_prompt = "\n".join(new_text_parts).strip()
-            patches.append(
-                PromptPatch(
-                    workflow_id=workflow_id,
-                    node_id=prompt.node_id,
-                    field_path=prompt.path,
-                    old=prompt.text,
-                    new=new_prompt,
-                    rationale="; ".join(rationales) or "Improve prompt robustness",
-                    confidence=round(confidence, 2),
-                    evidence_runs=sorted({rid for issue in issues for rid in issue.evidence_runs}),
-                )
-            )
-        return patches
 
 
 # --------------------------------------------------------------------------- #
@@ -569,8 +505,35 @@ class PromptOptimizer:
             if needs:
                 filtered_prompts.append(prompt)
 
-        generator = RuleBasedPatchGenerator(reference.constraints)
-        patches = generator.generate(workflow_id, issues, filtered_prompts)
+        patches: List[PromptPatch] = []
+        use_dspy = self.llm_config.get("use_dspy_optimizer", True)
+        if use_dspy:
+            dspy_optimizer = _DspyPromptOptimizer(self.llm_config)
+            try:
+                patches = dspy_optimizer.optimize_prompts(
+                    workflow_id,
+                    filtered_prompts,
+                    samples,
+                    reference_texts or [],
+                    reference.constraints,
+                )
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    logger.exception(
+                        "DSPy 提示词优化失败",
+                        extra={"workflow_id": workflow_id, "error": str(exc)},
+                    )
+                except Exception:
+                    pass
+                raise
+        else:
+            try:
+                logger.warning(
+                    "已禁用 DSPy 优化器，提示词保持不变",
+                    extra={"workflow_id": workflow_id},
+                )
+            except Exception:
+                pass
 
         rewriter = None
         enable_rewrite = self.llm_config.get("enable_prompt_rewrite", True)
@@ -1021,6 +984,65 @@ def _ensure_llm_available(cfg: Dict[str, Any]) -> None:
     raise RuntimeError(f"LLM endpoint 校验失败: {'; '.join(errors)}")
 
 
+def _adapt_dspy_api_base(url: Optional[str]) -> Optional[str]:
+    """
+    DSPy expects an api_base without the '/chat/completions' suffix that OpenAI-compatible
+    endpoints often expose. Other components still need the full URL, so we normalize only
+    for the DSPy LM constructor.
+    """
+    if not url:
+        return url
+    trimmed = str(url).strip()
+    if not trimmed:
+        return None
+    trimmed = trimmed.rstrip("/")
+    lowered = trimmed.lower()
+    for suffix in ("/chat/completions", "/completions"):
+        if lowered.endswith(suffix):
+            return trimmed[: -len(suffix)]
+    return trimmed
+
+
+def _coerce_text(value: Any) -> str:
+    """Convert arbitrary values (dict/list/objects) to a printable text string."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        pass
+    try:
+        return str(value)
+    except Exception:
+        return ""
+
+
+def _extract_lm_response_from_exception(exc: Exception) -> Optional[str]:
+    """
+    Try to recover the raw LM response from DSPy AdapterParseError text so that we can fall back
+    to heuristic processing instead of failing the entire optimization run.
+    """
+    # dspy.utils.exceptions.AdapterParseError exposes .lm_response in recent versions
+    response = getattr(exc, "lm_response", None)
+    if response:
+        return _coerce_text(response)
+    text = str(exc)
+    marker = "LM Response:"
+    if marker not in text:
+        return None
+    remainder = text.split(marker, 1)[1]
+    for stop in ("\nExpected to find", "\nActual output", "\nDuring handling"):
+        idx = remainder.find(stop)
+        if idx != -1:
+            remainder = remainder[:idx]
+            break
+    extracted = remainder.strip()
+    return extracted or None
+
+
 def _extract_llm_text_response(data: Dict[str, Any]) -> str:
     """
     Best-effort extraction of text content from an LLM response.
@@ -1150,6 +1172,7 @@ class _DspyRewriter:
     def __init__(self, cfg: Dict[str, Any]) -> None:
         try:
             import dspy  # type: ignore
+            from dspy.adapters import ChatAdapter  # 根据你安装的版本稍微调整
 
             self._dspy = dspy
         except Exception:
@@ -1179,3 +1202,365 @@ class _DspyRewriter:
         constraints_text = "; ".join(constraints) or "none"
         res = chain(issues=issues_text, constraints=constraints_text, original_prompt=current)
         return getattr(res, "improved_prompt", current) or current
+
+
+class _DspyPromptOptimizer:
+    """DSPy-based prompt optimizer that loops Predictor -> Judge -> Prompt update."""
+
+    def __init__(self, cfg: Dict[str, Any]) -> None:
+        self.cfg = cfg
+        self.available = False
+        self.max_iterations = int(cfg.get("dspy_optimizer_iterations", 2))
+        self.max_samples = int(cfg.get("dspy_optimizer_max_samples", 4))
+        self.max_tokens = int(cfg.get("dspy_optimizer_max_tokens", DEFAULT_DSPY_MAX_TOKENS))
+        self._lm = None
+        url = cfg.get("url")
+        model = cfg.get("model")
+        if not url or not model:
+            try:
+                logger.info(
+                    "DSPy 优化器缺少 LLM url 或 model，无法启用",
+                    extra={"workflow_llm_url": url, "workflow_llm_model": model},
+                )
+            except Exception:
+                pass
+            return
+        try:
+            import dspy  # type: ignore
+
+            self._dspy = dspy
+        except Exception:
+            self._dspy = None
+            try:
+                logger.warning(
+                    "DSPy 库未安装或导入失败，无法启用优化器",
+                    extra={"workflow_llm_model": model},
+                )
+            except Exception:
+                pass
+            return
+        self.available = self._dspy is not None
+        if not self.available:
+            return
+        try:
+            self._lm = self._build_lm()
+            # 配置为全局 LM，满足 DSPy Predict/_forward_preprocess 的要求
+            # self._dspy.configure(lm=self._lm, adapter=ChatAdapter())  # type: ignore[attr-defined]
+            # self._dspy.settings.configure(lm=self._lm, adapter=ChatAdapter(),)
+            self._dspy.configure(lm=self._lm)  # type: ignore[attr-defined]
+            logger.info(
+                "DSPy LM 已配置",
+                extra={
+                    "workflow_llm_model": model,
+                    "api_base": url,
+                    "max_tokens": self.max_tokens,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                logger.warning(
+                    "DSPy LM 创建或配置失败，将无法进行提示词优化",
+                    extra={"error": str(exc), "workflow_llm_model": model},
+                )
+            except Exception:
+                pass
+            self.available = False
+            return
+        try:
+            logger.info(
+                "DSPy 优化器已启用",
+                extra={
+                    "workflow_llm_url": url,
+                    "workflow_llm_model": model,
+                    "iterations": self.max_iterations,
+                    "max_samples": self.max_samples,
+                },
+            )
+        except Exception:
+            pass
+
+    def optimize_prompts(
+        self,
+        workflow_id: str,
+        prompts: Sequence[PromptLocation],
+        samples: Sequence[ExecutionSample],
+        reference_texts: Sequence[Optional[str]],
+        constraints: Sequence[str],
+    ) -> List[PromptPatch]:
+        if not self.available or not prompts:
+            return []
+        dataset = self._build_dataset(samples, reference_texts)
+        if not dataset:
+            return []
+        # lm = self._lm or self._build_lm()
+        # predictor = self._dspy.ChainOfThought(self._predict_signature(), lm=lm)  # type: ignore[attr-defined]
+        # judge = self._dspy.ChainOfThought(self._judge_signature(), lm=lm)  # type: ignore[attr-defined]
+        # rewriter = self._dspy.ChainOfThought(self._rewrite_signature(), lm=lm)  # type: ignore[attr-defined]
+        predictor = self._dspy.ChainOfThought(self._predict_signature())  # type: ignore[attr-defined]
+        judge = self._dspy.ChainOfThought(self._judge_signature())  # type: ignore[attr-defined]
+        rewriter = self._dspy.ChainOfThought(self._rewrite_signature())  # type: ignore[attr-defined]
+        patches: List[PromptPatch] = []
+        for prompt in prompts:
+            improved = self._optimize_single(prompt.text, dataset, constraints, predictor, judge, rewriter)
+            if not improved or improved.strip() == prompt.text.strip():
+                continue
+            try:
+                logger.info(
+                    "DSPy 优化完成 prompt",
+                    extra={
+                        "workflow_id": workflow_id,
+                        "node_id": prompt.node_id,
+                        "field_path": prompt.path,
+                    },
+                )
+            except Exception:
+                pass
+            patches.append(
+                PromptPatch(
+                    workflow_id=workflow_id,
+                    node_id=prompt.node_id,
+                    field_path=prompt.path,
+                    old=prompt.text,
+                    new=improved,
+                    rationale="DSPy optimizer updated prompt based on reference feedback",
+                    confidence=0.75,
+                    evidence_runs=[record["run_index"] for record in dataset],
+                )
+            )
+        return patches
+
+    def _build_dataset(
+        self,
+        samples: Sequence[ExecutionSample],
+        reference_texts: Sequence[Optional[str]],
+    ) -> List[Dict[str, Any]]:
+        dataset: List[Dict[str, Any]] = []
+        for idx, sample in enumerate(samples):
+            ref = ""
+            if reference_texts and idx < len(reference_texts):
+                ref = reference_texts[idx] or ""
+            if not ref:
+                ref = sample.output_text or ""
+            if not ref:
+                continue
+            dataset.append(
+                {
+                    "workflow_input": _extract_workflow_input(sample.raw),
+                    "reference": ref,
+                    "run_index": sample.index,
+                }
+            )
+            if len(dataset) >= self.max_samples:
+                break
+        try:
+            logger.debug(
+                "DSPy 构建训练样本",
+                extra={"sample_count": len(dataset), "max_samples": self.max_samples},
+            )
+        except Exception:
+            pass
+        return dataset
+
+    def _optimize_single(
+        self,
+        current_prompt: str,
+        dataset: Sequence[Dict[str, Any]],
+        constraints: Sequence[str],
+        predictor,
+        judge,
+        rewriter,
+    ) -> str:
+        prompt_text = current_prompt
+        for _ in range(max(1, self.max_iterations)):
+            failures: List[str] = []
+            for record in dataset:
+                candidate = ""
+                try:
+                    prediction = predictor(
+                        workflow_input=record["workflow_input"],
+                        prompt_template=prompt_text,
+                    )
+                    candidate = self._extract_prediction_output(prediction)
+                except Exception as exc:  # noqa: BLE001
+                    fallback = _extract_lm_response_from_exception(exc)
+                    if fallback:
+                        candidate = fallback
+                        try:
+                            logger.debug(
+                                "DSPy predictor解析失败，使用原始 LM 响应回退",
+                                extra={
+                                    "workflow_input": record["workflow_input"][:200],
+                                    "fallback_preview": candidate[:200],
+                                },
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            logger.warning(
+                                "DSPy predictor 执行失败",
+                                extra={
+                                    "workflow_input": record["workflow_input"][:200],
+                                    "error": str(exc),
+                                },
+                            )
+                        except Exception:
+                            pass
+                        failures.append(f"DSPy predictor failed: {exc}")
+                        continue
+                if not candidate.strip():
+                    failures.append("DSPy predictor returned empty response")
+                    continue
+                try:
+                    verdict = judge(
+                        reference=record["reference"],
+                        candidate=candidate,
+                    )
+                    verdict_raw = getattr(verdict, "verdict", None)
+                    verdict_text = (verdict_raw or "").lower()
+                    feedback = getattr(verdict, "feedback", "") or ""
+                except Exception as exc:  # noqa: BLE001
+                    fallback_feedback = _extract_lm_response_from_exception(exc)
+                    detail = fallback_feedback or str(exc)
+                    try:
+                        logger.warning(
+                            "DSPy judge 执行失败，记为不通过",
+                            extra={
+                                "workflow_input": record["workflow_input"][:200],
+                                "error": str(exc),
+                                "fallback": detail[:200],
+                            },
+                        )
+                    except Exception:
+                        pass
+                    failures.append(f"DSPy judge failed: {detail}")
+                    continue
+                if "fail" in verdict_text or not verdict_text:
+                    failures.append(feedback or f"Mismatch against reference:\n{record['reference'][:400]}")
+            if not failures:
+                break
+            feedback_text = "\n".join(f"- {item}" for item in failures)
+            try:
+                rewrite = rewriter(
+                    current_prompt=prompt_text,
+                    failures=feedback_text,
+                    constraints="\n".join(constraints) if constraints else "None",
+                )
+                prompt_text = getattr(rewrite, "optimized_prompt", "") or prompt_text
+            except Exception as exc:  # noqa: BLE001
+                fallback_prompt = _extract_lm_response_from_exception(exc)
+                if fallback_prompt:
+                    prompt_text = fallback_prompt
+                    try:
+                        logger.debug(
+                            "DSPy rewriter 解析失败，使用回退提示词",
+                            extra={"fallback_preview": fallback_prompt[:200]},
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        logger.warning(
+                            "DSPy rewriter 执行失败，保持原提示词",
+                            extra={"error": str(exc)},
+                        )
+                    except Exception:
+                        pass
+                    break
+        return prompt_text
+
+    def _build_lm(self):
+        raw_model = str(self.cfg.get("dspy_model") or self.cfg.get("model"))
+        qualified_model = raw_model
+        provider = self.cfg.get("dspy_provider") or self.cfg.get("llm_provider")
+        if not provider:
+            base = str(self.cfg.get("url") or "")
+            if "/v1" in base:
+                provider = "openai"
+        if provider and "/" not in qualified_model:
+            qualified_model = f"{provider}/{qualified_model}"
+        api_base = _adapt_dspy_api_base(self.cfg.get("url"))
+
+        def _create_lm():
+            return self._dspy.LM(  # type: ignore[attr-defined]
+                model=qualified_model,
+                api_base=api_base,
+                api_key=self.cfg.get("api_key"),
+                max_tokens=self.max_tokens,
+                model_alias_map={qualified_model: raw_model} if qualified_model != raw_model else None,
+            )
+
+        try:
+            logger.debug(
+                "DSPy 构建 LM",
+                extra={
+                    "qualified_model": qualified_model,
+                    "provider": provider,
+                    "api_base": api_base,
+                    "raw_url": self.cfg.get("url"),
+                },
+            )
+            return _create_lm()
+        except Exception as exc:
+            try:
+                logger.error(
+                    "DSPy 构建 LM 失败",
+                    extra={
+                        "qualified_model": qualified_model,
+                        "provider": provider,
+                        "api_base": api_base,
+                        "raw_url": self.cfg.get("url"),
+                        "error": str(exc),
+                    },
+                )
+            except Exception:
+                pass
+            raise
+
+    def _predict_signature(self):
+        dspy = self._dspy
+
+        class WorkflowPredictor(dspy.Signature):  # type: ignore[attr-defined]
+            """Simulate workflow output for a prompt template."""
+
+            workflow_input = dspy.InputField(desc="Serialized workflow input for this node")  # type: ignore[attr-defined]
+            prompt_template = dspy.InputField(desc="Prompt text to be optimized")  # type: ignore[attr-defined]
+            response_json = dspy.OutputField(desc="LLM response")  # type: ignore[attr-defined]
+            # response_json = dspy.OutputField(desc="LLM response in json format")  # type: ignore[attr-defined]
+
+        return WorkflowPredictor
+
+    def _judge_signature(self):
+        dspy = self._dspy
+
+        class JudgeSignature(dspy.Signature):  # type: ignore[attr-defined]
+            """Compare candidate output with reference JSON."""
+
+            reference = dspy.InputField(desc="Reference JSON text")  # type: ignore[attr-defined]
+            candidate = dspy.InputField(desc="Candidate JSON output")  # type: ignore[attr-defined]
+            verdict = dspy.OutputField(desc="Judge verdict pass/fail")  # type: ignore[attr-defined]
+            feedback = dspy.OutputField(desc="Feedback for failures")  # type: ignore[attr-defined]
+
+        return JudgeSignature
+
+    def _rewrite_signature(self):
+        dspy = self._dspy
+
+        class RewriteSignature(dspy.Signature):  # type: ignore[attr-defined]
+            """Rewrite prompt using judge feedback and constraints."""
+
+            current_prompt = dspy.InputField(desc="Original prompt text")  # type: ignore[attr-defined]
+            failures = dspy.InputField(desc="Judge feedback details")  # type: ignore[attr-defined]
+            constraints = dspy.InputField(desc="Constraints checklist")  # type: ignore[attr-defined]
+            optimized_prompt = dspy.OutputField(desc="Improved prompt text")  # type: ignore[attr-defined]
+
+        return RewriteSignature
+
+    def _extract_prediction_output(self, prediction: Any) -> str:
+        fields = ("response_json", "response", "output", "text")
+        for name in fields:
+            value = getattr(prediction, name, None)
+            text = _coerce_text(value)
+            if text:
+                return text
+        return _coerce_text(prediction)
