@@ -7,6 +7,7 @@ Stops on: no patches, target failure rate met, or max cycles reached.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -116,6 +117,45 @@ def _extract_app_id_from_import(resp: Dict[str, Any], fallback: str) -> str:
         if isinstance(data.get("app"), dict) and data["app"].get("id"):
             return str(data["app"]["id"])
     return fallback
+
+
+def _tag_yaml_name(yaml_path: str, suffix: str, logger) -> Tuple[str, Optional[str]]:
+    """
+    Load YAML and append suffix to the app/workflow name if possible.
+    Returns (yaml_content, new_name_if_changed).
+    """
+    content = Path(yaml_path).read_text(encoding="utf-8")
+    new_name: Optional[str] = None
+    try:
+        data = yaml.safe_load(content)
+        if not isinstance(data, dict):
+            return content, None
+
+        def _update_name(container: Dict[str, Any], key: str) -> bool:
+            if key in container and isinstance(container[key], str):
+                orig = container[key]
+                container[key] = f"{orig}-{suffix}"
+                return True
+            return False
+
+        updated = False
+        for key in ("name",):
+            updated = updated or _update_name(data, key)
+        if not updated and isinstance(data.get("app"), dict):
+            updated = updated or _update_name(data["app"], "name")
+        if not updated and isinstance(data.get("workflow"), dict):
+            updated = updated or _update_name(data["workflow"], "name")
+
+        if updated:
+            new_name = data.get("name")
+            content = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+            try:
+                logger.info("已为导入的 YAML 添加后缀", extra={"suffix": suffix, "new_name": new_name})
+            except Exception:
+                pass
+    except Exception:
+        return content, None
+    return content, new_name
 
 
 def _choose_api_key(keys: List[Dict[str, Any]], fallback: str) -> str:
@@ -283,8 +323,11 @@ def run_optimize_loop(
                 break
 
             # 4) 导入 / 发布 / 获取 API Key
+            # 4) 导入 / 发布 / 获取 API Key
+            tag = f"{datetime.now().strftime('%Y%m%d')}-c{cycle}"
+            yaml_content, tagged_name = _tag_yaml_name(report.patched_path, tag, logger)
             try:
-                import_resp = import_app_yaml(yaml_path=report.patched_path, base_url=base_url, token=token)
+                import_resp = import_app_yaml(yaml_content=yaml_content, base_url=base_url, token=token)
                 new_app_id = _extract_app_id_from_import(import_resp, current_app_id)
             except Exception as ex:  # noqa: BLE001
                 logger.warning(
