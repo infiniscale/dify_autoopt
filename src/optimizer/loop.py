@@ -204,6 +204,18 @@ def run_optimize_loop(
     if not base_url or not token:
         logger.warning("缺少 base_url 或 token，无法执行发布/导入流程", extra={"base_url": base_url, "has_token": bool(token)})
         return []
+    try:
+        logger.info(
+            "Loop 初始上下文",
+            extra={
+                "base_url": base_url,
+                "api_base": api_base,
+                "has_token": bool(token),
+                "workflows": len(workflows := rt.app.workflows or []),  # type: ignore
+            },
+        )
+    except Exception:
+        pass
 
     workflows = rt.app.workflows or []
     summaries: List[Dict[str, Any]] = []
@@ -222,7 +234,15 @@ def run_optimize_loop(
             exported = export_app_dsl(current_app_id, base_url=base_url, token=token, include_secret=False)
             current_yaml_path = str(exported)
         except Exception as ex:  # noqa: BLE001
-            logger.warning("导出 DSL 失败，跳过该工作流", extra={"workflow_id": current_app_id, "error": str(ex)})
+            logger.warning(
+                "导出 DSL 失败，跳过该工作流",
+                extra={
+                    "workflow_id": current_app_id,
+                    "error": str(ex),
+                    "base_url": base_url,
+                    "has_token": bool(token),
+                },
+            )
             continue
 
         for cycle in range(1, max_cycles + 1):
