@@ -324,6 +324,20 @@ def run_optimize_loop(
                 reference_path=ref_path,
             )
             summaries.append(asdict(cycle_result))
+            try:
+                logger.info(
+                    "自循环完成一轮",
+                    extra={
+                        "workflow_id": current_app_id,
+                        "cycle": cycle,
+                        "runs": len(run_results),
+                        "failure_rate": failure_rate,
+                        "patches": patches_count,
+                        "skip_ratio": report.stats.get("prompts_skip_ratio") if isinstance(report.stats, dict) else None,
+                    },
+                )
+            except Exception:
+                pass
 
             # 3) 退出条件
             stop_reason = None
