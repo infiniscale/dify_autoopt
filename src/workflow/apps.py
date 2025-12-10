@@ -37,6 +37,19 @@ def _resolve_token(passed_token: Optional[str]) -> Optional[str]:
     env_token = os.getenv("DIFY_API_TOKEN") or os.getenv("ACCESS_TOKEN")
     if env_token:
         return env_token.strip()
+    # Runtime auth api_key/access_token fallback (登录后可直接放在 config.auth.api_key/access_token)
+    try:
+        from src.config.bootstrap import get_runtime
+        rt = get_runtime()
+        auth_cfg = getattr(rt, "app", None)
+        auth_cfg = auth_cfg.auth if auth_cfg else None
+        if auth_cfg:
+            for key in ("api_key", "access_token"):
+                val = auth_cfg.get(key) if isinstance(auth_cfg, dict) else getattr(auth_cfg, key, None)
+                if val:
+                    return str(val).strip()
+    except Exception:
+        pass
     # Token store fallback
     try:
         from pathlib import Path
