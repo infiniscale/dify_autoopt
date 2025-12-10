@@ -70,6 +70,7 @@ def import_app_yaml(
                 "mode": body["mode"],
                 "token": _mask_token(resolved_token),
                 "yaml_length": len(content),
+                "yaml_path": str(yaml_path) if yaml_path else None,
             },
         )
     except Exception:
@@ -91,4 +92,3 @@ def import_app_yaml(
         pass
 
     return data
-
