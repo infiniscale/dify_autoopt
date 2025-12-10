@@ -198,6 +198,7 @@ def run_optimize_loop(
     if exit_ratio is not None and not (0 <= exit_ratio <= 1):
         exit_ratio = None
     base_url = _resolve_base_url(rt.dify_base_url)
+    api_base = getattr(rt, "dify_api_base", None) or base_url
     token = _resolve_token(None)
 
     if not base_url or not token:
@@ -231,7 +232,7 @@ def run_optimize_loop(
                 run_results = execute_workflow_v1(
                     current_app_id,
                     rows,
-                    base_url=rt.dify_base_url or base_url,
+                    base_url=api_base,
                     api_key=current_api_key,
                     timeout=exec_timeout,
                     input_types=declared_types,
@@ -323,12 +324,13 @@ def run_optimize_loop(
                 break
 
             # 4) 导入 / 发布 / 获取 API Key
-            # 4) 导入 / 发布 / 获取 API Key
             tag = f"{datetime.now().strftime('%Y%m%d')}-c{cycle}"
             yaml_content, tagged_name = _tag_yaml_name(report.patched_path, tag, logger)
             try:
                 import_resp = import_app_yaml(yaml_content=yaml_content, base_url=base_url, token=token)
                 new_app_id = _extract_app_id_from_import(import_resp, current_app_id)
+                if not new_app_id or new_app_id == current_app_id:
+                    raise RuntimeError("导入未产生新 app_id")
             except Exception as ex:  # noqa: BLE001
                 logger.warning(
                     "导入优化后的 DSL 失败，终止自循环",
@@ -346,7 +348,14 @@ def run_optimize_loop(
                 break
 
             new_keys = list_api_keys(base_url, new_app_id, token)
-            current_api_key = _choose_api_key(new_keys, current_api_key)
+            chosen_key = _choose_api_key(new_keys, "")
+            if not chosen_key:
+                logger.warning(
+                    "发布后的工作流未获取到有效 API Key，终止自循环",
+                    extra={"workflow_id": new_app_id, "cycle": cycle},
+                )
+                break
+            current_api_key = chosen_key
             current_app_id = new_app_id
             current_yaml_path = str(report.patched_path)
 
