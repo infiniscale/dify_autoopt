@@ -205,15 +205,22 @@ def run_optimize_loop(
         logger.warning("缺少 base_url 或 token，无法执行发布/导入流程", extra={"base_url": base_url, "has_token": bool(token)})
         return []
     try:
+        workflows_ctx = rt.app.workflows or []
         logger.info(
             "Loop 初始上下文",
             extra={
                 "base_url": base_url,
                 "api_base": api_base,
                 "has_token": bool(token),
-                "workflows": len(workflows := rt.app.workflows or []),  # type: ignore
+                "token_prefix": token[:4] + "****" if token and len(token) >= 8 else "<short/empty>",
+                "workflows": len(workflows_ctx),
             },
         )
+        # 简单校验 token 是否可用：拉一次 apps 列表
+        try:
+            list_all_apps(base_url=base_url, token=token, limit=1, max_pages=1)
+        except Exception as ex:
+            logger.warning("控制台 token 验证失败，后续导出/发布可能 401", extra={"error": str(ex)})
     except Exception:
         pass
 

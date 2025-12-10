@@ -40,7 +40,8 @@ def _resolve_token(passed_token: Optional[str]) -> Optional[str]:
     # Token store fallback
     try:
         from src.auth.token_opt import Token
-        return Token().get_access_token()
+        token = Token().get_access_token()
+        return token.strip() if token else None
     except Exception:
         return None
 
