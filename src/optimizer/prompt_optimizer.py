@@ -508,10 +508,15 @@ class PromptOptimizer:
         judge = _LlmPromptJudge(self.llm_config) if self.llm_config else None
         # Determine which prompts need change: if judge exists, use it; else default to "issues exist"
         filtered_prompts: List[PromptLocation] = []
+        total_prompts = len(prompts)
         for prompt in prompts:
             needs = True if not judge else judge.needs_change(prompt.text, issues, reference.constraints)
             if needs:
                 filtered_prompts.append(prompt)
+        judged_no_change = total_prompts - len(filtered_prompts)
+        prompts_skip_ratio = None
+        if judge and total_prompts > 0:
+            prompts_skip_ratio = judged_no_change / total_prompts
 
         patches: List[PromptPatch] = []
         use_dspy = self.llm_config.get("use_dspy_optimizer", True)
@@ -578,6 +583,10 @@ class PromptOptimizer:
                 "runs": len(samples),
                 "failures": len([s for s in samples if s.status not in {"success", "succeeded"}]),
                 "reference_texts": len([t for t in (reference_texts or []) if t]),
+                "prompts_total": total_prompts,
+                "prompts_need_change": len(filtered_prompts),
+                "prompts_no_change": judged_no_change,
+                "prompts_skip_ratio": prompts_skip_ratio,
                 **judge_stats,
             },
         )

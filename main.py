@@ -36,9 +36,9 @@ async def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--mode",
         "-m",
-        choices=["run", "opt", "all"],
+        choices=["run", "opt", "all", "loop"],
         default="run",
-        help="运行模式：run=仅执行工作流并保存结果；opt=基于已有运行结果生成优化建议；all=先执行后优化",
+        help="运行模式：run=仅执行工作流并保存结果；opt=基于已有运行结果生成优化建议；all=先执行后优化；loop=运行-优化-发布循环",
     )
     parser.add_argument(
         "--config",
@@ -55,6 +55,9 @@ async def main(argv: list[str] | None = None) -> int:
         default=[],
         help="覆盖配置项，格式: a.b.c=value，可重复（仅影响本次运行时）",
     )
+    parser.add_argument("--max-cycles", type=int, default=None, help="loop 模式：最大迭代轮数（默认取 optimization.max_iterations）")
+    parser.add_argument("--loop-no-patch", type=int, default=1, help="loop 模式：连续无补丁轮数达到此值则退出")
+    parser.add_argument("--target-failure-rate", type=float, default=None, help="loop 模式：当失败率不高于该值时退出")
     args = parser.parse_args(argv)
 
     # 0. 预加载 .env 环境变量
@@ -310,6 +313,37 @@ async def main(argv: list[str] | None = None) -> int:
         elif args.mode == "all":
             logger.info("进入全流程模式（先运行后优化）", extra={"mode": args.mode})
             await run_optimize_mode(run_workflows=True, optimize=True)
+        elif args.mode == "loop":
+            logger.info(
+                "进入循环优化模式（运行-优化-发布-再运行）",
+                extra={
+                    "mode": args.mode,
+                    "max_cycles": args.max_cycles,
+                    "no_patch_rounds": args.loop_no_patch,
+                    "target_failure_rate": args.target_failure_rate,
+                },
+            )
+            from src.optimizer import run_optimize_loop
+            from src.config.bootstrap import get_runtime
+
+            rt = get_runtime()
+            opt_cfg = (rt.app.optimization or {}) if rt and getattr(rt, "app", None) else {}
+            cfg_max_cycles = opt_cfg.get("max_iterations")
+            cfg_exit_ratio = opt_cfg.get("exit_ratio")
+
+            max_cycles = args.max_cycles if args.max_cycles is not None else (cfg_max_cycles if isinstance(cfg_max_cycles, int) and cfg_max_cycles > 0 else 3)
+            exit_ratio = cfg_exit_ratio if isinstance(cfg_exit_ratio, (int, float)) and 0 <= cfg_exit_ratio <= 1 else None
+
+            loop_summary = run_optimize_loop(
+                max_cycles=max_cycles,
+                allow_no_patch_rounds=args.loop_no_patch,
+                target_failure_rate=args.target_failure_rate,
+                exit_ratio=exit_ratio,
+            )
+            try:
+                logger.info("循环优化完成", extra={"summary": loop_summary[:5], "total_cycles": len(loop_summary)})
+            except Exception:
+                pass
 
         logger.info("Dify自动优化工具正常关闭", extra={"shutdown_time": datetime.now().isoformat(), "status": "graceful_shutdown"})
         return 0

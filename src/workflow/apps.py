@@ -39,8 +39,13 @@ def _resolve_token(passed_token: Optional[str]) -> Optional[str]:
         return env_token.strip()
     # Token store fallback
     try:
+        from pathlib import Path
+        cfg_path = Path("config/env_config.yaml")
+        if not cfg_path.exists():
+            return None
         from src.auth.token_opt import Token
-        return Token().get_access_token()
+        token = Token(config_path=str(cfg_path)).get_access_token()
+        return token.strip() if token else None
     except Exception:
         return None
 
