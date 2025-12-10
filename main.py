@@ -55,7 +55,7 @@ async def main(argv: list[str] | None = None) -> int:
         default=[],
         help="覆盖配置项，格式: a.b.c=value，可重复（仅影响本次运行时）",
     )
-    parser.add_argument("--max-cycles", type=int, default=3, help="loop 模式：最大迭代轮数")
+    parser.add_argument("--max-cycles", type=int, default=None, help="loop 模式：最大迭代轮数（默认取 optimization.max_iterations）")
     parser.add_argument("--loop-no-patch", type=int, default=1, help="loop 模式：连续无补丁轮数达到此值则退出")
     parser.add_argument("--target-failure-rate", type=float, default=None, help="loop 模式：当失败率不高于该值时退出")
     args = parser.parse_args(argv)
@@ -324,11 +324,21 @@ async def main(argv: list[str] | None = None) -> int:
                 },
             )
             from src.optimizer import run_optimize_loop
+            from src.config.bootstrap import get_runtime
+
+            rt = get_runtime()
+            opt_cfg = (rt.app.optimization or {}) if rt and getattr(rt, "app", None) else {}
+            cfg_max_cycles = opt_cfg.get("max_iterations")
+            cfg_exit_ratio = opt_cfg.get("exit_ratio")
+
+            max_cycles = args.max_cycles if args.max_cycles is not None else (cfg_max_cycles if isinstance(cfg_max_cycles, int) and cfg_max_cycles > 0 else 3)
+            exit_ratio = cfg_exit_ratio if isinstance(cfg_exit_ratio, (int, float)) and 0 <= cfg_exit_ratio <= 1 else None
 
             loop_summary = run_optimize_loop(
-                max_cycles=args.max_cycles,
+                max_cycles=max_cycles,
                 allow_no_patch_rounds=args.loop_no_patch,
                 target_failure_rate=args.target_failure_rate,
+                exit_ratio=exit_ratio,
             )
             try:
                 logger.info("循环优化完成", extra={"summary": loop_summary[:5], "total_cycles": len(loop_summary)})

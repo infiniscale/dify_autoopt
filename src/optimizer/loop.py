@@ -128,9 +128,10 @@ def _choose_api_key(keys: List[Dict[str, Any]], fallback: str) -> str:
 
 def run_optimize_loop(
     *,
-    max_cycles: int = 3,
+    max_cycles: Optional[int] = None,
     allow_no_patch_rounds: int = 1,
     target_failure_rate: Optional[float] = None,
+    exit_ratio: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """
     Execute -> Optimize -> Import/Publish -> Repeat, until stop conditions met.
@@ -146,6 +147,16 @@ def run_optimize_loop(
     exec_timeout = rt.app.execution.get("timeout", 9000) if rt.app.execution else 9000
     opt_cfg = rt.app.optimization or {}
     llm_cfg = opt_cfg.get("llm")
+
+    cfg_max_cycles = opt_cfg.get("max_iterations")
+    if max_cycles is None:
+        max_cycles = cfg_max_cycles if isinstance(cfg_max_cycles, int) and cfg_max_cycles > 0 else 3
+
+    cfg_exit_ratio = opt_cfg.get("exit_ratio")
+    if exit_ratio is None and isinstance(cfg_exit_ratio, (int, float)):
+        exit_ratio = cfg_exit_ratio
+    if exit_ratio is not None and not (0 <= exit_ratio <= 1):
+        exit_ratio = None
     base_url = _resolve_base_url(rt.dify_base_url)
     token = _resolve_token(None)
 
@@ -243,6 +254,9 @@ def run_optimize_loop(
                 stop_reason = "no_patches"
             if target_failure_rate is not None and failure_rate <= target_failure_rate:
                 stop_reason = "target_met"
+            skip_ratio = report.stats.get("prompts_skip_ratio") if isinstance(report.stats, dict) else None
+            if exit_ratio is not None and skip_ratio is not None and skip_ratio >= exit_ratio:
+                stop_reason = "skip_ratio"
             if cycle >= max_cycles:
                 if stop_reason is None:
                     stop_reason = "max_cycles"
