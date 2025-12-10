@@ -15,6 +15,7 @@ import yaml
 
 from src.config.bootstrap import get_runtime
 from src.optimizer.prompt_optimizer import PromptOptimizer, _status_from_run
+from src.optimizer.yaml_loader import load_workflow_yaml
 from src.utils.logger import get_logger
 from src.workflow.apps import _resolve_base_url, _resolve_token
 from src.workflow.api_keys import list_api_keys
@@ -201,8 +202,8 @@ def run_optimize_loop(
     api_base = getattr(rt, "dify_api_base", None) or base_url
     token = _resolve_token(None)
 
-    if not base_url or not token:
-        logger.warning("缺少 base_url 或 token，无法执行发布/导入流程", extra={"base_url": base_url, "has_token": bool(token)})
+    if not base_url:
+        logger.warning("缺少 base_url，无法执行循环优化", extra={"base_url": base_url})
         return []
     try:
         workflows_ctx = rt.app.workflows or []
@@ -216,11 +217,12 @@ def run_optimize_loop(
                 "workflows": len(workflows_ctx),
             },
         )
-        # 简单校验 token 是否可用：拉一次 apps 列表
-        try:
-            list_all_apps(base_url=base_url, token=token, limit=1, max_pages=1)
-        except Exception as ex:
-            logger.warning("控制台 token 验证失败，后续导出/发布可能 401", extra={"error": str(ex)})
+        # 简单校验 token 是否可用：拉一次 apps 列表（仅在 token 可用时）
+        if token:
+            try:
+                list_all_apps(base_url=base_url, token=token, limit=1, max_pages=1)
+            except Exception as ex:
+                logger.warning("控制台 token 验证失败，后续导出/发布可能 401", extra={"error": str(ex)})
     except Exception:
         pass
 
@@ -236,21 +238,32 @@ def run_optimize_loop(
         ref_path = _resolve_reference_file(opt_cfg, current_app_id)
         no_patch_rounds = 0
 
-        # 确保初始 DSL 可用：优先导出最新 DSL
-        try:
-            exported = export_app_dsl(current_app_id, base_url=base_url, token=token, include_secret=False)
-            current_yaml_path = str(exported)
-        except Exception as ex:  # noqa: BLE001
-            logger.warning(
-                "导出 DSL 失败，跳过该工作流",
-                extra={
-                    "workflow_id": current_app_id,
-                    "error": str(ex),
-                    "base_url": base_url,
-                    "has_token": bool(token),
-                },
-            )
-            continue
+        current_yaml_path: Optional[str] = None
+        # 确保初始 DSL 可用：优先导出最新 DSL（若有 token），否则尝试读取本地已导出的 DSL
+        if token:
+            try:
+                exported = export_app_dsl(current_app_id, base_url=base_url, token=token, include_secret=False)
+                current_yaml_path = str(exported)
+            except Exception as ex:  # noqa: BLE001
+                logger.warning(
+                    "导出 DSL 失败，尝试读取本地 DSL",
+                    extra={
+                        "workflow_id": current_app_id,
+                        "error": str(ex),
+                        "base_url": base_url,
+                        "has_token": bool(token),
+                    },
+                )
+        if current_yaml_path is None:
+            try:
+                tree, path = load_workflow_yaml(current_app_id, output_dir=output_dir)
+                current_yaml_path = str(path)
+            except Exception:
+                logger.warning(
+                    "未找到可用的 DSL，跳过该工作流",
+                    extra={"workflow_id": current_app_id, "has_token": bool(token)},
+                )
+                continue
 
         for cycle in range(1, max_cycles + 1):
             # 1) 运行工作流
@@ -351,6 +364,12 @@ def run_optimize_loop(
                 break
 
             # 4) 导入 / 发布 / 获取 API Key
+            if not token:
+                logger.warning(
+                    "缺少控制台 token，无法导入/发布优化后的 DSL，终止自循环",
+                    extra={"workflow_id": current_app_id},
+                )
+                break
             tag = f"{datetime.now().strftime('%Y%m%d')}-c{cycle}"
             yaml_content, tagged_name = _tag_yaml_name(report.patched_path, tag, logger)
             try:
