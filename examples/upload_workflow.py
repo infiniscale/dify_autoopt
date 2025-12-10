@@ -15,19 +15,44 @@ from pathlib import Path
 
 from src.auth.login import DifyAuthClient
 from src.workflow.imports import import_app_yaml
+from src.config.bootstrap import bootstrap_from_unified, get_runtime
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Login and upload a workflow YAML")
-    parser.add_argument("--base-url", required=True, help="Dify 控制台 base_url，例如 http://xy.dnset.com:1280")
-    parser.add_argument("--username", help="控制台用户名（邮箱）")
-    parser.add_argument("--password", help="控制台密码")
+    parser.add_argument("--config", default="config/config.yaml", help="统一配置文件路径（默认 config/config.yaml）")
     parser.add_argument("--yaml", required=True, help="要上传的本地 YAML 路径")
     args = parser.parse_args()
 
+    # 加载统一配置，提取 base_url / auth
+    rt = None
+    cfg_path = Path(args.config)
+    if cfg_path.exists():
+        try:
+            rt = bootstrap_from_unified(cfg_path)
+        except Exception:
+            rt = None
+    if rt is None:
+        try:
+            rt = get_runtime()
+        except Exception:
+            rt = None
+
+    base_url = None
+    username = None
+    password = None
+    if rt and getattr(rt, "app", None):
+        base_url = (rt.app.dify or {}).get("base_url") or getattr(rt, "dify_base_url", None)
+        auth_cfg = rt.app.auth or {}
+        username = auth_cfg.get("username")
+        password = auth_cfg.get("password")
+
+    if not base_url:
+        raise RuntimeError("配置中缺少 dify.base_url，请确认 config/config.yaml 设置正确")
+
     token = None
-    if args.username and args.password:
-        client = DifyAuthClient(base_url=args.base_url, email=args.username, password=args.password)
+    if username and password:
+        client = DifyAuthClient(base_url=base_url, email=username, password=password)
         login_resp = client.login()
         token = login_resp.get("access_token") if isinstance(login_resp, dict) else None
         if not token:
@@ -39,7 +64,7 @@ def main() -> None:
 
     resp = import_app_yaml(
         yaml_path=yaml_path,
-        base_url=args.base_url,
+        base_url=base_url,
         token=token,
     )
     print("上传完成，响应：", resp)
