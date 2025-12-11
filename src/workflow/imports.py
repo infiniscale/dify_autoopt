@@ -16,7 +16,7 @@ from typing import Optional, Dict, Any
 import requests
 
 from src.utils.logger import get_logger, log_performance
-from .apps import _resolve_token, _resolve_base_url, _mask_token
+from .apps import _resolve_token, _resolve_base_url, _mask_token, _login_token
 
 
 @log_performance("workflow_import_app_yaml")
@@ -47,13 +47,15 @@ def import_app_yaml(
             raise FileNotFoundError(f"YAML file not found: {p}")
         content = p.read_text(encoding="utf-8")
 
-    resolved_token = _resolve_token(token)
-    if not resolved_token:
-        raise RuntimeError("No access token available. Provide `token` or set DIFY_API_TOKEN or configure token store.")
-
     resolved_base = _resolve_base_url(base_url)
     if not resolved_base:
         raise RuntimeError("No base_url provided and runtime not initialized.")
+
+    resolved_token = _resolve_token(token)
+    if not resolved_token:
+        resolved_token = _login_token(resolved_base)
+    if not resolved_token:
+        raise RuntimeError("No access token available. Please login (username/password) or set DIFY_API_TOKEN.")
 
     url = f"{resolved_base}/console/api/apps/imports"
     headers = {
@@ -77,7 +79,23 @@ def import_app_yaml(
         pass
 
     resp = requests.post(url, headers=headers, json=body, timeout=timeout)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        try:
+            logger.warning(
+                "Import app YAML failed",
+                extra={
+                    "status": resp.status_code,
+                    "body": resp.text[:300],
+                    "url": url,
+                    "yaml_length": len(content),
+                    "yaml_path": str(yaml_path) if yaml_path else None,
+                },
+            )
+        except Exception:
+            pass
+        raise
     data = resp.json()
 
     try:

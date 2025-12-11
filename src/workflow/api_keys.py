@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from src.utils.logger import get_logger
+from .apps import _resolve_token
 
 logger = get_logger("workflow.api_keys")
 
@@ -28,8 +29,11 @@ def list_api_keys(base_url: str, app_id: str, token: str, timeout: float = 10.0)
     Returns:
         A list of API key dicts (best-effort parsing). Returns [] on errors.
     """
+    resolved_token = _resolve_token(token)
+    if not resolved_token:
+        return []
     url = f"{base_url.rstrip('/')}/console/api/apps/{app_id}/api-keys"
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {"Authorization": f"Bearer {resolved_token}"}
     try:
         logger.info("Fetching API keys", extra={"url": url, "app_id": app_id})
         resp = requests.get(url, headers=headers, timeout=timeout)
@@ -40,7 +44,16 @@ def list_api_keys(base_url: str, app_id: str, token: str, timeout: float = 10.0)
             return keys
     except Exception as exc:  # noqa: BLE001
         try:
-            logger.warning("Failed to fetch API keys", extra={"url": url, "app_id": app_id, "error": str(exc)})
+            logger.warning(
+                "Failed to fetch API keys",
+                extra={
+                    "url": url,
+                    "app_id": app_id,
+                    "status": resp.status_code if 'resp' in locals() else None,  # type: ignore
+                    "body": resp.text[:300] if 'resp' in locals() else None,  # type: ignore
+                    "error": str(exc),
+                },
+            )
         except Exception:
             pass
     return []
