@@ -449,6 +449,11 @@ def execute_workflow_v1(
         last_exc: Optional[Exception] = None
         for attempt in range(1, attempts + 1):
             api_key_local = _get_api_key()
+            row_meta = dict(meta_base)
+            try:
+                row_meta["raw_inputs"] = row
+            except Exception:
+                pass
             try:
                 prepared_inputs = _prepare_inputs_with_files(
                     row,
@@ -483,8 +488,20 @@ def execute_workflow_v1(
                     _set_api_key(api_key_local)
                 persisted_path: Optional[Path] = None
                 if persist_results and output_dir:
-                    _persist_result(run_result, output_dir, app_id, idx, prepared_inputs, meta_base)
-                    persisted_path = _persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs, meta_base)
+                    _persist_result(run_result, output_dir, app_id, idx, prepared_inputs, row_meta)
+                    persisted_path = _persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs, row_meta)
+                try:
+                    logger.info(
+                        "工作流单条完成",
+                        extra={
+                            "workflow_id": app_id,
+                            "index": idx,
+                            "raw_inputs": row,
+                            "prepared_keys": list(prepared_inputs.keys()),
+                        },
+                    )
+                except Exception:
+                    pass
                 return idx, prepared_inputs, run_result, persisted_path
             except HTTPError as exc:
                 status = getattr(exc.response, "status_code", None)
