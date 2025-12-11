@@ -192,11 +192,11 @@ def run_optimize_loop(
     logger = get_logger("optimizer.loop")
     rt = get_runtime()
     output_dir = (rt.app.io_paths or {}).get("output_dir") or "./outputs"
+    opt_cfg = rt.app.optimization or {}
     exec_timeout = rt.app.execution.get("timeout", 9000) if rt.app.execution else 9000
     run_concurrency = rt.app.execution.get("concurrency", 1) if rt.app.execution else 1
     if isinstance(opt_cfg.get("run_concurrency"), int) and opt_cfg.get("run_concurrency") > 0:
         run_concurrency = opt_cfg.get("run_concurrency")
-    opt_cfg = rt.app.optimization or {}
     llm_cfg = opt_cfg.get("llm")
 
     cfg_max_cycles = opt_cfg.get("max_iterations")
