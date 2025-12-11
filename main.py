@@ -494,6 +494,15 @@ async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True
     output_dir = (rt.app.io_paths or {}).get("output_dir") or "./outputs"
     exec_timeout = rt.app.execution.get("timeout", 60) if rt.app.execution else 60
     exec_retry = rt.app.execution.get("retry_count", 0) if rt.app.execution else 0
+    exec_meta = {
+        "execution_config": {
+            "timeout": exec_timeout,
+            "retry_count": exec_retry,
+            "concurrency": (rt.app.execution or {}).get("concurrency"),
+            "response_mode": "blocking",
+        },
+        "source": "config",
+    }
     ref_cfg = rt.app.optimization or {}
 
     optimizer = PromptOptimizer(default_output_root=output_dir, llm_config=ref_cfg.get("llm"))
@@ -520,6 +529,7 @@ async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True
                         timeout=exec_timeout,
                         persist_results=True,
                         retry_count=exec_retry,
+                        persist_metadata=exec_meta,
                     )
                 run_results = await asyncio.to_thread(_run_one)
             except Exception as ex:

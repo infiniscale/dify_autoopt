@@ -151,6 +151,7 @@ def _persist_result(
     workflow_id: str,
     index: int,
     inputs: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Persist workflow run result (and inputs) to markdown file."""
     try:
@@ -173,6 +174,16 @@ def _persist_result(
                 content_lines.append("\n```\n")
             except Exception:
                 content_lines.append(f"\n## Inputs\n{inputs}\n")
+        if meta:
+            try:
+                import json as _json
+
+                content_lines.append("\n## Metadata\n")
+                content_lines.append("```json\n")
+                content_lines.append(_json.dumps(meta, ensure_ascii=False, indent=2))
+                content_lines.append("\n```\n")
+            except Exception:
+                content_lines.append(f"\n## Metadata\n{meta}\n")
 
         content_lines.append("\n## Response\n")
         try:
@@ -201,6 +212,7 @@ def _persist_result_json(
     workflow_id: str,
     index: int,
     inputs: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Persist workflow run result to structured JSON for downstream optimization."""
     base = Path(output_dir).expanduser().resolve()
@@ -212,6 +224,7 @@ def _persist_result_json(
         "index": index,
         "inputs": inputs or {},
         "result": data,
+        "meta": meta or {},
     }
     try:
         import json as _json
@@ -359,6 +372,7 @@ def execute_workflow_v1(
     persist_results: bool = False,
     concurrency: int = 1,
     retry_count: int = 0,
+    persist_metadata: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Execute a workflow via the Dify public API (blocking).
@@ -408,6 +422,28 @@ def execute_workflow_v1(
 
     results: List[Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]] = []
 
+    # Build static metadata for persistence (avoid tokens)
+    meta_base: Dict[str, Any] = {
+        "execution": {
+            "timeout": timeout,
+            "retry_count": retry_count,
+            "concurrency": concurrency,
+            "response_mode": response_mode,
+            "user": user,
+        },
+        "paths": {
+            "upload_path": upload_path or f"{resolved_base}/files/upload",
+            "run_path": run_path or f"{resolved_base}/workflows/run",
+            "output_dir": str(Path(output_dir).resolve()) if output_dir else None,
+        },
+        "base_url": resolved_base,
+    }
+    if persist_metadata:
+        try:
+            meta_base.update(persist_metadata)
+        except Exception:
+            pass
+
     def _one_row(idx: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]:
         attempts = max(0, retry_count) + 1
         last_exc: Optional[Exception] = None
@@ -447,8 +483,8 @@ def execute_workflow_v1(
                     _set_api_key(api_key_local)
                 persisted_path: Optional[Path] = None
                 if persist_results and output_dir:
-                    _persist_result(run_result, output_dir, app_id, idx, prepared_inputs)
-                    persisted_path = _persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs)
+                    _persist_result(run_result, output_dir, app_id, idx, prepared_inputs, meta_base)
+                    persisted_path = _persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs, meta_base)
                 return idx, prepared_inputs, run_result, persisted_path
             except HTTPError as exc:
                 status = getattr(exc.response, "status_code", None)
@@ -552,6 +588,7 @@ def execute_workflow_from_config(
     run_path: Optional[str] = None,
     persist_results: bool = True,
     retry_count: Optional[int] = None,
+    persist_metadata: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Load inputs for a workflow from unified config and execute each row sequentially.
@@ -575,9 +612,22 @@ def execute_workflow_from_config(
     rows, declared_types = _normalize_inputs(raw_inputs)
     api_key = getattr(workflow_entry, "api_key", None)
     output_dir = (rt.app.io_paths or {}).get("output_dir")
-    exec_retry = retry_count
-    if exec_retry is None:
-        exec_retry = rt.app.execution.get("retry_count", 0) if rt.app.execution else 0
+    exec_cfg = rt.app.execution or {}
+    exec_retry = retry_count if retry_count is not None else exec_cfg.get("retry_count", 0)
+    exec_meta = {
+        "execution_config": {
+            "timeout": timeout,
+            "retry_count": exec_retry,
+            "concurrency": exec_cfg.get("concurrency"),
+            "response_mode": "blocking",
+        },
+        "source": "config",
+    }
+    if persist_metadata:
+        try:
+            exec_meta.update(persist_metadata)
+        except Exception:
+            pass
     resolved_base = _resolve_base_url(base_url)
     if not api_key or not resolved_base:
         raise RuntimeError("Workflow execution requires dify.base_url and workflow.api_key in config")
@@ -595,4 +645,5 @@ def execute_workflow_from_config(
         persist_results=persist_results and bool(output_dir),
         concurrency=rt.app.execution.get("concurrency") if rt.app.execution else 1,
         retry_count=int(exec_retry) if isinstance(exec_retry, int) else 0,
+        persist_metadata=exec_meta,
     )

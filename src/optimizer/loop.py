@@ -196,6 +196,14 @@ def run_optimize_loop(
     exec_timeout = rt.app.execution.get("timeout", 9000) if rt.app.execution else 9000
     run_concurrency = rt.app.execution.get("concurrency", 1) if rt.app.execution else 1
     exec_retry = rt.app.execution.get("retry_count", 0) if rt.app.execution else 0
+    exec_meta = {
+        "execution_config": {
+            "timeout": exec_timeout,
+            "retry_count": exec_retry,
+            "concurrency": run_concurrency,
+            "response_mode": "blocking",
+        }
+    }
     if isinstance(opt_cfg.get("run_concurrency"), int) and opt_cfg.get("run_concurrency") > 0:
         run_concurrency = opt_cfg.get("run_concurrency")
     llm_cfg = opt_cfg.get("llm")
@@ -295,6 +303,7 @@ def run_optimize_loop(
                     output_dir=output_dir,
                     persist_results=True,
                     concurrency=run_concurrency,
+                    persist_metadata=exec_meta,
                 )
             except Exception as ex:  # noqa: BLE001
                 logger.warning(
