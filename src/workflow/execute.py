@@ -404,9 +404,9 @@ def execute_workflow_v1(
         },
     )
 
-    results: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
+    results: List[Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]] = []
 
-    def _one_row(idx: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any], Dict[str, Any]]:
+    def _one_row(idx: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]:
         api_key_local = _get_api_key()
         try:
             prepared_inputs = _prepare_inputs_with_files(
@@ -482,7 +482,11 @@ def execute_workflow_v1(
         # If run succeeds after potential refresh, align local key for subsequent runs
         if api_key_local != _get_api_key():
             _set_api_key(api_key_local)
-        return idx, prepared_inputs, run_result
+        persisted_path: Optional[Path] = None
+        if persist_results and output_dir:
+            _persist_result(run_result, output_dir, app_id, idx, prepared_inputs)
+            persisted_path = _persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs)
+        return idx, prepared_inputs, run_result, persisted_path
 
     if concurrency and concurrency > 1 and len(rows) > 1:
         logger.info("并发执行工作流", extra={"workflow_id": app_id, "rows": len(rows), "concurrency": concurrency})
@@ -509,11 +513,10 @@ def execute_workflow_v1(
     results.sort(key=lambda x: x[0])
     persisted_files: List[Path] = []
     final_results: List[Dict[str, Any]] = []
-    for idx, prepared_inputs, run_result in results:
+    for idx, prepared_inputs, run_result, persisted_path in results:
         final_results.append(run_result)
-        if persist_results and output_dir:
-            _persist_result(run_result, output_dir, app_id, idx, prepared_inputs)
-            persisted_files.append(_persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs))
+        if persisted_path:
+            persisted_files.append(persisted_path)
 
     logger.info("Workflow execution finished", extra={"runs": len(final_results)})
     if persist_results and output_dir:
