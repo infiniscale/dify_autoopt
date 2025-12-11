@@ -11,13 +11,16 @@ from __future__ import annotations
 
 import mimetypes
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 
 import requests
+from requests import HTTPError
 
 from src.utils.logger import get_logger, log_performance
-from .apps import _mask_token
+from .apps import _mask_token, _resolve_token, _login_token
+from .api_keys import list_api_keys
 from .export import _safe_dirname_from_id
 
 logger = get_logger("workflow.execute")
@@ -301,6 +304,43 @@ def _resolve_base_url(passed_base_url: Optional[str]) -> Optional[str]:
         return None
 
 
+def _console_base_from_api(base: str) -> str:
+    """Strip trailing /v1 if present to get console base URL."""
+    cleaned = base.rstrip("/")
+    if cleaned.endswith("/v1"):
+        return cleaned[:-3]
+    return cleaned
+
+
+def _refresh_app_api_key(app_id: str, api_base_with_v1: str, logger):
+    """Try to refresh app api_key using console token (env/access token or login)."""
+    console_base = _console_base_from_api(api_base_with_v1)
+    console_token = _resolve_token(None)
+    if not console_token:
+        console_token = _login_token(console_base)
+    if not console_token:
+        return None
+    keys = list_api_keys(console_base, app_id, console_token, create_when_missing=True, create_name="auto-refresh")
+    for item in keys:
+        for key_name in ("api_key", "key", "apiKey", "token"):
+            if item.get(key_name):
+                new_key = str(item[key_name])
+                try:
+                    logger.info(
+                        "Refreshed workflow api_key",
+                        extra={
+                            "workflow_id": app_id,
+                            "base_url": console_base,
+                            "token": _mask_token(console_token),
+                            "api_key_prefix": _mask_token(new_key),
+                        },
+                    )
+                except Exception:
+                    pass
+                return new_key
+    return None
+
+
 @log_performance("workflow_execute_v1")
 def execute_workflow_v1(
     app_id: str,
@@ -329,14 +369,25 @@ def execute_workflow_v1(
         raise RuntimeError("No base_url provided and runtime not initialized.")
     if not api_key:
         raise RuntimeError("No api_key provided for workflow execution.")
+    current_api_key: str = api_key
+    key_lock = Lock()
+
+    def _get_api_key() -> str:
+        with key_lock:
+            return current_api_key
+
+    def _set_api_key(new_key: str) -> None:
+        nonlocal current_api_key
+        with key_lock:
+            current_api_key = new_key
 
     logger.debug(
         "Resolved workflow endpoints",
         extra={
-            "base_url": resolved_base,
-            "upload_path": (upload_path or f"{resolved_base}/files/upload"),
-            "run_path": (run_path or f"{resolved_base}/workflows/run"),
-            "api_key": _mask_token(api_key),
+        "base_url": resolved_base,
+        "upload_path": (upload_path or f"{resolved_base}/files/upload"),
+        "run_path": (run_path or f"{resolved_base}/workflows/run"),
+        "api_key": _mask_token(_get_api_key()),
         },
     )
 
@@ -356,15 +407,37 @@ def execute_workflow_v1(
     results: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
 
     def _one_row(idx: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any], Dict[str, Any]]:
-        prepared_inputs = _prepare_inputs_with_files(
-            row,
-            base_url=resolved_base,
-            api_key=api_key,
-            user=user,
-            timeout=timeout,
-            upload_path=upload_path,
-            declared_types=declared,
-        )
+        api_key_local = _get_api_key()
+        try:
+            prepared_inputs = _prepare_inputs_with_files(
+                row,
+                base_url=resolved_base,
+                api_key=api_key_local,
+                user=user,
+                timeout=timeout,
+                upload_path=upload_path,
+                declared_types=declared,
+            )
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 401:
+                new_key = _refresh_app_api_key(app_id, resolved_base, logger)
+                if new_key:
+                    _set_api_key(new_key)
+                    api_key_local = new_key
+                    prepared_inputs = _prepare_inputs_with_files(
+                        row,
+                        base_url=resolved_base,
+                        api_key=api_key_local,
+                        user=user,
+                        timeout=timeout,
+                        upload_path=upload_path,
+                        declared_types=declared,
+                    )
+                else:
+                    raise
+            else:
+                raise
         meta_fields: Dict[str, Any] = {}
         if output_dir and "__output_dir" not in prepared_inputs:
             meta_fields["__output_dir"] = str(Path(output_dir).resolve())
@@ -374,16 +447,41 @@ def execute_workflow_v1(
             meta_fields["__input_index"] = idx
         prepared_inputs.update(meta_fields)
         logger.debug("Executing workflow row", extra={"index": idx, "keys": list(prepared_inputs.keys())})
-        run_result = _run_workflow_once(
-            app_id,
-            prepared_inputs,
-            base_url=resolved_base,
-            api_key=api_key,
-            user=user,
-            timeout=timeout,
-            response_mode=response_mode,
-            run_path=run_path,
-        )
+        try:
+            run_result = _run_workflow_once(
+                app_id,
+                prepared_inputs,
+                base_url=resolved_base,
+                api_key=api_key_local,
+                user=user,
+                timeout=timeout,
+                response_mode=response_mode,
+                run_path=run_path,
+            )
+        except HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 401:
+                new_key = _refresh_app_api_key(app_id, resolved_base, logger)
+                if new_key:
+                    _set_api_key(new_key)
+                    api_key_local = new_key
+                    run_result = _run_workflow_once(
+                        app_id,
+                        prepared_inputs,
+                        base_url=resolved_base,
+                        api_key=api_key_local,
+                        user=user,
+                        timeout=timeout,
+                        response_mode=response_mode,
+                        run_path=run_path,
+                    )
+                else:
+                    raise
+            else:
+                raise
+        # If run succeeds after potential refresh, align local key for subsequent runs
+        if api_key_local != _get_api_key():
+            _set_api_key(api_key_local)
         return idx, prepared_inputs, run_result
 
     if concurrency and concurrency > 1 and len(rows) > 1:

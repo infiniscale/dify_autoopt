@@ -46,11 +46,14 @@ def publish_workflow(
         raise RuntimeError("No access token available. Please login (username/password) or set DIFY_API_TOKEN.")
 
     url = f"{resolved_base}/console/api/apps/{app_id}/workflows/publish"
-    headers = {
-        "Authorization": f"Bearer {resolved_token}",
-        "Content-Type": "application/json",
-    }
     body = payload if isinstance(payload, dict) else {}
+
+    def _post_with_token(tok: str):
+        headers = {
+            "Authorization": f"Bearer {tok}",
+            "Content-Type": "application/json",
+        }
+        return requests.post(url, headers=headers, json=body, timeout=timeout)
 
     try:
         logger.info(
@@ -65,7 +68,25 @@ def publish_workflow(
     except Exception:
         pass
 
-    resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+    resp = _post_with_token(resolved_token)
+    if resp.status_code == 401:
+        refreshed_token = _login_token(resolved_base)
+        if refreshed_token and refreshed_token != resolved_token:
+            try:
+                logger.info(
+                    "Token expired, retrying publish with refreshed token",
+                    extra={
+                        "app_id": app_id,
+                        "url": url,
+                        "old_token": _mask_token(resolved_token),
+                        "new_token": _mask_token(refreshed_token),
+                    },
+                )
+            except Exception:
+                pass
+            resolved_token = refreshed_token
+            resp = _post_with_token(resolved_token)
+
     try:
         resp.raise_for_status()
     except Exception as exc:  # noqa: BLE001
