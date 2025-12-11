@@ -551,6 +551,7 @@ def execute_workflow_from_config(
     upload_path: Optional[str] = None,
     run_path: Optional[str] = None,
     persist_results: bool = True,
+    retry_count: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Load inputs for a workflow from unified config and execute each row sequentially.
@@ -574,6 +575,9 @@ def execute_workflow_from_config(
     rows, declared_types = _normalize_inputs(raw_inputs)
     api_key = getattr(workflow_entry, "api_key", None)
     output_dir = (rt.app.io_paths or {}).get("output_dir")
+    exec_retry = retry_count
+    if exec_retry is None:
+        exec_retry = rt.app.execution.get("retry_count", 0) if rt.app.execution else 0
     resolved_base = _resolve_base_url(base_url)
     if not api_key or not resolved_base:
         raise RuntimeError("Workflow execution requires dify.base_url and workflow.api_key in config")
@@ -590,4 +594,5 @@ def execute_workflow_from_config(
         output_dir=output_dir,
         persist_results=persist_results and bool(output_dir),
         concurrency=rt.app.execution.get("concurrency") if rt.app.execution else 1,
+        retry_count=int(exec_retry) if isinstance(exec_retry, int) else 0,
     )
