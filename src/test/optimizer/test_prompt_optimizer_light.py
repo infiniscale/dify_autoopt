@@ -1,8 +1,9 @@
 from pathlib import Path
 
+import pytest
 import yaml
 
-from src.optimizer.prompt_optimizer import PromptOptimizer, ReferenceSpec
+from src.optimizer.prompt_optimizer import PromptOptimizer, ReferenceSpec, PromptPatch
 
 
 def _sample_yaml():
@@ -29,8 +30,40 @@ def _nested_workflow_yaml():
     return {"workflow": _sample_yaml()}
 
 
-def test_generates_patch_when_constraint_missing(tmp_path: Path):
-    optimizer = PromptOptimizer()
+@pytest.fixture()
+def mock_dspy(monkeypatch):
+    def _activate(suffix="Return JSON"):
+        def fake_init(self, cfg):
+            self.cfg = cfg
+            self.available = True
+
+        def fake_optimize(self, workflow_id, prompts, samples, reference_texts, constraints):
+            patches = []
+            for prompt in prompts:
+                new_text = f"{prompt.text}\n\n- {suffix}"
+                patches.append(
+                    PromptPatch(
+                        workflow_id=workflow_id,
+                        node_id=prompt.node_id,
+                        field_path=prompt.path,
+                        old=prompt.text,
+                        new=new_text,
+                        rationale="mock dspy patch",
+                        confidence=0.9,
+                        evidence_runs=[s.index for s in samples],
+                    )
+                )
+            return patches
+
+        monkeypatch.setattr("src.optimizer.prompt_optimizer._DspyPromptOptimizer.__init__", fake_init)
+        monkeypatch.setattr("src.optimizer.prompt_optimizer._DspyPromptOptimizer.optimize_prompts", fake_optimize)
+
+    return _activate
+
+
+def test_generates_patch_when_constraint_missing(tmp_path: Path, mock_dspy):
+    mock_dspy()
+    optimizer = PromptOptimizer(llm_config={"use_dspy_optimizer": True}, validate_llm=False)
     run_results = [
         {"status": "success", "output": "plain text without json"},
         {"status": "success", "output": "still missing constraint"},
@@ -50,8 +83,9 @@ def test_generates_patch_when_constraint_missing(tmp_path: Path):
     assert report.issues, "Should record detected issues"
 
 
-def test_low_similarity_issue_creates_patch(tmp_path: Path):
-    optimizer = PromptOptimizer()
+def test_low_similarity_issue_creates_patch(tmp_path: Path, mock_dspy):
+    mock_dspy()
+    optimizer = PromptOptimizer(llm_config={"use_dspy_optimizer": True}, validate_llm=False)
     run_results = [{"status": "success", "output": "unrelated answer"}]
     reference = ReferenceSpec(expected_outputs=["expected deterministic answer"], similarity_threshold=0.9)
 
@@ -66,8 +100,9 @@ def test_low_similarity_issue_creates_patch(tmp_path: Path):
     assert report.patches, "Patch should be suggested for low similarity"
 
 
-def test_creates_patched_copy_when_applying(tmp_path: Path):
-    optimizer = PromptOptimizer(default_output_root=tmp_path)
+def test_creates_patched_copy_when_applying(tmp_path: Path, mock_dspy):
+    mock_dspy()
+    optimizer = PromptOptimizer(default_output_root=tmp_path, llm_config={"use_dspy_optimizer": True}, validate_llm=False)
     run_results = [{"status": "success", "output": "missing constraint"}]
     reference = ReferenceSpec(constraints=["Return JSON"])
 
@@ -84,8 +119,9 @@ def test_creates_patched_copy_when_applying(tmp_path: Path):
     assert report.patched_path.exists()
 
 
-def test_nested_workflow_patch_updates_in_place(tmp_path: Path):
-    optimizer = PromptOptimizer(default_output_root=tmp_path)
+def test_nested_workflow_patch_updates_in_place(tmp_path: Path, mock_dspy):
+    mock_dspy()
+    optimizer = PromptOptimizer(default_output_root=tmp_path, llm_config={"use_dspy_optimizer": True}, validate_llm=False)
     run_results = [{"status": "success", "output": "missing constraint"}]
     reference = ReferenceSpec(constraints=["Return JSON"])
     workflow_tree = _nested_workflow_yaml()
@@ -124,8 +160,9 @@ def test_status_parsing_handles_nested_result_data(tmp_path: Path):
     assert not report.issues or all(it.kind != "high_failure_rate" for it in report.issues)
 
 
-def test_reads_prompts_from_workflow_graph_section(tmp_path: Path):
-    optimizer = PromptOptimizer()
+def test_reads_prompts_from_workflow_graph_section(tmp_path: Path, mock_dspy):
+    mock_dspy()
+    optimizer = PromptOptimizer(llm_config={"use_dspy_optimizer": True}, validate_llm=False)
     run_results = [{"status": "success", "output": "plain"}]
     reference = ReferenceSpec(constraints=["Return JSON"])
 
@@ -137,3 +174,4 @@ def test_reads_prompts_from_workflow_graph_section(tmp_path: Path):
     )
 
     assert report.patches, "Expected patches when constraints are missing in nested workflow graph"
+

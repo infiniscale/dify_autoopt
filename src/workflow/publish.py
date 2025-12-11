@@ -16,7 +16,7 @@ from typing import Optional, Dict, Any
 import requests
 
 from src.utils.logger import get_logger, log_performance
-from .apps import _resolve_token, _resolve_base_url, _mask_token
+from .apps import _resolve_token, _resolve_base_url, _mask_token, _login_token
 
 
 @log_performance("workflow_publish")
@@ -35,13 +35,15 @@ def publish_workflow(
     """
     logger = get_logger("workflow.publish")
 
-    resolved_token = _resolve_token(token)
-    if not resolved_token:
-        raise RuntimeError("No access token available. Provide `token` or set DIFY_API_TOKEN or configure token store.")
-
     resolved_base = _resolve_base_url(base_url)
     if not resolved_base:
         raise RuntimeError("No base_url provided and runtime not initialized.")
+
+    resolved_token = _resolve_token(token)
+    if not resolved_token:
+        resolved_token = _login_token(resolved_base)
+    if not resolved_token:
+        raise RuntimeError("No access token available. Please login (username/password) or set DIFY_API_TOKEN.")
 
     url = f"{resolved_base}/console/api/apps/{app_id}/workflows/publish"
     headers = {
@@ -64,7 +66,22 @@ def publish_workflow(
         pass
 
     resp = requests.post(url, headers=headers, json=body, timeout=timeout)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        try:
+            logger.warning(
+                "Publish workflow failed",
+                extra={
+                    "status": resp.status_code,
+                    "body": resp.text[:300],
+                    "url": url,
+                    "app_id": app_id,
+                },
+            )
+        except Exception:
+            pass
+        raise
     data = resp.json()
 
     try:
@@ -78,4 +95,3 @@ def publish_workflow(
         pass
 
     return data
-
