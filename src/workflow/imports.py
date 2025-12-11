@@ -102,9 +102,15 @@ def import_app_yaml(
         # Common success response might include new app id or status
         app_id = None
         if isinstance(data, dict):
+            # Top-level
+            if data.get("app_id"):
+                app_id = data.get("app_id")
+            elif data.get("id") and not data.get("data"):
+                app_id = data.get("id")
+            # Nested data/app
             d = data.get("data")
             if isinstance(d, dict):
-                app_id = d.get("id") or d.get("app", {}).get("id") if isinstance(d.get("app"), dict) else None
+                app_id = app_id or d.get("app_id") or d.get("id") or (d.get("app") or {}).get("id")
         logger.info("App YAML imported", extra={"app_id": app_id})
     except Exception:
         pass

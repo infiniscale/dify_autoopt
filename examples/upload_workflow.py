@@ -108,11 +108,24 @@ async def main() -> None:
         raise FileNotFoundError(f"YAML 文件不存在: {yaml_path}")
 
     import_resp = import_app_yaml(yaml_path=yaml_path, base_url=base_url, token=token)
-    app_id = None
-    if isinstance(import_resp, dict):
-        data = import_resp.get("data")
+    def _extract_app_id(resp: dict) -> str | None:
+        if not isinstance(resp, dict):
+            return None
+        if resp.get("app_id"):
+            return str(resp["app_id"])
+        if resp.get("id") and not resp.get("data"):
+            return str(resp["id"])
+        data = resp.get("data")
         if isinstance(data, dict):
-            app_id = data.get("id") or (data.get("app") or {}).get("id")
+            if data.get("app_id"):
+                return str(data["app_id"])
+            if data.get("id"):
+                return str(data["id"])
+            if isinstance(data.get("app"), dict) and data["app"].get("id"):
+                return str(data["app"]["id"])
+        return None
+
+    app_id = _extract_app_id(import_resp) if isinstance(import_resp, dict) else None
     if not app_id:
         logger.error("导入成功但未解析到 app_id", extra={"response_keys": list(import_resp.keys()) if isinstance(import_resp, dict) else None})
         print("导入响应：", import_resp)
@@ -124,7 +137,13 @@ async def main() -> None:
         logger.error("发布工作流失败", extra={"app_id": app_id, "error": str(ex)})
         raise
 
-    keys = list_api_keys(base_url, app_id, token or "")
+    keys = list_api_keys(
+        base_url,
+        app_id,
+        token or "",
+        create_when_missing=True,
+        create_name=f"upload-{yaml_path.stem}",
+    )
     chosen_key = None
     for item in keys:
         for key_name in ("api_key", "key", "apiKey"):
@@ -141,6 +160,8 @@ async def main() -> None:
             "base_url": base_url,
             "app_id": app_id,
             "api_key_prefix": chosen_key[:4] + "****" if chosen_key and len(chosen_key) >= 8 else chosen_key,
+            "api_keys_count": len(keys),
+            "raw_api_keys": keys,
         },
     )
     print("导入响应：", import_resp)

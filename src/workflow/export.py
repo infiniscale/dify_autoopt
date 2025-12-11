@@ -17,7 +17,7 @@ import json
 import yaml
 
 from src.utils.logger import get_logger, log_performance
-from .apps import _resolve_token, _resolve_base_url, _mask_token
+from .apps import _resolve_token, _resolve_base_url, _mask_token, _login_token
 
 
 def _infer_filename(app_id: str, content_disposition: str | None, content_type: str | None) -> str:
@@ -93,13 +93,15 @@ def export_app_dsl(
     """
     logger = get_logger("workflow.export")
 
-    resolved_token = _resolve_token(token)
-    if not resolved_token:
-        raise RuntimeError("No access token available. Provide `token` or set DIFY_API_TOKEN or configure token store.")
-
     resolved_base = _resolve_base_url(base_url)
     if not resolved_base:
         raise RuntimeError("No base_url provided and runtime not initialized.")
+
+    resolved_token = _resolve_token(token)
+    if not resolved_token:
+        resolved_token = _login_token(resolved_base)
+    if not resolved_token:
+        raise RuntimeError("No access token available. Please login (username/password) or set DIFY_API_TOKEN.")
 
     url = f"{resolved_base}/console/api/apps/{app_id}/export"
     params = {"include_secret": str(include_secret).lower()}

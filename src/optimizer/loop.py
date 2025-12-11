@@ -17,7 +17,7 @@ from src.config.bootstrap import get_runtime
 from src.optimizer.prompt_optimizer import PromptOptimizer, _status_from_run
 from src.optimizer.yaml_loader import load_workflow_yaml
 from src.utils.logger import get_logger
-from src.workflow.apps import _resolve_base_url, _resolve_token
+from src.workflow.apps import _resolve_base_url, _resolve_token, _login_token, list_all_apps
 from src.workflow.api_keys import list_api_keys
 from src.workflow.export import _safe_dirname_from_id, export_app_dsl
 from src.workflow.execute import _normalize_inputs, execute_workflow_v1
@@ -111,12 +111,19 @@ def _resolve_reference_texts(wf_entry, run_results: Sequence[Dict[str, Any]], lo
 def _extract_app_id_from_import(resp: Dict[str, Any], fallback: str) -> str:
     if not isinstance(resp, dict):
         return fallback
+    # Top-level response
+    if resp.get("app_id"):
+        return str(resp["app_id"])
+    if resp.get("id") and not resp.get("data"):
+        return str(resp["id"])
     data = resp.get("data")
     if isinstance(data, dict):
         if data.get("id"):
             return str(data["id"])
         if isinstance(data.get("app"), dict) and data["app"].get("id"):
             return str(data["app"]["id"])
+        if data.get("app_id"):
+            return str(data["app_id"])
     return fallback
 
 
@@ -200,7 +207,10 @@ def run_optimize_loop(
         exit_ratio = None
     base_url = _resolve_base_url(rt.dify_base_url)
     api_base = getattr(rt, "dify_api_base", None) or base_url
-    token = _resolve_token(None)
+    # 控制台 token（导出/导入/发布用），与执行用 app_key 区分
+    console_token = _resolve_token(None)
+    if (not console_token or (isinstance(console_token, str) and console_token.startswith("app-"))) and base_url:
+        console_token = _login_token(base_url) or console_token
 
     if not base_url:
         logger.warning("缺少 base_url，无法执行循环优化", extra={"base_url": base_url})
@@ -212,15 +222,15 @@ def run_optimize_loop(
             extra={
                 "base_url": base_url,
                 "api_base": api_base,
-                "has_token": bool(token),
-                "token_prefix": token[:4] + "****" if token and len(token) >= 8 else "<short/empty>",
+                "has_token": bool(console_token),
+                "token_prefix": console_token[:4] + "****" if console_token and isinstance(console_token, str) and len(console_token) >= 8 else "<short/empty>",
                 "workflows": len(workflows_ctx),
             },
         )
         # 简单校验 token 是否可用：拉一次 apps 列表（仅在 token 可用时）
-        if token:
+        if console_token:
             try:
-                list_all_apps(base_url=base_url, token=token, limit=1, max_pages=1)
+                list_all_apps(base_url=base_url, token=console_token, limit=1, max_pages=1)
             except Exception as ex:
                 logger.warning("控制台 token 验证失败，后续导出/发布可能 401", extra={"error": str(ex)})
     except Exception:
@@ -239,10 +249,10 @@ def run_optimize_loop(
         no_patch_rounds = 0
 
         current_yaml_path: Optional[str] = None
-        # 确保初始 DSL 可用：优先导出最新 DSL（若有 token），否则尝试读取本地已导出的 DSL
-        if token:
+        # 确保初始 DSL 可用：优先导出最新 DSL（若有控制台 token），否则尝试读取本地已导出的 DSL
+        if console_token:
             try:
-                exported = export_app_dsl(current_app_id, base_url=base_url, token=token, include_secret=False)
+                exported = export_app_dsl(current_app_id, base_url=base_url, token=console_token, include_secret=False)
                 current_yaml_path = str(exported)
             except Exception as ex:  # noqa: BLE001
                 logger.warning(
@@ -251,7 +261,7 @@ def run_optimize_loop(
                         "workflow_id": current_app_id,
                         "error": str(ex),
                         "base_url": base_url,
-                        "has_token": bool(token),
+                        "has_token": bool(console_token),
                     },
                 )
         if current_yaml_path is None:
@@ -261,7 +271,7 @@ def run_optimize_loop(
             except Exception:
                 logger.warning(
                     "未找到可用的 DSL，跳过该工作流",
-                    extra={"workflow_id": current_app_id, "has_token": bool(token)},
+                    extra={"workflow_id": current_app_id, "has_token": bool(console_token)},
                 )
                 continue
 
@@ -378,7 +388,7 @@ def run_optimize_loop(
                 break
 
             # 4) 导入 / 发布 / 获取 API Key
-            if not token:
+            if not console_token:
                 logger.warning(
                     "缺少控制台 token，无法导入/发布优化后的 DSL，终止自循环",
                     extra={"workflow_id": current_app_id},
@@ -387,7 +397,7 @@ def run_optimize_loop(
             tag = f"{datetime.now().strftime('%Y%m%d')}-c{cycle}"
             yaml_content, tagged_name = _tag_yaml_name(report.patched_path, tag, logger)
             try:
-                import_resp = import_app_yaml(yaml_content=yaml_content, base_url=base_url, token=token)
+                import_resp = import_app_yaml(yaml_content=yaml_content, base_url=base_url, token=console_token)
                 new_app_id = _extract_app_id_from_import(import_resp, current_app_id)
                 if not new_app_id or new_app_id == current_app_id:
                     raise RuntimeError("导入未产生新 app_id")
@@ -399,7 +409,7 @@ def run_optimize_loop(
                 break
 
             try:
-                publish_workflow(new_app_id, base_url=base_url, token=token)
+                publish_workflow(new_app_id, base_url=base_url, token=console_token)
             except Exception as ex:  # noqa: BLE001
                 logger.warning(
                     "发布优化后的工作流失败，终止自循环",
@@ -407,7 +417,13 @@ def run_optimize_loop(
                 )
                 break
 
-            new_keys = list_api_keys(base_url, new_app_id, token)
+            new_keys = list_api_keys(
+                base_url,
+                new_app_id,
+                console_token,
+                create_when_missing=True,
+                create_name=f"auto-loop-{tag}",
+            )
             chosen_key = _choose_api_key(new_keys, "")
             if not chosen_key:
                 logger.warning(
