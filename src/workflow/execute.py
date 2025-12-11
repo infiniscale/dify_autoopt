@@ -12,6 +12,7 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -315,6 +316,7 @@ def execute_workflow_v1(
     input_types: Optional[Dict[str, str]] = None,
     output_dir: Optional[Union[str, Path]] = None,
     persist_results: bool = False,
+    concurrency: int = 1,
 ) -> List[Dict[str, Any]]:
     """
     Execute a workflow via the Dify public API (blocking).
@@ -351,9 +353,9 @@ def execute_workflow_v1(
         },
     )
 
-    results: List[Dict[str, Any]] = []
-    persisted_files: List[Path] = []
-    for idx, row in enumerate(rows, start=1):
+    results: List[Tuple[int, Dict[str, Any], Dict[str, Any]]] = []
+
+    def _one_row(idx: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any], Dict[str, Any]]:
         prepared_inputs = _prepare_inputs_with_files(
             row,
             base_url=resolved_base,
@@ -363,7 +365,6 @@ def execute_workflow_v1(
             upload_path=upload_path,
             declared_types=declared,
         )
-        # Inject metadata for tracking/output if not already present
         meta_fields: Dict[str, Any] = {}
         if output_dir and "__output_dir" not in prepared_inputs:
             meta_fields["__output_dir"] = str(Path(output_dir).resolve())
@@ -383,12 +384,31 @@ def execute_workflow_v1(
             response_mode=response_mode,
             run_path=run_path,
         )
-        results.append(run_result)
+        return idx, prepared_inputs, run_result
+
+    if concurrency and concurrency > 1 and len(rows) > 1:
+        logger.info("并发执行工作流", extra={"workflow_id": app_id, "rows": len(rows), "concurrency": concurrency})
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = {pool.submit(_one_row, idx, row): idx for idx, row in enumerate(rows, start=1)}
+            for fut in as_completed(futures):
+                try:
+                    results.append(fut.result())
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("单条运行失败", extra={"index": futures[fut], "error": str(exc)})
+    else:
+        for idx, row in enumerate(rows, start=1):
+            results.append(_one_row(idx, row))
+
+    results.sort(key=lambda x: x[0])
+    persisted_files: List[Path] = []
+    final_results: List[Dict[str, Any]] = []
+    for idx, prepared_inputs, run_result in results:
+        final_results.append(run_result)
         if persist_results and output_dir:
             _persist_result(run_result, output_dir, app_id, idx, prepared_inputs)
             persisted_files.append(_persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs))
 
-    logger.info("Workflow execution finished", extra={"runs": len(results)})
+    logger.info("Workflow execution finished", extra={"runs": len(final_results)})
     if persist_results and output_dir:
         try:
             import json as _json
@@ -397,10 +417,16 @@ def execute_workflow_v1(
             summary_dir = base / _safe_dirname_from_id(app_id) / "runs"
             summary_dir.mkdir(parents=True, exist_ok=True)
             summary_file = summary_dir / "runs_summary.json"
-            failure_count = len([r for r in results if str(r.get("result", "")).lower() != "success" and r.get("status") not in {"success", "succeeded"}])
+            failure_count = len(
+                [
+                    r
+                    for r in final_results
+                    if str(r.get("result", "")).lower() != "success" and r.get("status") not in {"success", "succeeded"}
+                ]
+            )
             summary_payload = {
                 "workflow_id": app_id,
-                "total_runs": len(results),
+                "total_runs": len(final_results),
                 "failures": failure_count,
                 "files": [str(p) for p in persisted_files],
             }
@@ -460,4 +486,5 @@ def execute_workflow_from_config(
         input_types=declared_types,
         output_dir=output_dir,
         persist_results=persist_results and bool(output_dir),
+        concurrency=rt.app.execution.get("concurrency") if rt.app.execution else 1,
     )

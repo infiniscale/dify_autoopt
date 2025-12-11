@@ -193,6 +193,9 @@ def run_optimize_loop(
     rt = get_runtime()
     output_dir = (rt.app.io_paths or {}).get("output_dir") or "./outputs"
     exec_timeout = rt.app.execution.get("timeout", 9000) if rt.app.execution else 9000
+    run_concurrency = rt.app.execution.get("concurrency", 1) if rt.app.execution else 1
+    if isinstance(opt_cfg.get("run_concurrency"), int) and opt_cfg.get("run_concurrency") > 0:
+        run_concurrency = opt_cfg.get("run_concurrency")
     opt_cfg = rt.app.optimization or {}
     llm_cfg = opt_cfg.get("llm")
 
@@ -225,6 +228,7 @@ def run_optimize_loop(
                 "has_token": bool(console_token),
                 "token_prefix": console_token[:4] + "****" if console_token and isinstance(console_token, str) and len(console_token) >= 8 else "<short/empty>",
                 "workflows": len(workflows_ctx),
+                "run_concurrency": run_concurrency,
             },
         )
         # 简单校验 token 是否可用：拉一次 apps 列表（仅在 token 可用时）
@@ -288,6 +292,7 @@ def run_optimize_loop(
                     input_types=declared_types,
                     output_dir=output_dir,
                     persist_results=True,
+                    concurrency=run_concurrency,
                 )
             except Exception as ex:  # noqa: BLE001
                 logger.warning(
