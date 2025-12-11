@@ -12,7 +12,7 @@ from __future__ import annotations
 import mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 
 import requests
 
@@ -390,11 +390,20 @@ def execute_workflow_v1(
         logger.info("并发执行工作流", extra={"workflow_id": app_id, "rows": len(rows), "concurrency": concurrency})
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {pool.submit(_one_row, idx, row): idx for idx, row in enumerate(rows, start=1)}
-            for fut in as_completed(futures):
-                try:
-                    results.append(fut.result())
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("单条运行失败", extra={"index": futures[fut], "error": str(exc)})
+            try:
+                for fut in as_completed(futures, timeout=timeout):
+                    idx = futures[fut]
+                    try:
+                        results.append(fut.result())
+                        logger.debug("工作流单条完成", extra={"index": idx})
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("单条运行失败", extra={"index": idx, "error": str(exc)})
+            except FuturesTimeout:
+                pending = [i for f, i in futures.items() if not f.done()]
+                for f in futures:
+                    if not f.done():
+                        f.cancel()
+                raise RuntimeError(f"并发执行超时，未完成条目: {pending}")
     else:
         for idx, row in enumerate(rows, start=1):
             results.append(_one_row(idx, row))
