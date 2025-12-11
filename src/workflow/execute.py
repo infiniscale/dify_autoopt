@@ -10,6 +10,7 @@ This module keeps three responsibilities:
 from __future__ import annotations
 
 import mimetypes
+import time
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -357,6 +358,7 @@ def execute_workflow_v1(
     output_dir: Optional[Union[str, Path]] = None,
     persist_results: bool = False,
     concurrency: int = 1,
+    retry_count: int = 0,
 ) -> List[Dict[str, Any]]:
     """
     Execute a workflow via the Dify public API (blocking).
@@ -407,86 +409,77 @@ def execute_workflow_v1(
     results: List[Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]] = []
 
     def _one_row(idx: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]:
-        api_key_local = _get_api_key()
-        try:
-            prepared_inputs = _prepare_inputs_with_files(
-                row,
-                base_url=resolved_base,
-                api_key=api_key_local,
-                user=user,
-                timeout=timeout,
-                upload_path=upload_path,
-                declared_types=declared,
-            )
-        except HTTPError as exc:
-            status = getattr(exc.response, "status_code", None)
-            if status == 401:
-                new_key = _refresh_app_api_key(app_id, resolved_base, logger)
-                if new_key:
-                    _set_api_key(new_key)
-                    api_key_local = new_key
-                    prepared_inputs = _prepare_inputs_with_files(
-                        row,
-                        base_url=resolved_base,
-                        api_key=api_key_local,
-                        user=user,
-                        timeout=timeout,
-                        upload_path=upload_path,
-                        declared_types=declared,
-                    )
+        attempts = max(0, retry_count) + 1
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            api_key_local = _get_api_key()
+            try:
+                prepared_inputs = _prepare_inputs_with_files(
+                    row,
+                    base_url=resolved_base,
+                    api_key=api_key_local,
+                    user=user,
+                    timeout=timeout,
+                    upload_path=upload_path,
+                    declared_types=declared,
+                )
+                meta_fields: Dict[str, Any] = {}
+                if output_dir and "__output_dir" not in prepared_inputs:
+                    meta_fields["__output_dir"] = str(Path(output_dir).resolve())
+                if "__workflow_id" not in prepared_inputs:
+                    meta_fields["__workflow_id"] = app_id
+                if "__input_index" not in prepared_inputs:
+                    meta_fields["__input_index"] = idx
+                prepared_inputs.update(meta_fields)
+                logger.debug("Executing workflow row", extra={"index": idx, "keys": list(prepared_inputs.keys())})
+                run_result = _run_workflow_once(
+                    app_id,
+                    prepared_inputs,
+                    base_url=resolved_base,
+                    api_key=api_key_local,
+                    user=user,
+                    timeout=timeout,
+                    response_mode=response_mode,
+                    run_path=run_path,
+                )
+                # If run succeeds after potential refresh, align local key for subsequent runs
+                if api_key_local != _get_api_key():
+                    _set_api_key(api_key_local)
+                persisted_path: Optional[Path] = None
+                if persist_results and output_dir:
+                    _persist_result(run_result, output_dir, app_id, idx, prepared_inputs)
+                    persisted_path = _persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs)
+                return idx, prepared_inputs, run_result, persisted_path
+            except HTTPError as exc:
+                status = getattr(exc.response, "status_code", None)
+                # Prioritize token refresh for 401
+                if status == 401:
+                    new_key = _refresh_app_api_key(app_id, resolved_base, logger)
+                    if new_key:
+                        _set_api_key(new_key)
+                        last_exc = exc
+                        # retry in next loop iteration with new key
+                    else:
+                        raise
                 else:
-                    raise
-            else:
-                raise
-        meta_fields: Dict[str, Any] = {}
-        if output_dir and "__output_dir" not in prepared_inputs:
-            meta_fields["__output_dir"] = str(Path(output_dir).resolve())
-        if "__workflow_id" not in prepared_inputs:
-            meta_fields["__workflow_id"] = app_id
-        if "__input_index" not in prepared_inputs:
-            meta_fields["__input_index"] = idx
-        prepared_inputs.update(meta_fields)
-        logger.debug("Executing workflow row", extra={"index": idx, "keys": list(prepared_inputs.keys())})
-        try:
-            run_result = _run_workflow_once(
-                app_id,
-                prepared_inputs,
-                base_url=resolved_base,
-                api_key=api_key_local,
-                user=user,
-                timeout=timeout,
-                response_mode=response_mode,
-                run_path=run_path,
-            )
-        except HTTPError as exc:
-            status = getattr(exc.response, "status_code", None)
-            if status == 401:
-                new_key = _refresh_app_api_key(app_id, resolved_base, logger)
-                if new_key:
-                    _set_api_key(new_key)
-                    api_key_local = new_key
-                    run_result = _run_workflow_once(
-                        app_id,
-                        prepared_inputs,
-                        base_url=resolved_base,
-                        api_key=api_key_local,
-                        user=user,
-                        timeout=timeout,
-                        response_mode=response_mode,
-                        run_path=run_path,
+                    last_exc = exc
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+
+            if attempt < attempts:
+                try:
+                    logger.warning(
+                        "单条运行失败，准备重试",
+                        extra={"index": idx, "attempt": attempt, "max_attempts": attempts, "error": str(last_exc)},
                     )
-                else:
-                    raise
-            else:
-                raise
-        # If run succeeds after potential refresh, align local key for subsequent runs
-        if api_key_local != _get_api_key():
-            _set_api_key(api_key_local)
-        persisted_path: Optional[Path] = None
-        if persist_results and output_dir:
-            _persist_result(run_result, output_dir, app_id, idx, prepared_inputs)
-            persisted_path = _persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs)
-        return idx, prepared_inputs, run_result, persisted_path
+                except Exception:
+                    pass
+                time.sleep(min(2 ** (attempt - 1), 5))
+                continue
+            if last_exc:
+                raise last_exc
+        # Should not reach here
+        raise RuntimeError("Unexpected retry loop exit")
 
     if concurrency and concurrency > 1 and len(rows) > 1:
         logger.info("并发执行工作流", extra={"workflow_id": app_id, "rows": len(rows), "concurrency": concurrency})
