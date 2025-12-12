@@ -81,6 +81,45 @@ class PromptLocation:
 
 
 @dataclass
+class NodeBrief:
+    """Lightweight description of a workflow node for rewriting context."""
+
+    node_id: str
+    node_name: str
+    node_type: str
+    role: str = ""
+    input_schema: Dict[str, Any] = field(default_factory=dict)
+    output_schema: Dict[str, Any] = field(default_factory=dict)
+    downstream_constraints: List[str] = field(default_factory=list)
+    placeholders: List[str] = field(default_factory=list)
+    message_layout: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class FailSignal:
+    """Structured failure hints instead of one long feedback string."""
+
+    tags: List[str] = field(default_factory=list)
+    missing_fields: List[str] = field(default_factory=list)
+    format_errors: List[str] = field(default_factory=list)
+    constraint_gaps: List[str] = field(default_factory=list)
+    semantic_gaps: List[str] = field(default_factory=list)
+    examples: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class PromptBlock:
+    """A node-level prompt consisting of multiple messages."""
+
+    node_id: str
+    node_name: str
+    node_type: str
+    messages: List[Dict[str, Any]]  # each: {"role": str, "text": str, "path": str, "index": int}
+    merged_text: str
+    brief: Optional[NodeBrief] = None
+
+
+@dataclass
 class PromptPatch:
     """Patch suggestion for a prompt field."""
 
@@ -324,8 +363,150 @@ def _iter_llm_prompts(workflow_yaml: Dict[str, Any]) -> Iterable[PromptLocation]
                 yield PromptLocation(node_id=node_id, path=path, text=str(data["system_prompt"]))
 
 
+def _merge_messages_with_markers(messages: Sequence[Dict[str, Any]]) -> str:
+    """Merge multiple messages into a single text with stable markers for round-trip editing."""
+    parts: List[str] = []
+    for msg in messages:
+        role = msg.get("role") or "user"
+        idx = msg.get("index", 0)
+        start = f"<ROLE::{role}::{idx}>"
+        end = f"</ROLE::{role}::{idx}>"
+        parts.extend([start, str(msg.get("text", "")), end])
+    return "\n".join(parts)
+
+
+def _split_block_by_markers(block: PromptBlock, merged_text: str) -> Optional[List[str]]:
+    """Split merged text back into message texts using role/index markers; returns None if markers are missing."""
+    segments: Dict[Tuple[str, int], str] = {}
+    pattern = re.compile(r"<ROLE::(?P<role>[^:>]+)::(?P<idx>\d+)>")
+    pos = 0
+    while True:
+        match = pattern.search(merged_text, pos)
+        if not match:
+            break
+        role = match.group("role")
+        idx = int(match.group("idx"))
+        end_token = f"</ROLE::{role}::{idx}>"
+        start_content = match.end()
+        end_content = merged_text.find(end_token, start_content)
+        if end_content == -1:
+            return None
+        segments[(role, idx)] = merged_text[start_content:end_content]
+        pos = end_content + len(end_token)
+    texts: List[str] = []
+    for msg in block.messages:
+        key = (msg.get("role") or "user", int(msg.get("index", 0)))
+        if key not in segments:
+            return None
+        texts.append(segments[key].strip())
+    return texts
+
+
+def _build_node_brief(node: Dict[str, Any], merged_text: str, node_id: str) -> NodeBrief:
+    """Extract a concise node brief for rewriting context."""
+    placeholders = _extract_placeholders(merged_text)
+    node_name = str(node.get("data", {}).get("title") or node.get("data", {}).get("label") or node.get("id") or node_id)
+    node_type = str(node.get("type") or "")
+    role = str(node.get("data", {}).get("role") or node.get("data", {}).get("description") or node_type)
+    input_schema = {}
+    output_schema = {}
+    data = node.get("data") or {}
+    if isinstance(data.get("inputs"), dict):
+        input_schema = data.get("inputs") or {}
+    if isinstance(data.get("output_schema"), dict):
+        output_schema = data.get("output_schema") or {}
+    layout: List[Dict[str, Any]] = []
+    prompt_template = data.get("prompt_template")
+    messages = []
+    if isinstance(prompt_template, dict):
+        messages = prompt_template.get("messages") or []
+    elif isinstance(prompt_template, list):
+        messages = prompt_template
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        layout.append({"role": msg.get("role"), "index": idx})
+    if "system_prompt" in data:
+        layout.append({"role": "system", "index": len(layout)})
+    return NodeBrief(
+        node_id=node_id,
+        node_name=node_name,
+        node_type=node_type,
+        role=role,
+        input_schema=input_schema,
+        output_schema=output_schema,
+        downstream_constraints=[],
+        placeholders=placeholders,
+        message_layout=layout,
+    )
+
+
+def _iter_prompt_blocks(workflow_yaml: Dict[str, Any]) -> Iterable[PromptBlock]:
+    """Yield node-level prompt blocks (system + user messages)."""
+    graph, graph_pointer = _extract_graph(workflow_yaml or {})
+    buckets = []
+    if "nodes" in graph:
+        buckets.append(("nodes", graph.get("nodes") or []))
+    if "data" in graph:
+        buckets.append(("data", graph.get("data") or []))
+    for bucket_name, nodes in buckets:
+        for idx, node in enumerate(nodes):
+            if not isinstance(node, dict):
+                continue
+            node_id = str(node.get("id") or f"node_{idx}")
+            data = node.get("data") or {}
+            prompt_template = data.get("prompt_template")
+            messages: List[Dict[str, Any]] = []
+            if isinstance(prompt_template, dict):
+                for mi, msg in enumerate(prompt_template.get("messages") or []):
+                    if not isinstance(msg, dict) or msg.get("text") is None:
+                        continue
+                    sub_path = "messages"
+                    path = f"{graph_pointer}/{bucket_name}/{idx}/data/prompt_template/{sub_path}/{mi}/text"
+                    messages.append({"role": msg.get("role") or "user", "text": str(msg.get("text")), "path": path, "index": mi})
+            elif isinstance(prompt_template, list):
+                for mi, msg in enumerate(prompt_template):
+                    if not isinstance(msg, dict) or msg.get("text") is None:
+                        continue
+                    path = f"{graph_pointer}/{bucket_name}/{idx}/data/prompt_template/{mi}/text"
+                    messages.append({"role": msg.get("role") or "user", "text": str(msg.get("text")), "path": path, "index": mi})
+            if "system_prompt" in data:
+                path = f"{graph_pointer}/{bucket_name}/{idx}/data/system_prompt"
+                messages.append({"role": "system", "text": str(data["system_prompt"]), "path": path, "index": len(messages)})
+            if not messages:
+                continue
+            merged = _merge_messages_with_markers(messages)
+            brief = _build_node_brief(node, merged, node_id)
+            yield PromptBlock(
+                node_id=node_id,
+                node_name=brief.node_name,
+                node_type=brief.node_type,
+                messages=messages,
+                merged_text=merged,
+                brief=brief,
+            )
+
+
 def _similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a or "", b or "").ratio()
+
+
+def _tokenize_keywords(text: str) -> List[str]:
+    return [w for w in re.findall(r"[A-Za-z0-9_]+", text.lower()) if len(w) >= 3]
+
+
+def _should_skip_for_intent(prompt_text: str, constraints: Sequence[str], expected_outputs: Sequence[str]) -> bool:
+    """Heuristic: if prompt shares almost no keywords with expectations, skip rewriting."""
+    keyword_source = " ".join(list(constraints or []) + list(expected_outputs or []))
+    keywords = set(_tokenize_keywords(keyword_source))
+    if not keywords:
+        return False
+    prompt_tokens = set(_tokenize_keywords(prompt_text))
+    if not prompt_tokens:
+        return True
+    overlap = keywords & prompt_tokens
+    ratio = len(overlap) / max(len(keywords), 1)
+    return ratio < 0.15 and len(overlap) <= 1
 
 
 class PromptDeltaDetector:
@@ -502,31 +683,45 @@ class PromptOptimizer:
         except Exception:
             pass
 
-        prompts = list(_iter_llm_prompts(workflow_tree))
+        prompt_blocks = list(_iter_prompt_blocks(workflow_tree))
         judge = _LlmPromptJudge(self.llm_config) if self.llm_config else None
         # Determine which prompts need change: if judge exists, use it; else default to "issues exist"
-        filtered_prompts: List[PromptLocation] = []
-        total_prompts = len(prompts)
-        for prompt in prompts:
-            needs = True if not judge else judge.needs_change(prompt.text, issues, reference.constraints)
+        filtered_blocks: List[PromptBlock] = []
+        skip_intent_blocks = 0
+        total_prompts = len(prompt_blocks)
+        for block in prompt_blocks:
+            prompt_text = block.merged_text
+            if _should_skip_for_intent(prompt_text, reference.constraints, reference.expected_outputs):
+                skip_intent_blocks += 1
+                try:
+                    logger.info(
+                        "跳过意图不相关的 prompt block",
+                        extra={"workflow_id": workflow_id, "node_id": block.node_id},
+                    )
+                except Exception:
+                    pass
+                continue
+            needs = True if not judge else judge.needs_change(prompt_text, issues, reference.constraints)
             if needs:
-                filtered_prompts.append(prompt)
-        judged_no_change = total_prompts - len(filtered_prompts)
+                filtered_blocks.append(block)
+        judged_no_change = total_prompts - len(filtered_blocks)
         prompts_skip_ratio = None
         if judge and total_prompts > 0:
             prompts_skip_ratio = judged_no_change / total_prompts
 
         patches: List[PromptPatch] = []
+        fail_signal = _build_fail_signal_from_issues(issues, reference.constraints)
         use_dspy = self.llm_config.get("use_dspy_optimizer", True)
         if use_dspy:
             dspy_optimizer = _DspyPromptOptimizer(self.llm_config)
             try:
-                patches = dspy_optimizer.optimize_prompts(
+                patches = dspy_optimizer.optimize_blocks(
                     workflow_id,
-                    filtered_prompts,
+                    filtered_blocks,
                     samples,
                     reference_texts or [],
                     reference.constraints,
+                    fail_signal=fail_signal,
                 )
             except Exception as exc:  # noqa: BLE001
                 try:
@@ -553,10 +748,11 @@ class PromptOptimizer:
             rewriter = dspy_rewriter if dspy_rewriter.available else _LlmRewriter(self.llm_config)
 
         if rewriter:
+            context_text = _format_fail_signal(fail_signal)
             refined: List[PromptPatch] = []
             for patch in patches:
                 try:
-                    new_text = rewriter.rewrite(patch.new, issues, reference.constraints)
+                    new_text = rewriter.rewrite(patch.new, issues, reference.constraints, context=context_text)
                     patch.new = new_text
                     refined.append(patch)
                 except Exception:
@@ -582,8 +778,9 @@ class PromptOptimizer:
                 "failures": len([s for s in samples if s.status not in {"success", "succeeded"}]),
                 "reference_texts": len([t for t in (reference_texts or []) if t]),
                 "prompts_total": total_prompts,
-                "prompts_need_change": len(filtered_prompts),
+                "prompts_need_change": len(filtered_blocks),
                 "prompts_no_change": judged_no_change,
+                "prompts_skip_intent": skip_intent_blocks,
                 "prompts_skip_ratio": prompts_skip_ratio,
                 **judge_stats,
             },
@@ -1073,6 +1270,108 @@ def _placeholders_preserved(original_placeholders: Sequence[str], new_text: str)
     return set(original_placeholders) == set(_extract_placeholders(new_text))
 
 
+def _build_fail_signal_from_issues(issues: Sequence[DetectedIssue], constraints: Sequence[str]) -> FailSignal:
+    """Map detected issues into structured fail signals for rewrites."""
+    tags: List[str] = []
+    missing_fields: List[str] = []
+    format_errors: List[str] = []
+    constraint_gaps: List[str] = []
+    semantic_gaps: List[str] = []
+    for issue in issues:
+        kind = (issue.kind or "").lower()
+        msg = (issue.message or "").lower()
+        if kind not in tags:
+            tags.append(kind)
+        if "format" in msg or "json" in msg:
+            format_errors.append(issue.message)
+        if "missing" in msg or "not observed" in msg:
+            missing_fields.append(issue.message)
+        if "constraint" in msg:
+            constraint_gaps.append(issue.message)
+        if "similarity" in msg or "mismatch" in msg:
+            semantic_gaps.append(issue.message)
+    for c in constraints or []:
+        if c and all(c.lower() not in item.lower() for item in constraint_gaps):
+            constraint_gaps.append(f"Ensure constraint is satisfied: {c}")
+    return FailSignal(
+        tags=tags,
+        missing_fields=missing_fields,
+        format_errors=format_errors,
+        constraint_gaps=constraint_gaps,
+        semantic_gaps=semantic_gaps,
+        examples=[],
+    )
+
+
+def _format_fail_signal(signal: FailSignal) -> str:
+    lines = []
+    if signal.tags:
+        lines.append(f"tags: {', '.join(signal.tags)}")
+    if signal.missing_fields:
+        lines.append("missing_fields:")
+        lines.extend(f"- {m}" for m in signal.missing_fields)
+    if signal.format_errors:
+        lines.append("format_errors:")
+        lines.extend(f"- {m}" for m in signal.format_errors)
+    if signal.constraint_gaps:
+        lines.append("constraint_gaps:")
+        lines.extend(f"- {m}" for m in signal.constraint_gaps)
+    if signal.semantic_gaps:
+        lines.append("semantic_gaps:")
+        lines.extend(f"- {m}" for m in signal.semantic_gaps)
+    return "\n".join(lines)
+
+
+def _format_node_brief(brief: Optional[NodeBrief]) -> str:
+    if not brief:
+        return ""
+    parts = [
+        f"node_id: {brief.node_id}",
+        f"name: {brief.node_name}",
+        f"type: {brief.node_type}",
+    ]
+    if brief.role:
+        parts.append(f"role: {brief.role}")
+    if brief.input_schema:
+        parts.append(f"input_schema keys: {list(brief.input_schema.keys())}")
+    if brief.output_schema:
+        parts.append(f"output_schema keys: {list(brief.output_schema.keys())}")
+    if brief.downstream_constraints:
+        parts.append(f"downstream_constraints: {brief.downstream_constraints}")
+    if brief.message_layout:
+        parts.append(f"message_layout: {brief.message_layout}")
+    if brief.placeholders:
+        parts.append(f"placeholders (do not change): {brief.placeholders}")
+    return "\n".join(parts)
+
+
+def _build_block_context(block: PromptBlock, fail_signal: FailSignal, constraints: Sequence[str]) -> str:
+    parts = [
+        "Node brief:",
+        _format_node_brief(block.brief),
+        "",
+        "Failure signals:",
+        _format_fail_signal(fail_signal),
+    ]
+    if constraints:
+        parts.append("")
+        parts.append("Global constraints:")
+        parts.extend(f"- {c}" for c in constraints)
+    if block.brief and block.brief.placeholders:
+        parts.append("")
+        parts.append("Placeholders (must remain exactly):")
+        parts.extend(f"- {ph}" for ph in block.brief.placeholders)
+    return "\n".join(part for part in parts if part is not None)
+
+
+def _validate_block_rewrite(block: PromptBlock, new_text: str) -> bool:
+    """Validate rewritten block keeps markers and placeholders."""
+    if block.brief and not _placeholders_preserved(block.brief.placeholders, new_text):
+        return False
+    markers_ok = _split_block_by_markers(block, new_text) is not None
+    return markers_ok
+
+
 def _safe_rewrite_prompt(current: str, rewrite_fn) -> str:
     """
     Run rewrite_fn with placeholder masking. If placeholders are dropped/altered, fall back to original.
@@ -1202,8 +1501,16 @@ class _LlmRewriter:
         self.model = cfg.get("model")
         self.api_key = cfg.get("api_key")
 
-    def rewrite(self, current: str, issues: Sequence[DetectedIssue], constraints: Sequence[str]) -> str:
+    def rewrite(
+        self,
+        current: str,
+        issues: Sequence[DetectedIssue],
+        constraints: Sequence[str],
+        context: Optional[str] = None,
+    ) -> str:
         import requests
+
+        placeholders = _extract_placeholders(current)
 
         def _do_rewrite(masked_prompt: str) -> str:
             prompt_lines = [
@@ -1215,6 +1522,13 @@ class _LlmRewriter:
                 prompt_lines.append("Ensure these constraints are included:")
                 for c in constraints:
                     prompt_lines.append(f"- {c}")
+            if placeholders:
+                prompt_lines.append("Do NOT change or drop these placeholders/variables:")
+                for ph in placeholders:
+                    prompt_lines.append(f"- {ph}")
+            if context:
+                prompt_lines.append("Context:")
+                prompt_lines.append(context)
             prompt_lines.append("Original prompt:")
             prompt_lines.append(masked_prompt)
             payload = {
@@ -1308,9 +1622,17 @@ class _DspyRewriter:
         self.cfg = cfg
         self.available = self._dspy is not None
 
-    def rewrite(self, current: str, issues: Sequence[DetectedIssue], constraints: Sequence[str]) -> str:
+    def rewrite(
+        self,
+        current: str,
+        issues: Sequence[DetectedIssue],
+        constraints: Sequence[str],
+        context: Optional[str] = None,
+    ) -> str:
         if not self.available:
             return current
+
+        placeholders = _extract_placeholders(current)
 
         def _do_rewrite(masked_prompt: str) -> str:
             # Minimal dspy-based rewrite: use LM to propose a revised prompt
@@ -1324,13 +1646,22 @@ class _DspyRewriter:
 
                 issues: str
                 constraints: str
+                context: str
+                placeholders: str
                 original_prompt: str
                 improved_prompt: str
 
             chain = self._dspy.ChainOfThought(RewriteSpec, lm=lm)  # type: ignore[attr-defined]
             issues_text = "; ".join(f"{it.kind}: {it.message}" for it in issues) or "none"
             constraints_text = "; ".join(constraints) or "none"
-            res = chain(issues=issues_text, constraints=constraints_text, original_prompt=masked_prompt)
+            placeholders_text = "; ".join(placeholders) or "none"
+            res = chain(
+                issues=issues_text,
+                constraints=constraints_text,
+                context=context or "none",
+                placeholders=placeholders_text,
+                original_prompt=masked_prompt,
+            )
             return getattr(res, "improved_prompt", masked_prompt) or masked_prompt
 
         return _safe_rewrite_prompt(current, _do_rewrite)
@@ -1433,7 +1764,15 @@ class _DspyPromptOptimizer:
         rewriter = self._dspy.ChainOfThought(self._rewrite_signature())  # type: ignore[attr-defined]
         patches: List[PromptPatch] = []
         for prompt in prompts:
-            improved = self._optimize_single(prompt.text, dataset, constraints, predictor, judge, rewriter)
+            improved = self._optimize_single(
+                prompt.text,
+                dataset,
+                constraints,
+                predictor,
+                judge,
+                rewriter,
+                None,
+            )
             if not improved or improved.strip() == prompt.text.strip():
                 continue
             try:
@@ -1459,6 +1798,72 @@ class _DspyPromptOptimizer:
                     evidence_runs=[record["run_index"] for record in dataset],
                 )
             )
+        return patches
+
+    def optimize_blocks(
+        self,
+        workflow_id: str,
+        blocks: Sequence[PromptBlock],
+        samples: Sequence[ExecutionSample],
+        reference_texts: Sequence[Optional[str]],
+        constraints: Sequence[str],
+        fail_signal: Optional[FailSignal] = None,
+    ) -> List[PromptPatch]:
+        if not self.available or not blocks:
+            return []
+        dataset = self._build_dataset(samples, reference_texts)
+        if not dataset:
+            return []
+        predictor = self._dspy.ChainOfThought(self._predict_signature())  # type: ignore[attr-defined]
+        judge = self._dspy.ChainOfThought(self._judge_signature())  # type: ignore[attr-defined]
+        rewriter = self._dspy.ChainOfThought(self._rewrite_signature())  # type: ignore[attr-defined]
+        patches: List[PromptPatch] = []
+        effective_signal = fail_signal or FailSignal()
+        for block in blocks:
+            context_text = _build_block_context(block, effective_signal, constraints)
+            placeholders_text = "; ".join(block.brief.placeholders) if block.brief and block.brief.placeholders else ""
+            improved = self._optimize_single(
+                block.merged_text,
+                dataset,
+                constraints,
+                predictor,
+                judge,
+                rewriter,
+                context_text,
+                placeholders_text,
+            )
+            if not improved or improved.strip() == block.merged_text.strip():
+                continue
+            if not _validate_block_rewrite(block, improved):
+                try:
+                    logger.warning(
+                        "DSPy block rewrite校验失败，保持原提示词",
+                        extra={"workflow_id": workflow_id, "node_id": block.node_id},
+                    )
+                except Exception:
+                    pass
+                continue
+            split_texts = _split_block_by_markers(block, improved)
+            if not split_texts:
+                continue
+            for msg, new_text in zip(block.messages, split_texts):
+                if new_text is None:
+                    continue
+                old_text = str(msg.get("text") or "")
+                if new_text.strip() == old_text.strip():
+                    continue
+                patches.append(
+                    PromptPatch(
+                        workflow_id=workflow_id,
+                        node_id=block.node_id,
+                        field_path=msg.get("path", ""),
+                        old=old_text,
+                        new=new_text,
+                        rationale="DSPy optimizer updated prompt block with node context",
+                        confidence=0.75,
+                        evidence_runs=[record["run_index"] for record in dataset],
+                    )
+                )
         return patches
 
     def _build_dataset(
@@ -1501,6 +1906,8 @@ class _DspyPromptOptimizer:
         predictor,
         judge,
         rewriter,
+        context_text: Optional[str] = None,
+        placeholders_text: Optional[str] = None,
     ) -> str:
         prompt_text = current_prompt
         for _ in range(max(1, self.max_iterations)):
@@ -1582,6 +1989,8 @@ class _DspyPromptOptimizer:
                     current_prompt=masked_prompt,
                     failures=feedback_text,
                     constraints="\n".join(constraints) if constraints else "None",
+                    context=context_text or "None",
+                    placeholders=placeholders_text or "None",
                 )
                 return getattr(rewrite, "optimized_prompt", "") or masked_prompt
 
@@ -1674,6 +2083,8 @@ class _DspyPromptOptimizer:
             current_prompt = dspy.InputField(desc="Original prompt text")  # type: ignore[attr-defined]
             failures = dspy.InputField(desc="Judge feedback details")  # type: ignore[attr-defined]
             constraints = dspy.InputField(desc="Constraints checklist")  # type: ignore[attr-defined]
+            context = dspy.InputField(desc="Node brief and failure signals")  # type: ignore[attr-defined]
+            placeholders = dspy.InputField(desc="Placeholders that must stay intact")  # type: ignore[attr-defined]
             optimized_prompt = dspy.OutputField(desc="Improved prompt text")  # type: ignore[attr-defined]
 
         return RewriteSignature
