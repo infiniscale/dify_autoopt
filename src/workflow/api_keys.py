@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 import requests
 
 from src.utils.logger import get_logger
-from .apps import _resolve_token, _login_token
+from .apps import _resolve_token, _login_token, _mask_token
 
 logger = get_logger("workflow.api_keys")
 
@@ -60,12 +60,31 @@ def create_api_key(
         logger.warning("无法创建 API Key，缺少 token", extra={"app_id": app_id})
         return None
     url = f"{base_url.rstrip('/')}/console/api/apps/{app_id}/api-keys"
-    headers = {"Authorization": f"Bearer {resolved_token}"}
     payload = {"name": name or f"auto-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}", "type": "app"}
+
+    def _post_with_token(tok: str):
+        headers = {"Authorization": f"Bearer {tok}"}
+        return requests.post(url, headers=headers, json=payload, timeout=timeout), headers
+
     resp = None
+    current_headers = {"Authorization": f"Bearer {resolved_token}"}
     try:
         logger.info("Creating API key", extra={"url": url, "app_id": app_id, "payload": payload})
-        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        resp, current_headers = _post_with_token(resolved_token)
+        if resp.status_code == 401:
+            refreshed_token = _login_token(base_url)
+            if refreshed_token and refreshed_token != resolved_token:
+                logger.info(
+                    "Token expired, retrying API key creation with refreshed token",
+                    extra={
+                        "app_id": app_id,
+                        "url": url,
+                        "old_token": _mask_token(resolved_token),
+                        "new_token": _mask_token(refreshed_token),
+                    },
+                )
+                resolved_token = refreshed_token
+                resp, current_headers = _post_with_token(resolved_token)
         status = resp.status_code
         body_snippet = resp.text[:300] if resp.text else ""
         logger.debug("Create API key response", extra={"status": status, "body": body_snippet})
@@ -86,7 +105,7 @@ def create_api_key(
                     "status": resp.status_code if resp else None,
                     "body": resp.text[:300] if resp else None,
                     "error": str(exc),
-                    "headers": headers,
+                    "headers": current_headers,
                     "payload": payload,
                 },
             )
@@ -124,11 +143,30 @@ def list_api_keys(
         return []
 
     url = f"{base_url.rstrip('/')}/console/api/apps/{app_id}/api-keys"
-    headers = {"Authorization": f"Bearer {resolved_token}"}
     resp = None
+    current_headers = {"Authorization": f"Bearer {resolved_token}"}
+
+    def _get_with_token(tok: str):
+        headers = {"Authorization": f"Bearer {tok}"}
+        return requests.get(url, headers=headers, timeout=timeout), headers
+
     try:
-        logger.info("Fetching API keys", extra={"url": url, "app_id": app_id, "headers": headers})
-        resp = requests.get(url, headers=headers, timeout=timeout)
+        logger.info("Fetching API keys", extra={"url": url, "app_id": app_id, "headers": current_headers})
+        resp, current_headers = _get_with_token(resolved_token)
+        if resp.status_code == 401:
+            refreshed_token = _login_token(base_url)
+            if refreshed_token and refreshed_token != resolved_token:
+                logger.info(
+                    "Token expired, retrying API key fetch with refreshed token",
+                    extra={
+                        "app_id": app_id,
+                        "url": url,
+                        "old_token": _mask_token(resolved_token),
+                        "new_token": _mask_token(refreshed_token),
+                    },
+                )
+                resolved_token = refreshed_token
+                resp, current_headers = _get_with_token(resolved_token)
         status = resp.status_code
         body_snippet = resp.text[:300] if resp.text else ""
         logger.debug("API keys raw response", extra={"status": status, "body": body_snippet})

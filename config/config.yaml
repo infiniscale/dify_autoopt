@@ -44,7 +44,7 @@ workflows:
         type: file
         value:
           - "./docs/购销合同.pdf"
-          - "./docs/【满开x西藏酷爱通信有限公司】apple授权专营店合作协议.docx"
+          # - "./docs/【满开x西藏酷爱通信有限公司】apple授权专营店合作协议.docx"
           # - "./docs/长宁龙之梦合同.pdf"
           # - "./docs/受理终端采购协议（2025版）爱施德(1).pdf"
           # - "./docs/采购合同(1).docx"
@@ -65,7 +65,7 @@ workflows:
         value: "testtest"
     reference:
       - "./docs/reference-rules/购销合同_分析报告.md"
-      - "./docs/reference-rules/【满开x西藏酷爱通信有限公司】apple授权专营店合作协议_分析报告.md"
+      # - "./docs/reference-rules/【满开x西藏酷爱通信有限公司】apple授权专营店合作协议_分析报告.md"
       # - "./docs/reference-rules/长宁龙之梦合同_分析报告.md"
       # - "./docs/reference-rules/受理终端采购协议（2025版）爱施德(1)_分析报告.md"
       # - "./docs/reference-rules/采购合同(1)_分析报告.md"
@@ -88,7 +88,7 @@ workflows:
 # ===== 执行与并发配置 =====
 execution:
   concurrency: 5
-  timeout: 9000                  # 秒
+  timeout: 90000
   retry_count: 3
   rate_limit:
     per_minute: 60
@@ -104,9 +104,12 @@ optimization:
   max_iterations: 3
   exit_ratio: 0.8
   llm:
-    url: "http://211.93.0.206:10027/v1/chat/completions"
-    model: "glm-4.6-fp8"
-    api_key: "sk-4ZYDiy0HfYjRUJNYg8Hw2ULHbZc0UcS3WnXBwzSUQADteVzL"
+    url: "${LLM_BASE_URL}"
+    # url: "http://211.93.0.206:10027/v1/chat/completions"
+    # model: "glm-4.6-fp8"
+    model: "${LLM_MODEL}"
+    # api_key: "sk-4ZYDiy0HfYjRUJNYg8Hw2ULHbZc0UcS3WnXBwzSUQADteVzL"
+    api_key: "${LLM_API_KEY}"
     enable_cache: true
     cache_ttl: 86400
     health_timeout_seconds: 60
