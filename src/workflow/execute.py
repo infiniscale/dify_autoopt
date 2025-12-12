@@ -363,6 +363,7 @@ def execute_workflow_v1(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: int = 9000,
+    batch_timeout: Optional[Union[int, float]] = None,
     upload_path: Optional[str] = None,
     run_path: Optional[str] = None,
     user: Optional[str] = "autoopt",
@@ -400,10 +401,11 @@ def execute_workflow_v1(
     logger.debug(
         "Resolved workflow endpoints",
         extra={
-        "base_url": resolved_base,
-        "upload_path": (upload_path or f"{resolved_base}/files/upload"),
-        "run_path": (run_path or f"{resolved_base}/workflows/run"),
-        "api_key": _mask_token(_get_api_key()),
+            "base_url": resolved_base,
+            "upload_path": (upload_path or f"{resolved_base}/files/upload"),
+            "run_path": (run_path or f"{resolved_base}/workflows/run"),
+            "api_key": _mask_token(_get_api_key()),
+            "per_request_timeout": timeout,
         },
     )
 
@@ -421,6 +423,19 @@ def execute_workflow_v1(
     )
 
     results: List[Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]] = []
+
+    effective_batch_timeout: Optional[float]
+    try:
+        effective_batch_timeout = float(batch_timeout) if batch_timeout is not None else float(timeout) * max(
+            len(rows), 1
+        )
+    except Exception:
+        effective_batch_timeout = None
+    if effective_batch_timeout is None or effective_batch_timeout <= 0:
+        try:
+            effective_batch_timeout = float(timeout) * max(len(rows), 1)
+        except Exception:
+            effective_batch_timeout = float(timeout)
 
     # Build static metadata for persistence (avoid tokens)
     meta_base: Dict[str, Any] = {
@@ -535,11 +550,20 @@ def execute_workflow_v1(
         raise RuntimeError("Unexpected retry loop exit")
 
     if concurrency and concurrency > 1 and len(rows) > 1:
-        logger.info("并发执行工作流", extra={"workflow_id": app_id, "rows": len(rows), "concurrency": concurrency})
+        logger.info(
+            "并发执行工作流",
+            extra={
+                "workflow_id": app_id,
+                "rows": len(rows),
+                "concurrency": concurrency,
+                "batch_timeout": effective_batch_timeout,
+                "per_request_timeout": timeout,
+            },
+        )
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             futures = {pool.submit(_one_row, idx, row): idx for idx, row in enumerate(rows, start=1)}
             try:
-                for fut in as_completed(futures, timeout=timeout):
+                for fut in as_completed(futures, timeout=effective_batch_timeout):
                     idx = futures[fut]
                     try:
                         results.append(fut.result())
@@ -601,6 +625,7 @@ def execute_workflow_from_config(
     *,
     base_url: Optional[str] = None,
     timeout: int = 9000,
+    batch_timeout: Optional[Union[int, float]] = None,
     upload_path: Optional[str] = None,
     run_path: Optional[str] = None,
     persist_results: bool = True,
@@ -631,9 +656,16 @@ def execute_workflow_from_config(
     output_dir = (rt.app.io_paths or {}).get("output_dir")
     exec_cfg = rt.app.execution or {}
     exec_retry = retry_count if retry_count is not None else exec_cfg.get("retry_count", 0)
+    effective_batch_timeout: Optional[Union[int, float]] = batch_timeout
+    if effective_batch_timeout is None:
+        try:
+            effective_batch_timeout = float(timeout) * max(len(rows), 1)
+        except Exception:
+            effective_batch_timeout = None
     exec_meta = {
         "execution_config": {
             "timeout": timeout,
+            "batch_timeout": effective_batch_timeout,
             "retry_count": exec_retry,
             "concurrency": exec_cfg.get("concurrency"),
             "response_mode": "blocking",
@@ -655,6 +687,7 @@ def execute_workflow_from_config(
         base_url=resolved_base,
         api_key=api_key,
         timeout=timeout,
+        batch_timeout=effective_batch_timeout,
         upload_path=upload_path,
         run_path=run_path,
         input_types=declared_types,

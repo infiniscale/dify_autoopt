@@ -88,7 +88,7 @@ workflows:
 # ===== 执行与并发配置 =====
 execution:
   concurrency: 5
-  timeout: 9000                  # 秒
+  timeout: 90000
   retry_count: 3
   rate_limit:
     per_minute: 60
