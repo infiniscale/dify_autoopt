@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import difflib
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import re
@@ -1676,6 +1678,7 @@ class _DspyPromptOptimizer:
         self.max_iterations = int(cfg.get("dspy_optimizer_iterations", 2))
         self.max_samples = int(cfg.get("dspy_optimizer_max_samples", 4))
         self.max_tokens = int(cfg.get("dspy_optimizer_max_tokens", DEFAULT_DSPY_MAX_TOKENS))
+        self._optimizer_cm = None
         self._lm = None
         url = cfg.get("url")
         model = cfg.get("model")
@@ -1752,6 +1755,7 @@ class _DspyPromptOptimizer:
     ) -> List[PromptPatch]:
         if not self.available or not prompts:
             return []
+        self._optimizer_cm = _get_optimizer_concurrency_manager()
         dataset = self._build_dataset(samples, reference_texts)
         if not dataset:
             return []
@@ -1773,8 +1777,9 @@ class _DspyPromptOptimizer:
                 rewriter,
                 None,
             )
+
             if not improved or improved.strip() == prompt.text.strip():
-                continue
+                return None
             try:
                 logger.info(
                     "DSPy 优化完成 prompt",
@@ -1786,18 +1791,30 @@ class _DspyPromptOptimizer:
                 )
             except Exception:
                 pass
-            patches.append(
-                PromptPatch(
-                    workflow_id=workflow_id,
-                    node_id=prompt.node_id,
-                    field_path=prompt.path,
-                    old=prompt.text,
-                    new=improved,
-                    rationale="DSPy optimizer updated prompt based on reference feedback",
-                    confidence=0.75,
-                    evidence_runs=[record["run_index"] for record in dataset],
-                )
+            return PromptPatch(
+                workflow_id=workflow_id,
+                node_id=prompt.node_id,
+                field_path=prompt.path,
+                old=prompt.text,
+                new=improved,
+                rationale="DSPy optimizer updated prompt based on reference feedback",
+                confidence=0.75,
+                evidence_runs=[record["run_index"] for record in dataset],
             )
+
+        if max_workers <= 1:
+            for prompt in prompts:
+                patch = _optimize(prompt)
+                if patch:
+                    patches.append(patch)
+            return patches
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(_optimize, prompt): prompt for prompt in prompts}
+            for future in as_completed(future_map):
+                patch = future.result()
+                if patch:
+                    patches.append(patch)
         return patches
 
     def optimize_blocks(
@@ -1909,51 +1926,89 @@ class _DspyPromptOptimizer:
         context_text: Optional[str] = None,
         placeholders_text: Optional[str] = None,
     ) -> str:
-        prompt_text = current_prompt
-        for _ in range(max(1, self.max_iterations)):
-            failures: List[str] = []
-            for record in dataset:
-                candidate = ""
-                try:
-                    prediction = predictor(
-                        workflow_input=record["workflow_input"],
-                        prompt_template=prompt_text,
-                    )
-                    candidate = self._extract_prediction_output(prediction)
-                except Exception as exc:  # noqa: BLE001
-                    fallback = _extract_lm_response_from_exception(exc)
-                    if fallback:
-                        candidate = fallback
-                        try:
-                            logger.debug(
-                                "DSPy predictor解析失败，使用原始 LM 响应回退",
-                                extra={
-                                    "workflow_input": record["workflow_input"][:200],
-                                    "fallback_preview": candidate[:200],
-                                },
-                            )
-                        except Exception:
-                            pass
-                    else:
+        cm = self._optimizer_cm
+        with (cm.slot() if cm else nullcontext()):
+            prompt_text = current_prompt
+            for _ in range(max(1, self.max_iterations)):
+                failures: List[str] = []
+                for record in dataset:
+                    candidate = ""
+                    try:
+                        prediction = predictor(
+                            workflow_input=record["workflow_input"],
+                            prompt_template=prompt_text,
+                        )
+                        candidate = self._extract_prediction_output(prediction)
+                    except Exception as exc:  # noqa: BLE001
+                        fallback = _extract_lm_response_from_exception(exc)
+                        if fallback:
+                            candidate = fallback
+                            try:
+                                logger.debug(
+                                    "DSPy predictor解析失败，使用原始 LM 响应回退",
+                                    extra={
+                                        "workflow_input": record["workflow_input"][:200],
+                                        "fallback_preview": candidate[:200],
+                                    },
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                logger.warning(
+                                    "DSPy predictor 执行失败",
+                                    extra={
+                                        "workflow_input": record["workflow_input"][:200],
+                                        "error": str(exc),
+                                    },
+                                )
+                            except Exception:
+                                pass
+                            failures.append(f"DSPy predictor failed: {exc}")
+                            continue
+                    if not candidate.strip():
+                        failures.append("DSPy predictor returned empty response")
+                        continue
+                    try:
+                        verdict = judge(
+                            reference=record["reference"],
+                            candidate=candidate,
+                        )
+                        verdict_raw = getattr(verdict, "verdict", None)
+                        verdict_text = (verdict_raw or "").lower()
+                        feedback = getattr(verdict, "feedback", "") or ""
+                        soft_pass, soft_score = _is_reference_soft_satisfied(record["reference"], candidate)
+                        if ("fail" in verdict_text or not verdict_text) and soft_pass:
+                            verdict_text = "pass"
+                            if not feedback:
+                                feedback = f"Soft-passed by similarity≈{soft_score:.2f} to reference"
+                    except Exception as exc:  # noqa: BLE001
+                        fallback_feedback = _extract_lm_response_from_exception(exc)
+                        detail = fallback_feedback or str(exc)
                         try:
                             logger.warning(
-                                "DSPy predictor 执行失败",
+                                "DSPy judge 执行失败，记为不通过",
                                 extra={
                                     "workflow_input": record["workflow_input"][:200],
                                     "error": str(exc),
+                                    "fallback": detail[:200],
                                 },
                             )
                         except Exception:
                             pass
-                        failures.append(f"DSPy predictor failed: {exc}")
+                        failures.append(f"DSPy judge failed: {detail}")
                         continue
-                if not candidate.strip():
-                    failures.append("DSPy predictor returned empty response")
-                    continue
-                try:
-                    verdict = judge(
-                        reference=record["reference"],
-                        candidate=candidate,
+                    if "fail" in verdict_text or not verdict_text:
+                        failures.append(feedback or f"Mismatch against reference:\n{record['reference'][:400]}")
+                if not failures:
+                    break
+                feedback_text = "\n".join(f"- {item}" for item in failures)
+
+                def _do_rewrite(masked_prompt: str) -> str:
+                    rewrite = rewriter(
+                        current_prompt=masked_prompt,
+                        failures=feedback_text,
+                        constraints="\n".join(constraints) if constraints else "None",
                     )
                     verdict_raw = getattr(verdict, "verdict", None)
                     verdict_text = (verdict_raw or "").lower()
@@ -1994,11 +2049,12 @@ class _DspyPromptOptimizer:
                 )
                 return getattr(rewrite, "optimized_prompt", "") or masked_prompt
 
-            new_prompt = _safe_rewrite_prompt(prompt_text, _do_rewrite)
-            if new_prompt == prompt_text:
-                break
-            prompt_text = new_prompt
-        return prompt_text
+
+                new_prompt = _safe_rewrite_prompt(prompt_text, _do_rewrite)
+                if new_prompt == prompt_text:
+                    break
+                prompt_text = new_prompt
+            return prompt_text
 
     def _build_lm(self):
         raw_model = str(self.cfg.get("dspy_model") or self.cfg.get("model"))
@@ -2097,3 +2153,18 @@ class _DspyPromptOptimizer:
             if text:
                 return text
         return _coerce_text(prediction)
+
+
+def _get_optimizer_concurrency_manager():
+    """Fetch optimizer-level concurrency manager from runtime if available."""
+    try:
+        from src.config.bootstrap import get_runtime
+
+        rt = get_runtime()
+        cm = getattr(rt, "optimizer_concurrency", None)
+        if cm:
+            return cm
+        conc_map = getattr(rt, "concurrency", None) or {}
+        return conc_map.get("optimizer")
+    except Exception:
+        return None

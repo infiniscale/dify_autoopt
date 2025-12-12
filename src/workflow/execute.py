@@ -16,6 +16,7 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 
+
 import requests
 from requests import HTTPError
 
@@ -589,6 +590,7 @@ def execute_workflow_v1(
             persisted_files.append(persisted_path)
 
     logger.info("Workflow execution finished", extra={"runs": len(final_results)})
+
     if persist_results and output_dir:
         try:
             import json as _json
@@ -697,3 +699,18 @@ def execute_workflow_from_config(
         retry_count=int(exec_retry) if isinstance(exec_retry, int) else 0,
         persist_metadata=exec_meta,
     )
+
+
+def _get_concurrency_manager(name: str):
+    """Return concurrency manager by name ('workflow'|'optimizer') if runtime is initialized."""
+    try:
+        from src.config.bootstrap import get_runtime
+
+        rt = get_runtime()
+        cm = getattr(rt, f"{name}_concurrency", None)
+        if cm:
+            return cm
+        conc_map = getattr(rt, "concurrency", None) or {}
+        return conc_map.get(name)
+    except Exception:
+        return None
