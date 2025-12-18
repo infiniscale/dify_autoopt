@@ -105,10 +105,7 @@ optimization:
   exit_ratio: 0.8
   llm:
     url: "${LLM_BASE_URL}"
-    # url: "http://211.93.0.206:10027/v1/chat/completions"
-    # model: "glm-4.6-fp8"
     model: "${LLM_MODEL}"
-    # api_key: "sk-4ZYDiy0HfYjRUJNYg8Hw2ULHbZc0UcS3WnXBwzSUQADteVzL"
     api_key: "${LLM_API_KEY}"
     enable_cache: true
     cache_ttl: 86400
