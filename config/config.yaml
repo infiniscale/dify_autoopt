@@ -13,14 +13,12 @@ meta:
 # ===== Dify 平台配置 =====
 dify:
   base_url: "http://xy.dnset.com:1280"   # Dify 实例根地址
-  api_base: "http://xy.dnset.com:1280/v1"
 
 # ===== 登录与认证配置（演示用，建议使用环境变量替代） =====
 auth:
   # 建议：将真实账号/密码存于环境变量，在此处使用 ${VAR_NAME} 占位并由加载器扩展。
   username: "${DIFY_USERNAME}"
   password: "${DIFY_PASSWORD}"
-# api_key: "${DIFY_API_TOKEN}"
 
 # ===== 全局参数变量（可在工作流 inputs 中复用） =====
 variables:
@@ -33,31 +31,47 @@ variables:
 # ===== 工作流信息（最小示例） =====
 # 提示：如需使用 catalog（workflow_repository.yaml），可并行维护，CLI 会优先从 --catalog 加载。
 workflows:
-  - id: "d787093d-3d99-4523-801b-d3cfcb6e9ea8"
-    name: "文本分类工作流"
-    description: "对输入文本进行类别判定"
-    api_key: "app-lhg7xZq0KRVk5frngV0MRCjW"
+  # - id: "1e4be230-9776-4b6a-b20e-6c8fcdcd2f0f"
+  # - id: "d787093d-3d99-4523-801b-d3cfcb6e9ea8"
+  - id: "3f6422ab-3ed6-4a6d-af0e-b5df715c0080"
+    name: "测试工作流文件"
+    description: "对输入文本进行格式转换A"
+    # api_key: "app-mnZUnTtmjjHjyAAcS9KxYEfA"
+    # api_key: "app-lhg7xZq0KRVk5frngV0MRCjW"
+    api_key: "app-bO8xtqhXurX1TDJ1FWwkjcgA"
     inputs:
       ContractFile:
         type: file
         value:
-          - "./samples/texts/sample_1.txt"
-          - "./samples/texts/sample_2.txt"
+          - "./docs/购销合同.pdf"
+          # - "./docs/【满开x西藏酷爱通信有限公司】apple授权专营店合作协议.docx"
+          # - "./docs/长宁龙之梦合同.pdf"
+          # - "./docs/受理终端采购协议（2025版）爱施德(1).pdf"
+          # - "./docs/采购合同(1).docx"
+          # - "./docs/【荣耀magic】广电智信科技（重庆）有限责任公司与深圳市德耀通讯科技有限责任公司合作协议(1).docx"
+          # - "./docs/百联店租赁合同.docx"
+          # - "./docs/微派：配送采集服务补充协议-2025年Q1版.docx"
       RulesetApiUrl:
         type: string
         value: "test"
       ContractID:
         type: string
         value: "test"
-      FilelD:
+      FileID:
         type: string
         value: "test{TIME}"
       ReviewBG:
         type: string
         value: "testtest"
     reference:
-      - "1"
-      - "2"
+      - "./docs/reference-rules/购销合同_分析报告.md"
+      # - "./docs/reference-rules/【满开x西藏酷爱通信有限公司】apple授权专营店合作协议_分析报告.md"
+      # - "./docs/reference-rules/长宁龙之梦合同_分析报告.md"
+      # - "./docs/reference-rules/受理终端采购协议（2025版）爱施德(1)_分析报告.md"
+      # - "./docs/reference-rules/采购合同(1)_分析报告.md"
+      # - "./docs/reference-rules/【荣耀magic】广电智信科技（重庆）有限责任公司与深圳市德耀通讯科技有限责任公司合作协议(1)_分析报告.md"
+      # - "./docs/reference-rules/百联店租赁合同_分析报告.md"
+      # - "./docs/reference-rules/微派：配送采集服务补充协议-2025年Q1版_分析报告.md"
 
   - id: "wf_chat_assistant"
     name: "对话助理工作流"
@@ -70,14 +84,11 @@ workflows:
       conversation:
         history: []
         user_input: "给出三条改进建议"
-    parameters:
-      temperature: 0.5
-      max_tokens: 512
 
 # ===== 执行与并发配置 =====
 execution:
   concurrency: 5
-  timeout: 300                  # 秒
+  timeout: 90000
   retry_count: 3
   rate_limit:
     per_minute: 60
@@ -89,14 +100,21 @@ execution:
 
 # ===== 优化配置（示例） =====
 optimization:
-  strategy: "clarity_focus"      # auto | clarity_focus | efficiency_focus | structure_focus | llm_guided
+  # strategy: "clarity_focus"      # auto | clarity_focus | efficiency_focus | structure_focus | llm_guided
   max_iterations: 3
+  exit_ratio: 0.8
   llm:
-    url: "http://127.0.0.1"
-    model: "gpt-4-turbo-preview"
-    api_key_env: "OPENAI_API_KEY"
+    url: "${LLM_BASE_URL}"
+    # url: "http://211.93.0.206:10027/v1/chat/completions"
+    # model: "glm-4.6-fp8"
+    model: "${LLM_MODEL}"
+    # api_key: "sk-4ZYDiy0HfYjRUJNYg8Hw2ULHbZc0UcS3WnXBwzSUQADteVzL"
+    api_key: "${LLM_API_KEY}"
     enable_cache: true
     cache_ttl: 86400
+    health_timeout_seconds: 60
+    enable_output_judge: true
+    judge_timeout_seconds: 100
 
 # ===== I/O 路径与日志 =====
 io_paths:

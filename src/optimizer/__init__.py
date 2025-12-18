@@ -14,6 +14,7 @@ from .prompt_optimizer import (
     ReferenceSpec,
     ExecutionSample,
 )
+from .loop import run_optimize_loop
 
 __all__ = [
     "WorkflowYamlLoader",
@@ -24,4 +25,5 @@ __all__ = [
     "DetectedIssue",
     "ReferenceSpec",
     "ExecutionSample",
+    "run_optimize_loop",
 ]

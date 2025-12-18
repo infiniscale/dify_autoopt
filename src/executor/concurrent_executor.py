@@ -9,6 +9,7 @@ Description: 基于线程池的并发执行器实现
 # 标准库
 import time
 from concurrent.futures import ThreadPoolExecutor, Future, as_completed, TimeoutError
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Callable, List, Optional, Dict, Any
 from uuid import uuid4
@@ -60,6 +61,7 @@ class ConcurrentExecutor(ExecutorBase):
         """
         super().__init__(now_fn, sleep_fn, id_fn)
         self._task_execution_func = task_execution_func or self._default_stub_execution
+        self._workflow_cm = None
 
     def _execute_tasks(
         self,
@@ -94,6 +96,9 @@ class ConcurrentExecutor(ExecutorBase):
         # 从 ExecutionPolicy 读取并发度
         concurrency = manifest.execution_policy.concurrency
         retry_policy = manifest.execution_policy.retry_policy
+        self._workflow_cm = _get_workflow_concurrency_manager()
+        if self._workflow_cm:
+            concurrency = min(concurrency, self._workflow_cm.limit)
 
         # 存储任务结果
         task_results: List[TaskResult] = []
@@ -210,119 +215,122 @@ class ConcurrentExecutor(ExecutorBase):
         Returns:
             TaskResult: 任务执行结果
         """
+        cm = self._workflow_cm
+        slot_cm = cm.slot() if cm else nullcontext()
         last_error = None
 
-        # 重试循环（最多 max_attempts 次）
-        for attempt in range(retry_policy.max_attempts):
-            # 检查取消令牌
-            if cancellation_token and cancellation_token.is_cancelled():
-                task.status = TaskStatus.CANCELLED
-                task.metadata["error_message"] = "Task cancelled during execution"
-                task.finished_at = self._now_fn()
-                return TaskResult.from_task(task)
-
-            try:
-                # 标记任务开始
-                task.mark_started(now_fn=self._now_fn)
-
-                # 使用 ThreadPoolExecutor 实现超时控制
-                with ThreadPoolExecutor(max_workers=1) as timeout_executor:
-                    future = timeout_executor.submit(self._task_execution_func, task)
-
-                    try:
-                        # 等待任务完成，带超时
-                        result_data = future.result(timeout=task.timeout_seconds)
-
-                        # 任务成功执行
-                        task.mark_finished(
-                            status=TaskStatus.SUCCEEDED,
-                            now_fn=self._now_fn
-                        )
-
-                        return TaskResult.from_task(task)
-
-                    except TimeoutError:
-                        # 任务超时
-                        future.cancel()
-                        last_error = f"Task execution timeout after {task.timeout_seconds}s"
-
-                        # 如果这是最后一次尝试，标记为超时
-                        if attempt == retry_policy.max_attempts - 1:
-                            task.mark_finished(
-                                status=TaskStatus.TIMEOUT,
-                                now_fn=self._now_fn
-                            )
-                            task.metadata["error_message"] = last_error
-                            return TaskResult.from_task(task)
-
-                        # 否则重置状态准备重试
-                        task.status = TaskStatus.PENDING
-
-            except TaskTimeoutException as e:
-                # 显式超时异常
-                last_error = str(e)
-
-                if attempt == retry_policy.max_attempts - 1:
-                    task.mark_finished(
-                        status=TaskStatus.TIMEOUT,
-                        now_fn=self._now_fn
-                    )
-                    task.metadata["error_message"] = last_error
-                    return TaskResult.from_task(task)
-
-                task.status = TaskStatus.PENDING
-
-            except TaskExecutionException as e:
-                # 任务执行失败（业务逻辑错误）
-                last_error = str(e)
-
-                if attempt == retry_policy.max_attempts - 1:
-                    task.mark_finished(
-                        status=TaskStatus.FAILED,
-                        now_fn=self._now_fn
-                    )
-                    task.metadata["error_message"] = last_error
-                    return TaskResult.from_task(task)
-
-                task.status = TaskStatus.PENDING
-
-            except Exception as e:
-                # 系统异常
-                last_error = f"Unexpected error: {str(e)}"
-
-                if attempt == retry_policy.max_attempts - 1:
-                    task.mark_finished(
-                        status=TaskStatus.ERROR,
-                        now_fn=self._now_fn
-                    )
-                    task.metadata["error_message"] = last_error
-                    return TaskResult.from_task(task)
-
-                task.status = TaskStatus.PENDING
-
-            # 如果不是最后一次尝试，执行退避等待
-            if attempt < retry_policy.max_attempts - 1:
-                # 计算退避时间（指数退避）
-                backoff_time = retry_policy.backoff_seconds * (
-                    retry_policy.backoff_multiplier ** attempt
-                )
-
-                # 等待（检查取消令牌）
+        with slot_cm:
+            # 重试循环（最多 max_attempts 次）
+            for attempt in range(retry_policy.max_attempts):
+                # 检查取消令牌
                 if cancellation_token and cancellation_token.is_cancelled():
                     task.status = TaskStatus.CANCELLED
-                    task.metadata["error_message"] = "Task cancelled during retry backoff"
+                    task.metadata["error_message"] = "Task cancelled during execution"
                     task.finished_at = self._now_fn()
                     return TaskResult.from_task(task)
 
-                self._sleep_fn(backoff_time)
+                try:
+                    # 标记任务开始
+                    task.mark_started(now_fn=self._now_fn)
 
-        # 理论上不应该到达这里（所有情况都在循环中处理）
-        task.mark_finished(
-            status=TaskStatus.ERROR,
-            now_fn=self._now_fn
-        )
-        task.metadata["error_message"] = last_error or "Unknown error during task execution"
-        return TaskResult.from_task(task)
+                    # 使用 ThreadPoolExecutor 实现超时控制
+                    with ThreadPoolExecutor(max_workers=1) as timeout_executor:
+                        future = timeout_executor.submit(self._task_execution_func, task)
+
+                        try:
+                            # 等待任务完成，带超时
+                            result_data = future.result(timeout=task.timeout_seconds)
+
+                            # 任务成功执行
+                            task.mark_finished(
+                                status=TaskStatus.SUCCEEDED,
+                                now_fn=self._now_fn
+                            )
+
+                            return TaskResult.from_task(task)
+
+                        except TimeoutError:
+                            # 任务超时
+                            future.cancel()
+                            last_error = f"Task execution timeout after {task.timeout_seconds}s"
+
+                            # 如果这是最后一次尝试，标记为超时
+                            if attempt == retry_policy.max_attempts - 1:
+                                task.mark_finished(
+                                    status=TaskStatus.TIMEOUT,
+                                    now_fn=self._now_fn
+                                )
+                                task.metadata["error_message"] = last_error
+                                return TaskResult.from_task(task)
+
+                            # 否则重置状态准备重试
+                            task.status = TaskStatus.PENDING
+
+                except TaskTimeoutException as e:
+                    # 显式超时异常
+                    last_error = str(e)
+
+                    if attempt == retry_policy.max_attempts - 1:
+                        task.mark_finished(
+                            status=TaskStatus.TIMEOUT,
+                            now_fn=self._now_fn
+                        )
+                        task.metadata["error_message"] = last_error
+                        return TaskResult.from_task(task)
+
+                    task.status = TaskStatus.PENDING
+
+                except TaskExecutionException as e:
+                    # 任务执行失败（业务逻辑错误）
+                    last_error = str(e)
+
+                    if attempt == retry_policy.max_attempts - 1:
+                        task.mark_finished(
+                            status=TaskStatus.FAILED,
+                            now_fn=self._now_fn
+                        )
+                        task.metadata["error_message"] = last_error
+                        return TaskResult.from_task(task)
+
+                    task.status = TaskStatus.PENDING
+
+                except Exception as e:
+                    # 系统异常
+                    last_error = f"Unexpected error: {str(e)}"
+
+                    if attempt == retry_policy.max_attempts - 1:
+                        task.mark_finished(
+                            status=TaskStatus.ERROR,
+                            now_fn=self._now_fn
+                        )
+                        task.metadata["error_message"] = last_error
+                        return TaskResult.from_task(task)
+
+                    task.status = TaskStatus.PENDING
+
+                # 如果不是最后一次尝试，执行退避等待
+                if attempt < retry_policy.max_attempts - 1:
+                    # 计算退避时间（指数退避）
+                    backoff_time = retry_policy.backoff_seconds * (
+                        retry_policy.backoff_multiplier ** attempt
+                    )
+
+                    # 等待（检查取消令牌）
+                    if cancellation_token and cancellation_token.is_cancelled():
+                        task.status = TaskStatus.CANCELLED
+                        task.metadata["error_message"] = "Task cancelled during retry backoff"
+                        task.finished_at = self._now_fn()
+                        return TaskResult.from_task(task)
+
+                    self._sleep_fn(backoff_time)
+
+            # 理论上不应该到达这里（所有情况都在循环中处理）
+            task.mark_finished(
+                status=TaskStatus.ERROR,
+                now_fn=self._now_fn
+            )
+            task.metadata["error_message"] = last_error or "Unknown error during task execution"
+            return TaskResult.from_task(task)
 
     def _default_stub_execution(self, task: Task) -> Dict[str, Any]:
         """默认的桩执行函数（测试用）。
@@ -341,3 +349,18 @@ class ConcurrentExecutor(ExecutorBase):
             "outputs": {"result": "stub execution success"},
             "elapsed_time": 0.1
         }
+
+
+def _get_workflow_concurrency_manager():
+    """Fetch workflow-level concurrency manager from runtime if available."""
+    try:
+        from src.config.bootstrap import get_runtime
+
+        rt = get_runtime()
+        cm = getattr(rt, "workflow_concurrency", None)
+        if cm:
+            return cm
+        conc_map = getattr(rt, "concurrency", None) or {}
+        return conc_map.get("workflow")
+    except Exception:
+        return None

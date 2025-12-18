@@ -29,7 +29,11 @@ if str(TEST_ROOT) not in sys.path:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def setup_logging():
-    """配置测试日志输出（保持最小化）"""
-    # 使用 loguru 的默认配置即可
-    pass
+def init_logging():
+    """Initialize project logging for tests (minimal)."""
+    import asyncio
+    from src.utils.logger import setup_logging as _setup
+
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(_setup())
+    yield

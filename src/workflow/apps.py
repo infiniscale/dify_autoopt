@@ -37,12 +37,50 @@ def _resolve_token(passed_token: Optional[str]) -> Optional[str]:
     env_token = os.getenv("DIFY_API_TOKEN") or os.getenv("ACCESS_TOKEN")
     if env_token:
         return env_token.strip()
+    # Runtime auth api_key/access_token fallback (登录后可直接放在 config.auth.api_key/access_token)
+    try:
+        from src.config.bootstrap import get_runtime
+        rt = get_runtime()
+        auth_cfg = getattr(rt, "app", None)
+        auth_cfg = auth_cfg.auth if auth_cfg else None
+        if auth_cfg:
+            for key in ("api_key", "access_token"):
+                val = auth_cfg.get(key) if isinstance(auth_cfg, dict) else getattr(auth_cfg, key, None)
+                if val:
+                    return str(val).strip()
+    except Exception:
+        pass
     # Token store fallback
     try:
+        from pathlib import Path
+        cfg_path = Path("config/env_config.yaml")
+        if not cfg_path.exists():
+            return None
         from src.auth.token_opt import Token
-        return Token().get_access_token()
+        token = Token(config_path=str(cfg_path)).get_access_token()
+        return token.strip() if token else None
     except Exception:
         return None
+
+
+def _login_token(base_url: str) -> Optional[str]:
+    """Attempt to login using runtime auth.username/password to obtain a console token."""
+    try:
+        from src.config.bootstrap import get_runtime
+        rt = get_runtime()
+        auth_cfg = rt.app.auth if getattr(rt, "app", None) else {}
+        username = auth_cfg.get("username") if isinstance(auth_cfg, dict) else getattr(auth_cfg, "username", None)
+        password = auth_cfg.get("password") if isinstance(auth_cfg, dict) else getattr(auth_cfg, "password", None)
+        if not username or not password:
+            return None
+        from src.auth.login import DifyAuthClient
+        client = DifyAuthClient(base_url=base_url, email=username, password=password)
+        resp = client.login()
+        if isinstance(resp, dict):
+            return resp.get("access_token")
+    except Exception:
+        return None
+    return None
 
 
 def _resolve_base_url(passed_base_url: Optional[str]) -> Optional[str]:

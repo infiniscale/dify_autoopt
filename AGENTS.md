@@ -2,14 +2,14 @@
 
 ## Project Structure & Module Organization
 - Source lives under `src/` by capability: `auth/`, `workflow/`, `config/`, `executor/`, `collector/`, `report/`, `optimizer/`, `utils/`. Each folder has a `README.md` describing intent.
-- Entry point: `./main.py` (modes: `--mode test|optimize|report`). Keep imports package-style under `src/`.
+- Entry point: `src/main.py` (modes: `--mode test|optimize|report`). Keep imports package-style under `src/`.
 - Tests: place unit tests in `src/test/` mirroring `src/` (e.g., `src/test/test_logger_basic.py`). Use `assets/` for large non-code files when needed.
 
 ## Build, Test, and Development Commands
 - Python 3.8+ with a virtualenv.
   - Create venv: `python -m venv .venv && source .venv/bin/activate`
   - Install deps: `pip install -r requirements.txt`
-- Run: `python ./main.py --mode test` (or `optimize`, `report`).
+- Run: `python src/main.py --mode test` (or `optimize`, `report`).
 - Tests: `python -m pytest -q`
 - Coverage: `pytest --cov=src --cov-report=term-missing`
 

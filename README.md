@@ -17,14 +17,9 @@
 
 ### 提示词优化
 - 🔍 **自动提取** - 智能识别工作流中的LLM提示词
-- 🧠 **智能分析** - 基于静态分析和AI驱动的质量评估
-- 🎯 **算法优化** - 基于静态分析和可选baseline指标的多策略优化
+- 🧠 **智能分析** - 基于大模型的效果评估和分析
+- 🎯 **算法优化** - 基于测试结果的自动优化算法
 - 📚 **版本管理** - 完整的提示词版本控制和回滚机制
-
-### 新增功能 (v1.1)
-- 🧪 **测试驱动优化** - 基于真实测试结果的多维度优化决策
-- 📊 **多指标监控** - 成功率、响应时间、成本、错误分布全方位分析
-- 🔢 **语义化版本** - 自动根据改进幅度生成major/minor/patch版本号
 
 ## 系统架构
 
@@ -61,7 +56,7 @@ src/
 ├── optimizer/             # 智能优化模块（新增）
 │   ├── __init__.py
 │   ├── prompt_extractor.py # 提示词提取
-│   ├── prompt_analyzer.py  # Prompt质量分析器(规则+启发式)
+│   ├── llm_analyzer.py     # LLM分析器
 │   ├── optimization_engine.py # 优化引擎
 │   └── version_manager.py  # 版本管理
 ├── utils/                 # 通用工具模块
@@ -69,7 +64,7 @@ src/
 │   ├── logger.py           # 日志管理
 │   ├── http_client.py      # HTTP客户端
 │   └── exceptions.py       # 异常定义
-main.py               # 主程序入口（根目录）
+└── main.py               # 主程序入口
 ```
 
 ## 技术栈
@@ -96,137 +91,91 @@ cd dify_autoopt
 pip install -r requirements.txt
 
 # 配置环境变量
-cp .env.example .env
+cp .env.example .env   # 复制后填写真实账号/密钥
 ```
 
-### 2. 配置设置（单一配置文件）
+.env.example 的作用与填法：
+- 复制为 `.env` 后，补齐你的 Dify 控制台账号密码或 Token，例如：
+  ```
+  DIFY_USERNAME=your_email@example.com
+  DIFY_PASSWORD=your_password
+  # 或：DIFY_API_TOKEN=app-xxxxxx
+  # 工作流运行用的 API Key 也可以放这里
+  WF1_API_KEY=app-xxxxxx
+  WF2_API_KEY=app-yyyyyy
+  ```
+- 启动时自动加载 `.env`，把 `${...}` 占位符注入到 `config/config.yaml`，避免在 YAML 中写明文。
+```
 
-本项目使用单一配置文件 `config/config.yaml`，顶层包含：`meta`、`dify`、`auth`、`variables`、`workflows`、`execution`、`optimization`、`io_paths`、`logging`。
+### 2. 配置设置
 
-示例（与当前实现一致）：
+编辑 `config/config.yaml` 文件：
+
 ```yaml
-meta:
-  version: "1.0.0"
-  environment: "development"
-
+# Dify平台配置
 dify:
-  base_url: "http://xy.dnset.com:1280"   # 控制台（登录、导出DSL）
-  api_base: "http://xy.dnset.com:1280/v1" # 公共API根路径（运行工作流）
-  tenant_id: null
+  base_url: "https://your-dify-instance.com"
+  api_base: "https://your-dify-instance.com/v1"
 
+# 认证配置
 auth:
-  # 演示：使用用户名/密码登录控制台；推荐用环境变量注入
-  username: "${DIFY_USERNAME}"
-  password: "${DIFY_PASSWORD}"
-  # 或：api_key: "${DIFY_API_TOKEN}"
+  username: "your_username"
+  password: "your_password"
+  api_key: "your_api_key"
 
-variables:
-  base_path: "./assets"
-  default_language: "zh"
-  temperature: 0.7
-  batch_size: 16
-  retries: 2
-
+# 工作流配置
 workflows:
-  - id: "d787093d-3d99-4523-801b-d3cfcb6e9ea8"   # 建议使用纯 app/workflow id
-    name: "文本分类工作流"
-    description: "对输入文本进行类别判定"
-    api_key: "${WF1_API_KEY}"       # 运行该工作流时使用（走 api_base）
-    inputs:                          # 输入变量按“变量名: {type, value}”组织
-      ContractFile:                  # 变量名（与 Dify 工作流的输入名一致）
-        type: file                   # 可选: file | string | number
-        value:
-          - "${BASE_PATH}/samples/texts/sample_1.txt"
-          - "${BASE_PATH}/samples/texts/sample_2.txt"
-      RulesetApiUrl:
-        type: string
-        value: ["https://example/api"]
-      ContractID:
-        type: string
-        value: ["A-001", "A-002"]
-      FileID:
-        type: string
-        value: ["test-{TIME}"]       # 可用占位符示例（由上层替换/注入）
-      ReviewBG:
-        type: string
-        value: ["default"]
-    reference:                       # 与多输入一一对应的参考/期望（可选）
-      - "case-1"
-      - "case-2"
-
-  - id: "wf_chat_assistant"
-    name: "对话助理工作流"
-    api_key: "${WF2_API_KEY}"
+  - name: "test_workflow_1"
     inputs:
-      prompt:
-        type: string
-        value:
-          - "请总结以下文本的要点：..."
-          - "列出本文的关键结论与证据。"
-      language:
-        type: string
-        value: ["${DEFAULT_LANGUAGE}"]
-    parameters:
-      temperature: 0.5
-      max_tokens: 512
+      file_list: ["path/to/file1", "path/to/file2"]
+      num_list: [1, 2, 3]
+      string_list: ["text1", "text2"]
 
+# 优化配置
+optimization:
+  llm_model: "gpt-4"
+  max_iterations: 5
+  optimization_strategy: "gradient_descent"
+
+# 执行配置
 execution:
   concurrency: 5
   timeout: 300
   retry_count: 3
-  rate_limit: { per_minute: 60, burst: 10 }
-  backoff: { initial_delay: 0.5, max_delay: 4.0, factor: 2.0 }
-
-optimization:
-  strategy: "clarity_focus"   # auto | clarity_focus | efficiency_focus | structure_focus | llm_guided
-  max_iterations: 3
-  llm:
-    url: "http://127.0.0.1"
-    model: "gpt-4-turbo-preview"
-    api_key_env: "OPENAI_API_KEY"
-    enable_cache: true
-    cache_ttl: 86400
-
-io_paths:
-  output_dir: "./outputs"
-  logs_dir: "./logs"
-
-logging:
-  level: "DEBUG"     # DEBUG | INFO | WARNING | ERROR | CRITICAL
-  format: "structured" # simple | structured
-  console_enabled: true
-  file_enabled: true
 ```
 
-约束与校验（重要）：
-- workflows[].inputs 的每个变量使用 `{type, value}` 描述：
-  - type: `file` | `string` | `number`（决定处理方式；file 类型会在运行前先上传文件并替换为 file_id）。
-  - value: 单值或列表。若某些变量为列表，所有列表变量长度必须相同（记为 N），标量会在执行时广播到 N。
-- workflows[].reference 可选；若 inputs 中存在列表，则 reference 必须为长度 N 的列表或为标量。
-- 运行工作流走公共 API：使用 `dify.api_base` + 每个 workflow 的 `api_key`；导出/发布走控制台 API：使用 `dify.base_url` + 登录后 token。
-
-### 3. 运行
+### 3. 运行测试
 
 ```bash
-# 基础运行（使用默认配置路径 config/config.yaml）
-python main.py --mode test
+# 运行基础测试
+python src/main.py --mode test
 
-# 指定配置路径
-python main.py --mode test --config config/config.yaml
+# 运行提示词优化
+python src/main.py --mode optimize --workflow-id <workflow_id>
 
-# 覆盖运行时配置（可多次 --set，使用 dot-path）
-python main.py --mode test --config config/config.yaml \
-  --set logging.level=DEBUG \
-  --set optimization.strategy=auto
-
-# 生成测试报告（JSON）
-python main.py --mode test --report report.json
+# 生成测试报告
+python src/main.py --mode report --output report.xlsx
 ```
 
 说明：
 - 未设置 `--config` 时自动尝试 `config/config.yaml`；如不存在则使用内置默认配置（会在日志中提示）。
 - `.env` 会在启动前自动加载（如未安装 `python-dotenv`，则忽略）。
 - 日志配置优先从 `config/config.yaml` 的 `logging` 块读取。
+
+### main.py 使用手册（参数）
+- `--mode`：`run`（仅执行工作流，不做优化）、`opt`（使用已有运行结果做优化）、`all`（先执行工作流再做优化）、`test`（示例/回归）。
+- `--config`：配置文件路径（默认 `config/config.yaml`）。
+- `--report`：测试模式输出报告 JSON 路径。
+- `--set a.b.c=value`：启动时覆盖配置字段（可多次传入）。
+
+示例：
+```bash
+# 全流程：运行 workflows + 提示词优化（需配置好 .env 和 config/config.yaml）
+python main.py --mode all --config config/config.yaml
+
+# 仅优化：使用已存在的 outputs/*/runs 下的运行结果，生成补丁
+python main.py --mode opt --config config/config.yaml
+```
 
 ## 单元测试
 
@@ -240,9 +189,6 @@ python -m pytest -q
 # 仅运行日志相关测试
 pytest -q -k logger
 
-# 仅运行 utils 目录下的测试
-pytest -q -k utils
-
 # 覆盖率报告（推荐）
 pytest --cov=src --cov-report=term-missing
 ```
@@ -250,7 +196,7 @@ pytest --cov=src --cov-report=term-missing
 约定与提示
 - 测试目录：`src/test/`（与 `src/` 结构对应）。
 - 命名规范：文件 `test_*.py`，函数 `test_*`。
-- 日志模块样例：参见 `src/test/utils/test_logger_basic.py` 与扩展用例；验证初始化、文件写入与上下文功能。
+- 日志模块样例：参见 `src/test/test_logger_basic.py`，验证初始化与文件写入。
 - 测试不应访问真实 Dify 端点，对 I/O 或网络进行隔离/伪造。
 
 ## 使用指南
@@ -327,12 +273,12 @@ class CustomOptimizer(BaseOptimizer):
 
 ## 配置参考
 
-### 配置校验
-启动时会对关键配置进行严格校验并输出结构化日志（`config.bootstrap`）：
-- 必填：`dify.base_url`；`auth.api_key` 或 `auth.username/password` 二者其一
-- 建议：`logging.level`、`optimization.strategy`、`execution` 参数范围
+### 完整配置示例
 
-如需运行时覆盖配置，可通过 `--set a.b.c=value` 多次指定，覆盖会写入临时 YAML 并作为本次引导的有效配置。
+详见 `config/examples/full_config.yaml`
+
+### 配置验证
+
 ```bash
 # 验证配置文件是否正确
 python -m dify_opt.utils.validator config/config.yaml
@@ -376,4 +322,4 @@ grep ERROR logs/dify_opt.log
 
 ---
 
-*最后更新: 2025-11-19*
+*最后更新: 2025-11-12*

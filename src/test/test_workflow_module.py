@@ -189,6 +189,42 @@ def test_execute_workflow_broadcast_and_file_upload_v1(monkeypatch, tmp_path):
         assert str(doc.get("upload_file_id")).startswith("fid_")
 
 
+def test_execute_workflow_persists_json(monkeypatch, tmp_path):
+    from src.workflow.execute import execute_workflow_v1
+
+    class DummyResp:
+        def __init__(self, data):
+            self._data = data
+            self.status_code = 200
+            self.headers = {"Content-Type": "application/json"}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._data
+
+    def fake_post(url, headers=None, json=None, timeout=None, files=None, data=None):
+        return DummyResp({"result": "success", "data": {"text": "ok", "metrics": {"duration_seconds": 1.2}}})
+
+    monkeypatch.setattr("requests.post", fake_post)
+
+    res = execute_workflow_v1(
+        "wf/abc",
+        {"a": 1},
+        base_url="http://api",
+        api_key="KEY",
+        persist_results=True,
+        output_dir=tmp_path,
+    )
+
+    assert len(res) == 1
+    run_file = tmp_path / "wf_abc" / "runs" / "run_1.json"
+    summary_file = tmp_path / "wf_abc" / "runs" / "runs_summary.json"
+    assert run_file.exists()
+    assert summary_file.exists()
+
+
 def test_execute_workflow_v1_grouped_inputs_list(monkeypatch, tmp_path):
     from src.workflow.execute import execute_workflow_v1
 
