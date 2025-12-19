@@ -14,16 +14,14 @@ import asyncio
 
 import pytest
 
-
-# Ensure `src` is importable when running tests from project root
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+# Ensure project root is in sys.path for imports
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 def test_logger_initialization_and_basic_logging():
-    from utils.logger.logger import setup_logging, get_logger, _log_manager
+    from src.utils.logger.logger import setup_logging, get_logger, _log_manager
 
     async def _run():
         # Reset configured state for a clean test run
@@ -38,7 +36,7 @@ def test_logger_initialization_and_basic_logging():
 
 
 def test_logger_writes_to_file_with_temp_config():
-    from utils.logger.logger import SimpleLogManager, get_logger, _log_manager
+    from src.utils.logger.logger import SimpleLogManager, get_logger, _log_manager
     import yaml
 
     # Prepare a temp directory and config to isolate file output

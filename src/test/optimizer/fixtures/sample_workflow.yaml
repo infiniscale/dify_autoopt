@@ -1,0 +1,44 @@
+workflows:
+  - id: test_workflow_001
+    name: Test Workflow
+    nodes:
+      - id: llm_node_1
+        type: llm
+        title: "Summarizer"
+        data:
+          prompt_template:
+            messages:
+              - role: system
+                text: "You are a helpful assistant. {{user_input}}"
+          model:
+            provider: openai
+            name: gpt-4
+          parameters:
+            temperature: 0.7
+
+      - id: llm_node_2
+        type: llm
+        title: "Analyzer"
+        data:
+          prompt_template:
+            messages:
+              - role: user
+                text: "Analyze the following data: {{data}}"
+          model:
+            provider: anthropic
+            name: claude-3
+          parameters:
+            temperature: 0.5
+
+      - id: code_node_1
+        type: code
+        data:
+          code: "result = process_data(input_data)"
+
+  - id: test_workflow_002
+    name: Simple Workflow
+    nodes:
+      - id: llm_simple
+        type: llm
+        data:
+          text: "Tell me about {{topic}}"
