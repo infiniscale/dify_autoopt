@@ -1,6 +1,4 @@
-import io
 import json
-from pathlib import Path
 
 import pytest
 
@@ -267,6 +265,43 @@ def test_execute_workflow_v1_grouped_inputs_list(monkeypatch, tmp_path):
     for p in calls["payloads"]:
         doc = p["inputs"]["file"]
         assert isinstance(doc, dict) and str(doc.get("upload_file_id")).startswith("gid_")
+
+
+def test_execute_workflow_v1_replaces_runtime_placeholders(monkeypatch):
+    from src.workflow.execute import execute_workflow_v1
+
+    calls = {"payloads": []}
+
+    class DummyResp:
+        def __init__(self, data):
+            self._data = data
+            self.status_code = 200
+            self.headers = {"Content-Type": "application/json"}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._data
+
+    def fake_post(url, headers=None, json=None, timeout=None, files=None, data=None):
+        calls["payloads"].append(json)
+        return DummyResp({"result": "success"})
+
+    monkeypatch.setattr("requests.post", fake_post)
+    monkeypatch.setattr("src.workflow.execute.time.strftime", lambda fmt: "20250101010101")
+
+    inputs = {
+        "note": ["a", "b"],
+        "tag": "run-{ID}-{TIME}",
+        "nested": {"inner": "id-{ID}"},
+    }
+    res = execute_workflow_v1("wf1", inputs, base_url="http://api", api_key="KEY")
+    assert len(res) == 2
+    assert calls["payloads"][0]["inputs"]["tag"] == "run-1-20250101010101"
+    assert calls["payloads"][0]["inputs"]["nested"]["inner"] == "id-1"
+    assert calls["payloads"][1]["inputs"]["tag"] == "run-2-20250101010101"
+    assert calls["payloads"][1]["inputs"]["nested"]["inner"] == "id-2"
 
 
 def test_execute_workflow_v1_uses_base_url_and_api_key(monkeypatch, tmp_path):

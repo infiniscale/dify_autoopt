@@ -11,22 +11,24 @@ from __future__ import annotations
 
 import mimetypes
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple, Union
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
-
 
 import requests
 from requests import HTTPError
 
 from src.utils.logger import get_logger, log_performance
-from .apps import _mask_token, _resolve_token, _login_token
 from .api_keys import list_api_keys
+from .apps import _mask_token, _resolve_token, _login_token
 from .export import _safe_dirname_from_id
 
 logger = get_logger("workflow.execute")
 RESULT_DIRNAME = "result"
+PLACEHOLDER_ID = "{ID}"
+PLACEHOLDER_TIME = "{TIME}"
+TIME_FORMAT = "%Y%m%d%H%M%S"
 
 
 def _is_file_path(value: Any) -> bool:
@@ -94,6 +96,19 @@ def _normalize_inputs(
             flattened[norm_key] = raw
 
     return _broadcast_inputs(flattened), declared_types
+
+
+def _apply_runtime_placeholders(value: Any, replacements: Dict[str, str]) -> Any:
+    if isinstance(value, str):
+        rendered = value
+        for token, replacement in replacements.items():
+            rendered = rendered.replace(token, replacement)
+        return rendered
+    if isinstance(value, dict):
+        return {key: _apply_runtime_placeholders(item, replacements) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_apply_runtime_placeholders(item, replacements) for item in value]
+    return value
 
 
 def _as_document(file_id: str) -> Dict[str, Any]:
@@ -463,6 +478,12 @@ def execute_workflow_v1(
     def _one_row(idx: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]:
         attempts = max(0, retry_count) + 1
         last_exc: Optional[Exception] = None
+        timestamp = time.strftime(TIME_FORMAT)
+        replacements = {
+            PLACEHOLDER_ID: str(idx),
+            PLACEHOLDER_TIME: timestamp,
+        }
+        rendered_row = _apply_runtime_placeholders(row, replacements)
         for attempt in range(1, attempts + 1):
             api_key_local = _get_api_key()
             row_meta = dict(meta_base)
@@ -472,7 +493,7 @@ def execute_workflow_v1(
                 pass
             try:
                 prepared_inputs = _prepare_inputs_with_files(
-                    row,
+                    rendered_row,
                     base_url=resolved_base,
                     api_key=api_key_local,
                     user=user,

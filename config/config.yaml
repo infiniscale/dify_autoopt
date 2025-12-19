@@ -54,13 +54,13 @@ workflows:
           # - "./docs/微派：配送采集服务补充协议-2025年Q1版.docx"
       RulesetApiUrl:
         type: string
-        value: "test"
+        value: "test{TIME}"
       ContractID:
         type: string
-        value: "test"
+        value: "test{ID}"
       FileID:
         type: string
-        value: "test{TIME}"
+        value: "test{ID}"
       ReviewBG:
         type: string
         value: "testtest"
@@ -126,4 +126,3 @@ logging:
   # format: "simple"               # simple | structured
   file_enabled: true
   console_enabled: true
-
