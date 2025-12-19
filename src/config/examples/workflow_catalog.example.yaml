@@ -1,0 +1,191 @@
+# Workflow 目录示例文件
+#
+# 使用方法：
+# 1. 复制此文件并重命名
+#    cp config/examples/workflow_catalog.example.yaml config/workflow_catalog.yaml
+# 2. 添加你的 Workflow 定义
+# 3. 确保 dsl_path 指向正确的 DSL 文件
+# 4. 更新节点索引（用于 Prompt Patch）
+
+meta:
+  version: "1.0"
+  source: "dify_api"              # 数据来源：dify_api | manual | import
+  last_synced: "2025-11-13T10:00:00Z"  # 最后同步时间
+  total_workflows: 2              # 工作流总数
+
+# Workflow 列表
+workflows:
+  # ===== 示例 1: Chatflow 类型 =====
+  - id: "customer_service_bot_v1"        # 唯一标识符（必须稳定，不要改变）
+    label: "智能客服机器人"               # 人类可读名称
+    type: "chatflow"                     # workflow | chatflow
+    version: "1.2.0"                     # 版本号（可选）
+    description: "处理客户咨询的智能对话机器人"
+
+    # DSL 文件路径（相对于 io_paths.workflow_dsl）
+    dsl_path: "chatflows/customer_service_v1.yaml"
+
+    # 文件校验和（可选，用于检测变更）
+    checksum: "sha256:abc123def456..."
+
+    # 节点结构索引（用于 Prompt Patch）
+    nodes:
+      # LLM 节点
+      - node_id: "llm_main"
+        label: "主对话模型"
+        type: "llm"
+        path: "/graph/nodes/0"
+        prompt_fields:
+          - "data.prompt_template"
+          - "data.system_prompt"
+
+      # 知识库检索节点
+      - node_id: "knowledge_retrieval"
+        label: "知识库查询"
+        type: "knowledge-retrieval"
+        path: "/graph/nodes/1"
+        prompt_fields: [ ]
+
+      # LLM 总结节点
+      - node_id: "llm_summary"
+        label: "回答总结"
+        type: "llm"
+        path: "/graph/nodes/2"
+        prompt_fields:
+          - "data.prompt_template"
+
+    # 资源依赖
+    resources:
+      knowledge_bases:
+        - "kb_product_docs"
+        - "kb_faq"
+      tools:
+        - "web_search"
+      datasets: [ ]
+
+    # 标签（用于分类和搜索）
+    tags:
+      - "客服"
+      - "对话"
+      - "生产环境"
+
+    # 元数据（可选）
+    metadata:
+      owner: "qa_team"
+      created_at: "2025-01-10"
+      use_case: "客户服务自动化"
+
+  # ===== 示例 2: Workflow 类型 =====
+  - id: "content_analyzer_v2"
+    label: "内容分析工具"
+    type: "workflow"                     # 无状态工作流
+    version: "2.0.1"
+    description: "分析文本内容的情感和关键信息"
+
+    dsl_path: "workflows/content_analyzer_v2.yaml"
+    checksum: "sha256:789xyz..."
+
+    nodes:
+      # 预处理节点
+      - node_id: "text_preprocessor"
+        label: "文本预处理"
+        type: "code"
+        path: "/graph/nodes/0"
+        prompt_fields: [ ]
+
+      # 情感分析 LLM
+      - node_id: "sentiment_llm"
+        label: "情感分析"
+        type: "llm"
+        path: "/graph/nodes/1"
+        prompt_fields:
+          - "data.prompt_template"
+
+      # 关键词提取 LLM
+      - node_id: "keyword_llm"
+        label: "关键词提取"
+        type: "llm"
+        path: "/graph/nodes/2"
+        prompt_fields:
+          - "data.prompt_template"
+
+      # 条件判断节点
+      - node_id: "quality_check"
+        label: "质量检查"
+        type: "if-else"
+        path: "/graph/nodes/3"
+        prompt_fields: [ ]
+
+      # HTTP 请求节点
+      - node_id: "api_callback"
+        label: "结果回调"
+        type: "http-request"
+        path: "/graph/nodes/4"
+        prompt_fields: [ ]
+
+    resources:
+      knowledge_bases: [ ]
+      tools:
+        - "text_splitter"
+        - "nlp_toolkit"
+      datasets:
+        - "training_samples"
+
+    tags:
+      - "NLP"
+      - "分析"
+      - "批处理"
+
+    metadata:
+      owner: "nlp_team"
+      created_at: "2025-02-15"
+      use_case: "内容审核"
+
+  # ===== 示例 3: 简化配置 =====
+  - id: "simple_qa_bot"
+    label: "简单问答机器人"
+    type: "chatflow"
+    dsl_path: "chatflows/simple_qa.yaml"
+
+    # 最小化节点索引（如果不需要 Prompt Patch）
+    nodes:
+      - node_id: "llm_qa"
+        type: "llm"
+        path: "/graph/nodes/0"
+        prompt_fields:
+          - "data.prompt_template"
+
+    resources:
+      knowledge_bases: [ ]
+      tools: [ ]
+
+    tags:
+      - "问答"
+      - "测试"
+
+# ===== 节点类型说明 =====
+# 常见节点类型：
+# - llm: LLM 大语言模型节点
+# - knowledge-retrieval: 知识库检索
+# - code: 代码执行节点
+# - http-request: HTTP 请求
+# - if-else: 条件判断
+# - template-transform: 模板转换
+# - variable-aggregator: 变量聚合
+# - tool: 工具调用
+# - start: 开始节点
+# - end: 结束节点
+
+# ===== Path 说明 =====
+# path 使用 JSON Pointer 格式：
+# - 根节点: /graph
+# - 节点列表: /graph/nodes
+# - 第一个节点: /graph/nodes/0
+# - 节点数据: /graph/nodes/0/data
+# - 嵌套字段: /graph/nodes/0/data/prompt_template
+
+# ===== Prompt Fields 说明 =====
+# prompt_fields 列出该节点中包含 prompt 的字段路径（相对于节点）
+# 例如：
+# - "data.prompt_template" → 节点的 data.prompt_template 字段
+# - "config.system_prompt" → 节点的 config.system_prompt 字段

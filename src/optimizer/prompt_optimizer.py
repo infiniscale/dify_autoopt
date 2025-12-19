@@ -1755,19 +1755,20 @@ class _DspyPromptOptimizer:
     ) -> List[PromptPatch]:
         if not self.available or not prompts:
             return []
-        self._optimizer_cm = _get_optimizer_concurrency_manager()
+        optimizer_cm = _get_optimizer_concurrency_manager()
+
         dataset = self._build_dataset(samples, reference_texts)
         if not dataset:
             return []
-        # lm = self._lm or self._build_lm()
-        # predictor = self._dspy.ChainOfThought(self._predict_signature(), lm=lm)  # type: ignore[attr-defined]
-        # judge = self._dspy.ChainOfThought(self._judge_signature(), lm=lm)  # type: ignore[attr-defined]
-        # rewriter = self._dspy.ChainOfThought(self._rewrite_signature(), lm=lm)  # type: ignore[attr-defined]
-        predictor = self._dspy.ChainOfThought(self._predict_signature())  # type: ignore[attr-defined]
-        judge = self._dspy.ChainOfThought(self._judge_signature())  # type: ignore[attr-defined]
-        rewriter = self._dspy.ChainOfThought(self._rewrite_signature())  # type: ignore[attr-defined]
         patches: List[PromptPatch] = []
-        for prompt in prompts:
+        max_workers = self._effective_workers(len(prompts))
+
+        def _optimize_prompt(prompt: PromptLocation) -> Optional[PromptPatch]:
+            # Avoid sharing ChainOfThought across threads
+            predictor = self._dspy.ChainOfThought(self._predict_signature())  # type: ignore[attr-defined]
+            judge = self._dspy.ChainOfThought(self._judge_signature())  # type: ignore[attr-defined]
+            rewriter = self._dspy.ChainOfThought(self._rewrite_signature())  # type: ignore[attr-defined]
+
             improved = self._optimize_single(
                 prompt.text,
                 dataset,
@@ -1775,7 +1776,7 @@ class _DspyPromptOptimizer:
                 predictor,
                 judge,
                 rewriter,
-                None,
+                optimizer_cm,
             )
 
             if not improved or improved.strip() == prompt.text.strip():
@@ -1804,83 +1805,23 @@ class _DspyPromptOptimizer:
 
         if max_workers <= 1:
             for prompt in prompts:
-                patch = _optimize(prompt)
+                patch = _optimize_prompt(prompt)
+
                 if patch:
                     patches.append(patch)
             return patches
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {executor.submit(_optimize, prompt): prompt for prompt in prompts}
+            future_map = {executor.submit(_optimize_prompt, prompt): prompt for prompt in prompts}
+
             for future in as_completed(future_map):
                 patch = future.result()
                 if patch:
                     patches.append(patch)
-        return patches
 
-    def optimize_blocks(
-        self,
-        workflow_id: str,
-        blocks: Sequence[PromptBlock],
-        samples: Sequence[ExecutionSample],
-        reference_texts: Sequence[Optional[str]],
-        constraints: Sequence[str],
-        fail_signal: Optional[FailSignal] = None,
-    ) -> List[PromptPatch]:
-        if not self.available or not blocks:
-            return []
-        dataset = self._build_dataset(samples, reference_texts)
-        if not dataset:
-            return []
-        predictor = self._dspy.ChainOfThought(self._predict_signature())  # type: ignore[attr-defined]
-        judge = self._dspy.ChainOfThought(self._judge_signature())  # type: ignore[attr-defined]
-        rewriter = self._dspy.ChainOfThought(self._rewrite_signature())  # type: ignore[attr-defined]
-        patches: List[PromptPatch] = []
-        effective_signal = fail_signal or FailSignal()
-        for block in blocks:
-            context_text = _build_block_context(block, effective_signal, constraints)
-            placeholders_text = "; ".join(block.brief.placeholders) if block.brief and block.brief.placeholders else ""
-            improved = self._optimize_single(
-                block.merged_text,
-                dataset,
-                constraints,
-                predictor,
-                judge,
-                rewriter,
-                context_text,
-                placeholders_text,
-            )
-            if not improved or improved.strip() == block.merged_text.strip():
-                continue
-            if not _validate_block_rewrite(block, improved):
-                try:
-                    logger.warning(
-                        "DSPy block rewrite校验失败，保持原提示词",
-                        extra={"workflow_id": workflow_id, "node_id": block.node_id},
-                    )
-                except Exception:
-                    pass
-                continue
-            split_texts = _split_block_by_markers(block, improved)
-            if not split_texts:
-                continue
-            for msg, new_text in zip(block.messages, split_texts):
-                if new_text is None:
-                    continue
-                old_text = str(msg.get("text") or "")
-                if new_text.strip() == old_text.strip():
-                    continue
-                patches.append(
-                    PromptPatch(
-                        workflow_id=workflow_id,
-                        node_id=block.node_id,
-                        field_path=msg.get("path", ""),
-                        old=old_text,
-                        new=new_text,
-                        rationale="DSPy optimizer updated prompt block with node context",
-                        confidence=0.75,
-                        evidence_runs=[record["run_index"] for record in dataset],
-                    )
-                )
+        prompt_order = {p.path: idx for idx, p in enumerate(prompts)}
+        patches.sort(key=lambda p: prompt_order.get(p.field_path, 0))
+
         return patches
 
     def _build_dataset(
@@ -1915,6 +1856,23 @@ class _DspyPromptOptimizer:
             pass
         return dataset
 
+    def _effective_workers(self, total: int) -> int:
+        """
+        Determine safe worker count based on runtime concurrency manager.
+
+        Falls back to total items when no manager is configured.
+        """
+        if total <= 1:
+            return 1
+        cm = _get_optimizer_concurrency_manager()
+        if cm and getattr(cm, "limit", None):
+            try:
+                return max(1, min(int(cm.limit), int(total)))
+            except Exception:
+                return max(1, min(4, total))
+        # Fallback cap to avoid QPS spikes when no manager is configured
+        return max(1, min(4, total))
+
     def _optimize_single(
         self,
         current_prompt: str,
@@ -1923,10 +1881,10 @@ class _DspyPromptOptimizer:
         predictor,
         judge,
         rewriter,
-        context_text: Optional[str] = None,
-        placeholders_text: Optional[str] = None,
+        optimizer_cm=None,
     ) -> str:
-        cm = self._optimizer_cm
+        cm = optimizer_cm
+
         with (cm.slot() if cm else nullcontext()):
             prompt_text = current_prompt
             for _ in range(max(1, self.max_iterations)):
@@ -2010,44 +1968,7 @@ class _DspyPromptOptimizer:
                         failures=feedback_text,
                         constraints="\n".join(constraints) if constraints else "None",
                     )
-                    verdict_raw = getattr(verdict, "verdict", None)
-                    verdict_text = (verdict_raw or "").lower()
-                    feedback = getattr(verdict, "feedback", "") or ""
-                    soft_pass, soft_score = _is_reference_soft_satisfied(record["reference"], candidate)
-                    if ("fail" in verdict_text or not verdict_text) and soft_pass:
-                        verdict_text = "pass"
-                        if not feedback:
-                            feedback = f"Soft-passed by similarity≈{soft_score:.2f} to reference"
-                except Exception as exc:  # noqa: BLE001
-                    fallback_feedback = _extract_lm_response_from_exception(exc)
-                    detail = fallback_feedback or str(exc)
-                    try:
-                        logger.warning(
-                            "DSPy judge 执行失败，记为不通过",
-                            extra={
-                                "workflow_input": record["workflow_input"][:200],
-                                "error": str(exc),
-                                "fallback": detail[:200],
-                            },
-                        )
-                    except Exception:
-                        pass
-                    failures.append(f"DSPy judge failed: {detail}")
-                    continue
-                if "fail" in verdict_text or not verdict_text:
-                    failures.append(feedback or f"Mismatch against reference:\n{record['reference'][:400]}")
-            if not failures:
-                break
-            feedback_text = "\n".join(f"- {item}" for item in failures)
-            def _do_rewrite(masked_prompt: str) -> str:
-                rewrite = rewriter(
-                    current_prompt=masked_prompt,
-                    failures=feedback_text,
-                    constraints="\n".join(constraints) if constraints else "None",
-                    context=context_text or "None",
-                    placeholders=placeholders_text or "None",
-                )
-                return getattr(rewrite, "optimized_prompt", "") or masked_prompt
+                    return getattr(rewrite, "optimized_prompt", "") or masked_prompt
 
 
                 new_prompt = _safe_rewrite_prompt(prompt_text, _do_rewrite)
