@@ -23,3 +23,6 @@ tenacity>=8.2.3         # Retry logic with exponential backoff
 
 # Optional: dspy-based prompt rewrite (used if installed)
 dspy-ai>=2.5.0
+
+# package
+pyinstaller

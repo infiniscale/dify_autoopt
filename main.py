@@ -5,13 +5,14 @@
 - .env：在初始化日志之前加载
 """
 
-import os
-import asyncio
-import sys
-from pathlib import Path
-from datetime import datetime
 import argparse
+import asyncio
 import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
 import requests
 
 try:
@@ -29,6 +30,20 @@ from src.utils.logger import (
     log_exception,
 )
 from src.config.loaders.config_loader import ConfigLoader
+
+
+def _expand_path(path: str) -> Path:
+    return Path(os.path.expandvars(path)).expanduser()
+
+
+def _config_has_logging(path: Path) -> bool:
+    try:
+        import yaml
+
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return isinstance(raw, dict) and "logging" in raw
+    except Exception:
+        return False
 
 
 async def main(argv: list[str] | None = None) -> int:
@@ -66,11 +81,102 @@ async def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
-    # 1. 日志初始化
-    await setup_logging(args.log_config)
-    logger = get_logger("main")
-
+    logger = None
     try:
+        # 1. 确定有效配置路径（提前处理，用于日志初始化）
+        deferred_logs: list[tuple[str, str, dict]] = []
+
+        def _defer(level: str, message: str, extra: dict) -> None:
+            deferred_logs.append((level, message, extra))
+
+        from src.config.bootstrap import bootstrap_from_unified
+        effective_config: Path
+        if args.config:
+            candidate = _expand_path(args.config)
+            if candidate.exists():
+                effective_config = candidate
+            else:
+                _defer("warning", "指定的配置文件不存在，尝试默认路径", {"config": str(candidate)})
+                effective_config = Path("config/config.yaml")
+        else:
+            effective_config = Path("config/config.yaml")
+        if not effective_config.exists():
+            # 使用内置默认配置
+            import yaml, tempfile
+
+            default_cfg = {
+                "meta": {"version": "1.0.0", "environment": "development"},
+                "dify": {"base_url": None},
+                "auth": {},
+                "variables": {},
+                "workflows": [],
+                "execution": {"concurrency": 5, "timeout": 300, "retry_count": 3},
+                "optimization": {"strategy": "auto", "max_iterations": 3},
+                "io_paths": {"output_dir": "./outputs", "logs_dir": "./logs"},
+                "logging": {"level": "INFO", "format": "simple", "console_enabled": True, "file_enabled": True},
+            }
+            tf = tempfile.NamedTemporaryFile(prefix="default_config_", suffix=".yaml", delete=False)
+            Path(tf.name).write_text(yaml.safe_dump(default_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            effective_config = Path(tf.name)
+            _defer("info", "未找到配置文件，已使用内置默认配置", {"effective_config": str(effective_config)})
+
+        # 1.1 应用 --set 覆盖项（生成临时配置文件）
+        if args.set:
+            try:
+                import yaml, tempfile
+
+                def _apply(d: dict, path: str, value: str):
+                    cur = d
+                    parts = path.split('.') if path else []
+                    for key in parts[:-1]:
+                        if key not in cur or not isinstance(cur[key], dict):
+                            cur[key] = {}
+                        cur = cur[key]
+                    v = value
+                    if value.lower() in {"true", "false"}:
+                        v = value.lower() == "true"
+                    else:
+                        try:
+                            if "." in value:
+                                v = float(value)
+                            else:
+                                v = int(value)
+                        except Exception:
+                            v = value
+                    if parts:
+                        cur[parts[-1]] = v
+
+                base_raw = {}
+                try:
+                    if effective_config.exists():
+                        base_raw = yaml.safe_load(effective_config.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    base_raw = {}
+                raw = base_raw
+                for item in args.set:
+                    if "=" not in item:
+                        continue
+                    k, v = item.split("=", 1)
+                    _apply(raw, k.strip(), v.strip())
+                tf = tempfile.NamedTemporaryFile(prefix="config_overrides_", suffix=".yaml", delete=False)
+                Path(tf.name).write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+                effective_config = Path(tf.name)
+                _defer("info", "已应用配置覆盖项", {"overrides": args.set, "effective_config": str(effective_config)})
+            except Exception as e:
+                _defer("warning", "应用配置覆盖项失败，继续使用原始配置", {"error": str(e)})
+
+        # 2. 日志初始化（优先使用显式 --log-config，其次使用有效配置文件的 logging 段）
+        log_config_path: str | None = args.log_config
+        if log_config_path:
+            log_config_path = str(_expand_path(log_config_path))
+        elif effective_config.exists() and _config_has_logging(effective_config):
+            log_config_path = str(effective_config)
+        await setup_logging(log_config_path)
+        logger = get_logger("main")
+
+        for level, message, extra in deferred_logs:
+            getattr(logger, level)(message, extra=extra)
+
         # 2. 启动日志
         logger.info(
             "Dify自动优化工具启动",
@@ -97,82 +203,7 @@ async def main(argv: list[str] | None = None) -> int:
         )
 
         # 4. 加载配置与引导
-        from src.config.bootstrap import bootstrap_from_unified
-        # 4.0 确定有效配置路径
-        effective_config: Path
-        if args.config:
-            candidate = Path(args.config)
-            if candidate.exists():
-                effective_config = candidate
-            else:
-                logger.warning("指定的配置文件不存在，尝试默认路径", extra={"config": str(candidate)})
-                effective_config = Path("config/config.yaml")
-        else:
-            effective_config = Path("config/config.yaml")
-        if not effective_config.exists():
-            # 使用内置默认配置
-            import yaml, tempfile
-            default_cfg = {
-                "meta": {"version": "1.0.0", "environment": "development"},
-                "dify": {"base_url": None},
-                "auth": {},
-                "variables": {},
-                "workflows": [],
-                "execution": {"concurrency": 5, "timeout": 300, "retry_count": 3},
-                "optimization": {"strategy": "auto", "max_iterations": 3},
-                "io_paths": {"output_dir": "./outputs", "logs_dir": "./logs"},
-                "logging": {"level": "INFO", "format": "simple", "console_enabled": True, "file_enabled": True},
-            }
-            tf = tempfile.NamedTemporaryFile(prefix="default_config_", suffix=".yaml", delete=False)
-            Path(tf.name).write_text(yaml.safe_dump(default_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
-            effective_config = Path(tf.name)
-            logger.info("未找到配置文件，已使用内置默认配置", extra={"effective_config": str(effective_config)})
-
-        # 4.1 应用 --set 覆盖项
-        if args.set:
-            try:
-                import yaml, tempfile
-                def _apply(d: dict, path: str, value: str):
-                    cur = d
-                    parts = path.split('.') if path else []
-                    for key in parts[:-1]:
-                        if key not in cur or not isinstance(cur[key], dict):
-                            cur[key] = {}
-                        cur = cur[key]
-                    v = value
-                    if value.lower() in {"true", "false"}:
-                        v = value.lower() == "true"
-                    else:
-                        try:
-                            if "." in value:
-                                v = float(value)
-                            else:
-                                v = int(value)
-                        except Exception:
-                            v = value
-                    if parts:
-                        cur[parts[-1]] = v
-                base_raw = {}
-                try:
-                    if effective_config.exists():
-                        import yaml
-                        base_raw = yaml.safe_load(effective_config.read_text(encoding="utf-8")) or {}
-                except Exception:
-                    base_raw = {}
-                raw = base_raw
-                for item in args.set:
-                    if "=" not in item:
-                        continue
-                    k, v = item.split("=", 1)
-                    _apply(raw, k.strip(), v.strip())
-                tf = tempfile.NamedTemporaryFile(prefix="config_overrides_", suffix=".yaml", delete=False)
-                Path(tf.name).write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
-                effective_config = Path(tf.name)
-                logger.info("已应用配置覆盖项", extra={"overrides": args.set, "effective_config": str(effective_config)})
-            except Exception as e:
-                logger.warning("应用配置覆盖项失败，继续使用原始配置", extra={"error": str(e)})
-
-        # 4.2 引导运行态
+        # 4.1 引导运行态
         runtime = bootstrap_from_unified(effective_config)
         meta = runtime.app.meta or {}
         _log_manager.set_global_context(
@@ -348,11 +379,14 @@ async def main(argv: list[str] | None = None) -> int:
         logger.info("Dify自动优化工具正常关闭", extra={"shutdown_time": datetime.now().isoformat(), "status": "graceful_shutdown"})
         return 0
     except Exception as e:
-        logger.critical(
-            "应用运行时发生严重错误",
-            extra={"error_type": type(e).__name__, "error_message": str(e), "shutdown_reason": "error"},
-            exc_info=True,
-        )
+        if logger:
+            logger.critical(
+                "应用运行时发生严重错误",
+                extra={"error_type": type(e).__name__, "error_message": str(e), "shutdown_reason": "error"},
+                exc_info=True,
+            )
+        else:
+            print(f"Fatal error before logger initialized: {type(e).__name__}: {e}")
         return 1
     finally:
         from src.utils.logger import _log_manager

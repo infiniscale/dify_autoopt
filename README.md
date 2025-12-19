@@ -259,6 +259,12 @@ python main.py --mode all --config config/config.yaml
 python main.py --mode opt --config config/config.yaml
 ```
 
+### 4. 打包
+
+```bash
+pyinstaller main.py --paths src  --name dify-autoopt-cli
+```
+
 ## 单元测试
 
 本项目使用 pytest 进行单元测试，测试文件位于 `src/test/`，命名为 `test_*.py`。
