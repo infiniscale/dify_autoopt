@@ -12,7 +12,8 @@ meta:
 
 # ===== Dify 平台配置 =====
 dify:
-  base_url: "http://xy.dnset.com:1280"   # Dify 实例根地址
+  #base_url: "http://xy.dnset.com:1280"   # Dify 实例根地址
+  base_url: "http://125.118.93.188:1280"   # Dify 实例根地址
 
 # ===== 登录与认证配置（演示用，建议使用环境变量替代） =====
 auth:
@@ -105,10 +106,7 @@ optimization:
   exit_ratio: 0.8
   llm:
     url: "${LLM_BASE_URL}"
-    # url: "http://211.93.0.206:10027/v1/chat/completions"
-    # model: "glm-4.6-fp8"
     model: "${LLM_MODEL}"
-    # api_key: "sk-4ZYDiy0HfYjRUJNYg8Hw2ULHbZc0UcS3WnXBwzSUQADteVzL"
     api_key: "${LLM_API_KEY}"
     enable_cache: true
     cache_ttl: 86400

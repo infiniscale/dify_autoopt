@@ -1852,8 +1852,8 @@ class _DspyPromptOptimizer:
                 "DSPy 构建训练样本",
                 extra={"sample_count": len(dataset), "max_samples": self.max_samples},
             )
-            except Exception:
-                pass
+        except Exception:
+            pass
         return dataset
 
     def _effective_workers(self, total: int) -> int:
