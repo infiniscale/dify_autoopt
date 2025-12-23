@@ -262,6 +262,18 @@ def run_optimize_loop(
         ref_path = _resolve_reference_file(opt_cfg, current_app_id)
         no_patch_rounds = 0
 
+        # Build workflow context for injection
+        wf_name = getattr(wf, "name", None)
+        wf_desc = getattr(wf, "description", None)
+        workflow_context: Optional[str] = None
+        if wf_name or wf_desc:
+            context_parts = []
+            if wf_name:
+                context_parts.append(f"Workflow Name: {wf_name}")
+            if wf_desc:
+                context_parts.append(f"Workflow Description: {wf_desc}")
+            workflow_context = "\n".join(context_parts)
+
         current_yaml_path: Optional[str] = None
         # 确保初始 DSL 可用：优先导出最新 DSL（若有控制台 token），否则尝试读取本地已导出的 DSL
         if console_token:
@@ -445,6 +457,7 @@ def run_optimize_loop(
                         reference_path=ref_path,
                         reference_texts=reference_texts,
                         output_root=output_dir,
+                        workflow_context=workflow_context,
                     )
             except Exception as ex:  # noqa: BLE001
                 logger.warning(

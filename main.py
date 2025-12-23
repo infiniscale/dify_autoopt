@@ -748,6 +748,18 @@ async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True
                     resume_from_checkpoint=bool(ref_cfg.get("resume_prompt_state")),
                 )
             else:
+                # Build workflow context for injection
+                wf_name = getattr(wf, "name", None)
+                wf_desc = getattr(wf, "description", None)
+                workflow_context = None
+                if wf_name or wf_desc:
+                    context_parts = []
+                    if wf_name:
+                        context_parts.append(f"Workflow Name: {wf_name}")
+                    if wf_desc:
+                        context_parts.append(f"Workflow Description: {wf_desc}")
+                    workflow_context = "\n".join(context_parts)
+
                 report = optimizer.optimize_from_runs(
                     workflow_id=wid,
                     run_results=run_results,
@@ -755,6 +767,7 @@ async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True
                     reference_path=reference_path,
                     reference_texts=reference_texts,
                     output_root=output_dir,
+                    workflow_context=workflow_context,
                 )
             summaries.append(
                 {
