@@ -625,15 +625,50 @@ class PromptOptimizer:
         workflow_yaml: Optional[Tuple[Dict[str, Any], Path]] = None,
         output_root: Optional[str | Path] = None,
         apply_patches: bool = True,
+        workflow_name: Optional[str] = None,
+        workflow_description: Optional[str] = None,
     ) -> OptimizationReport:
-        """Generate prompt patches from execution results and references."""
+        """Generate prompt patches from execution results and references.
+
+        Args:
+            workflow_id: Unique identifier for the workflow.
+            run_results: Sequence of execution run results.
+            reference_path: Path to reference spec file.
+            reference_spec: Pre-loaded reference spec.
+            reference_texts: Per-run reference texts for comparison.
+            workflow_yaml: Tuple of (yaml_tree, yaml_path) if pre-loaded.
+            output_root: Output directory for patches and reports.
+            apply_patches: Whether to write patched DSL file.
+            workflow_name: Human-readable name of the workflow (for context).
+            workflow_description: Description of the workflow purpose (for context).
+        """
         reference = reference_spec or _load_reference_spec(reference_path)
         samples = self._normalize_runs(run_results)
+
+        # Build workflow context string for optimization models
+        workflow_context = ""
+        if workflow_name:
+            workflow_context += f"Workflow Name: {workflow_name}\n"
+        if workflow_description:
+            workflow_context += f"Workflow Description: {workflow_description}\n"
+
+        # Debug: Log the constructed workflow context
+        logger.debug(
+            "Workflow context constructed for optimizer",
+            extra={
+                "workflow_context": workflow_context if workflow_context else "(empty)",
+                "workflow_name": workflow_name,
+                "workflow_description": workflow_description,
+            },
+        )
+
         try:
             logger.info(
                 "优化输入就绪",
                 extra={
                     "workflow_id": workflow_id,
+                    "workflow_name": workflow_name,
+                    "workflow_description": workflow_description[:100] if workflow_description else None,
                     "runs": len(samples),
                     "has_reference_texts": bool(reference_texts),
                     "llm_configured": bool(self.llm_config),
@@ -724,6 +759,7 @@ class PromptOptimizer:
                     reference_texts or [],
                     reference.constraints,
                     fail_signal=fail_signal,
+                    workflow_context=workflow_context,
                 )
             except Exception as exc:  # noqa: BLE001
                 try:
@@ -1270,6 +1306,35 @@ def _tokens_intact(original_masked: str, rewritten: str, token_map: Dict[str, st
 
 def _placeholders_preserved(original_placeholders: Sequence[str], new_text: str) -> bool:
     return set(original_placeholders) == set(_extract_placeholders(new_text))
+
+
+def _parse_workflow_context(workflow_context: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Parse workflow context string to extract name and description.
+
+    The workflow_context string is expected to have the format:
+        Workflow Name: <name>
+        Workflow Description: <description>
+
+    Args:
+        workflow_context: The workflow context string or None.
+
+    Returns:
+        A tuple of (workflow_name, workflow_description), either of which may be None.
+    """
+    if not workflow_context:
+        return None, None
+
+    workflow_name: Optional[str] = None
+    workflow_description: Optional[str] = None
+
+    for line in workflow_context.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("Workflow Name:"):
+            workflow_name = line[len("Workflow Name:"):].strip()
+        elif line.startswith("Workflow Description:"):
+            workflow_description = line[len("Workflow Description:"):].strip()
+
+    return workflow_name, workflow_description
 
 
 def _build_fail_signal_from_issues(issues: Sequence[DetectedIssue], constraints: Sequence[str]) -> FailSignal:
@@ -1824,6 +1889,274 @@ class _DspyPromptOptimizer:
 
         return patches
 
+    def optimize_blocks(
+        self,
+        workflow_id: str,
+        blocks: Sequence[PromptBlock],
+        samples: Sequence[ExecutionSample],
+        reference_texts: Sequence[Optional[str]],
+        constraints: Sequence[str],
+        *,
+        fail_signal: Optional[FailSignal] = None,
+        workflow_context: Optional[str] = None,
+    ) -> List[PromptPatch]:
+        """Optimize prompts from PromptBlock objects.
+
+        This method handles multi-message blocks and produces patches for each message.
+
+        Args:
+            workflow_id: Workflow identifier.
+            blocks: Sequence of PromptBlock objects containing node-level prompts.
+            samples: Execution samples for feedback.
+            reference_texts: Per-run reference texts for comparison.
+            constraints: Global constraints for the optimization.
+            fail_signal: Structured failure hints for rewrites.
+            workflow_context: Business context from workflow name and description.
+        """
+        if not self.available or not blocks:
+            return []
+        optimizer_cm = _get_optimizer_concurrency_manager()
+        dataset = self._build_dataset(samples, reference_texts)
+        if not dataset:
+            return []
+
+        patches: List[PromptPatch] = []
+        max_workers = self._effective_workers(len(blocks))
+
+        # Store workflow context for use in rewriter
+        self._workflow_context = workflow_context or ""
+
+        # Parse workflow context to extract name and description for system message
+        workflow_name, workflow_description = _parse_workflow_context(workflow_context)
+
+        def _optimize_block(block: PromptBlock) -> List[PromptPatch]:
+            """Optimize a single block and return patches for all its messages."""
+            predictor = self._dspy.ChainOfThought(self._predict_signature())  # type: ignore[attr-defined]
+            judge = self._dspy.ChainOfThought(self._judge_signature())  # type: ignore[attr-defined]
+            rewriter = self._dspy.ChainOfThought(self._rewrite_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
+
+            block_context = _build_block_context(block, fail_signal or FailSignal(), constraints)
+            if workflow_context:
+                block_context = f"{workflow_context}\n{block_context}"
+
+            improved = self._optimize_single_with_context(
+                block.merged_text,
+                dataset,
+                constraints,
+                predictor,
+                judge,
+                rewriter,
+                optimizer_cm,
+                block_context=block_context,
+                workflow_context=workflow_context,
+            )
+
+            if not improved or improved.strip() == block.merged_text.strip():
+                return []
+
+            # Split the improved merged text back into per-message segments
+            segments = _split_block_by_markers(block, improved)
+            if segments is None:
+                # Fallback: single patch for the first message if markers missing
+                try:
+                    logger.warning(
+                        "无法拆分优化后的block，使用回退策略",
+                        extra={"workflow_id": workflow_id, "node_id": block.node_id},
+                    )
+                except Exception:
+                    pass
+                return []
+
+            block_patches: List[PromptPatch] = []
+            for msg, new_text in zip(block.messages, segments):
+                old_text = str(msg.get("text", ""))
+                if new_text.strip() != old_text.strip():
+                    block_patches.append(
+                        PromptPatch(
+                            workflow_id=workflow_id,
+                            node_id=block.node_id,
+                            field_path=msg.get("path", ""),
+                            old=old_text,
+                            new=new_text,
+                            rationale="DSPy optimizer updated prompt based on reference feedback and workflow context",
+                            confidence=0.75,
+                            evidence_runs=[record["run_index"] for record in dataset],
+                        )
+                    )
+
+            try:
+                if block_patches:
+                    logger.info(
+                        "DSPy 优化完成 block",
+                        extra={
+                            "workflow_id": workflow_id,
+                            "node_id": block.node_id,
+                            "patches": len(block_patches),
+                        },
+                    )
+            except Exception:
+                pass
+
+            return block_patches
+
+        if max_workers <= 1:
+            for block in blocks:
+                block_patches = _optimize_block(block)
+                patches.extend(block_patches)
+            return patches
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(_optimize_block, block): block for block in blocks}
+            for future in as_completed(future_map):
+                block_patches = future.result()
+                patches.extend(block_patches)
+
+        return patches
+
+    def _optimize_single_with_context(
+        self,
+        current_prompt: str,
+        dataset: Sequence[Dict[str, Any]],
+        constraints: Sequence[str],
+        predictor,
+        judge,
+        rewriter,
+        optimizer_cm=None,
+        *,
+        block_context: str = "",
+        workflow_context: str = "",
+    ) -> str:
+        """Optimize a single prompt with additional context.
+
+        Similar to _optimize_single but includes workflow and block context in the rewrite step.
+        """
+        cm = optimizer_cm
+
+        with (cm.slot() if cm else nullcontext()):
+            prompt_text = current_prompt
+            for _ in range(max(1, self.max_iterations)):
+                failures: List[str] = []
+                for record in dataset:
+                    candidate = ""
+                    try:
+                        prediction = predictor(
+                            workflow_input=record["workflow_input"],
+                            prompt_template=prompt_text,
+                        )
+                        candidate = self._extract_prediction_output(prediction)
+                    except Exception as exc:  # noqa: BLE001
+                        fallback = _extract_lm_response_from_exception(exc)
+                        if fallback:
+                            candidate = fallback
+                        else:
+                            failures.append(f"DSPy predictor failed: {exc}")
+                            continue
+                    if not candidate.strip():
+                        failures.append("DSPy predictor returned empty response")
+                        continue
+                    try:
+                        verdict = judge(
+                            reference=record["reference"],
+                            candidate=candidate,
+                        )
+                        verdict_raw = getattr(verdict, "verdict", None)
+                        verdict_text = (verdict_raw or "").lower()
+                        feedback = getattr(verdict, "feedback", "") or ""
+                        soft_pass, soft_score = _is_reference_soft_satisfied(record["reference"], candidate)
+                        if ("fail" in verdict_text or not verdict_text) and soft_pass:
+                            verdict_text = "pass"
+                            if not feedback:
+                                feedback = f"Soft-passed by similarity={soft_score:.2f} to reference"
+                    except Exception as exc:  # noqa: BLE001
+                        fallback_feedback = _extract_lm_response_from_exception(exc)
+                        detail = fallback_feedback or str(exc)
+                        failures.append(f"DSPy judge failed: {detail}")
+                        continue
+                    if "fail" in verdict_text or not verdict_text:
+                        failures.append(feedback or f"Mismatch against reference:\n{record['reference'][:400]}")
+                if not failures:
+                    break
+                feedback_text = "\n".join(f"- {item}" for item in failures)
+
+                placeholders = _extract_placeholders(prompt_text)
+
+                # Debug: Log full DSPy rewriter inputs
+                logger.debug(
+                    "DSPy rewriter inputs",
+                    extra={
+                        "workflow_context_injected": bool(workflow_context),
+                        "current_prompt_preview": prompt_text[:300] if prompt_text else "(empty)",
+                        "failures": feedback_text[:300] if feedback_text else "(none)",
+                        "constraints_count": len(constraints) if constraints else 0,
+                        "block_context_preview": block_context[:200] if block_context else "(empty)",
+                        "placeholders": placeholders[:10] if placeholders else [],
+                    },
+                )
+
+                def _do_rewrite(masked_prompt: str) -> str:
+                    # Inject workflow context as constraint prefix into current_prompt
+                    prompt_with_context = masked_prompt
+                    if workflow_context:
+                        constraint_prefix = (
+                            f"[OPTIMIZATION CONSTRAINT]\n"
+                            f"{workflow_context}"
+                            f"The optimized prompt MUST align with the above workflow purpose.\n"
+                            f"[END CONSTRAINT]\n\n"
+                            f"[ORIGINAL PROMPT TO OPTIMIZE]\n"
+                        )
+                        prompt_with_context = constraint_prefix + masked_prompt
+
+                    # Debug: Log full prompt being sent to LLM (User Message content)
+                    logger.debug(
+                        "DSPy rewriter - User Message content",
+                        extra={
+                            "full_current_prompt": prompt_with_context,
+                            "prompt_length": len(prompt_with_context),
+                        },
+                    )
+
+                    # Log complete GLM request format (System + User Message)
+                    rewriter_signature = rewriter.signature if hasattr(rewriter, 'signature') else None
+                    system_prompt_doc = rewriter_signature.__doc__ if rewriter_signature else "(unknown)"
+                    logger.debug(
+                        "GLM 完整请求格式 - 即将调用 rewriter",
+                        extra={
+                            "system_message": system_prompt_doc,
+                            "user_message_current_prompt": prompt_with_context[:500] + "..." if len(prompt_with_context) > 500 else prompt_with_context,
+                            "user_message_failures": feedback_text[:300] + "..." if len(feedback_text) > 300 else feedback_text,
+                            "user_message_constraints": "\n".join(constraints) if constraints else "None",
+                            "user_message_context": block_context[:300] + "..." if len(block_context) > 300 else block_context,
+                            "user_message_placeholders": "; ".join(placeholders) if placeholders else "None",
+                        },
+                    )
+
+                    rewrite = rewriter(
+                        current_prompt=prompt_with_context,
+                        failures=feedback_text,
+                        constraints="\n".join(constraints) if constraints else "None",
+                        context=block_context,
+                        placeholders="; ".join(placeholders) if placeholders else "None",
+                    )
+                    return getattr(rewrite, "optimized_prompt", "") or masked_prompt
+
+                new_prompt = _safe_rewrite_prompt(prompt_text, _do_rewrite)
+
+                # Debug: Log rewrite result
+                logger.debug(
+                    "DSPy rewrite result",
+                    extra={
+                        "prompt_changed": new_prompt != prompt_text,
+                        "original_length": len(prompt_text) if prompt_text else 0,
+                        "new_length": len(new_prompt) if new_prompt else 0,
+                        "new_prompt_preview": new_prompt[:300] if new_prompt else "(empty)",
+                    },
+                )
+
+                if new_prompt == prompt_text:
+                    break
+                prompt_text = new_prompt
+            return prompt_text
+
     def _build_dataset(
         self,
         samples: Sequence[ExecutionSample],
@@ -2051,18 +2384,58 @@ class _DspyPromptOptimizer:
 
         return JudgeSignature
 
-    def _rewrite_signature(self):
+    def _rewrite_signature(
+        self,
+        workflow_name: Optional[str] = None,
+        workflow_description: Optional[str] = None,
+    ):
+        """Generate a RewriteSignature with optional workflow-specific system message.
+
+        Args:
+            workflow_name: Human-readable name of the workflow for context.
+            workflow_description: Description of the workflow purpose for context.
+
+        Returns:
+            A DSPy Signature class with appropriate docstring for the system message.
+        """
         dspy = self._dspy
 
-        class RewriteSignature(dspy.Signature):  # type: ignore[attr-defined]
-            """Rewrite prompt using judge feedback and constraints."""
+        # Build dynamic docstring based on workflow information
+        # Use explicit constraint markers for better visibility
+        if workflow_name or workflow_description:
+            constraint_lines = ["[WORKFLOW CONSTRAINT]"]
+            if workflow_name:
+                constraint_lines.append(f"Workflow Name: {workflow_name}")
+            if workflow_description:
+                constraint_lines.append(f"Workflow Description: {workflow_description}")
+            constraint_lines.append("You MUST optimize prompts to align with the above workflow purpose.")
+            constraint_lines.append("[END WORKFLOW CONSTRAINT]")
+            constraint_lines.append("")
+            constraint_lines.append("Rewrite the prompt using judge feedback and constraints.")
+            docstring = "\n".join(constraint_lines)
+        else:
+            docstring = "Rewrite prompt using judge feedback and constraints."
 
-            current_prompt = dspy.InputField(desc="Original prompt text")  # type: ignore[attr-defined]
+        class RewriteSignature(dspy.Signature):  # type: ignore[attr-defined]
+            current_prompt = dspy.InputField(desc="Original prompt text with workflow context prefix")  # type: ignore[attr-defined]
             failures = dspy.InputField(desc="Judge feedback details")  # type: ignore[attr-defined]
             constraints = dspy.InputField(desc="Constraints checklist")  # type: ignore[attr-defined]
             context = dspy.InputField(desc="Node brief and failure signals")  # type: ignore[attr-defined]
             placeholders = dspy.InputField(desc="Placeholders that must stay intact")  # type: ignore[attr-defined]
-            optimized_prompt = dspy.OutputField(desc="Improved prompt text")  # type: ignore[attr-defined]
+            optimized_prompt = dspy.OutputField(desc="Improved prompt text that aligns with the workflow purpose")  # type: ignore[attr-defined]
+
+        # Dynamically set the docstring
+        RewriteSignature.__doc__ = docstring
+
+        # Log the generated system prompt for debugging
+        logger.debug(
+            "GLM System Prompt (RewriteSignature docstring) 已生成",
+            extra={
+                "workflow_name": workflow_name,
+                "workflow_description": workflow_description,
+                "system_prompt": docstring,
+            },
+        )
 
         return RewriteSignature
 

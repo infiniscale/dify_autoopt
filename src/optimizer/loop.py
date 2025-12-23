@@ -331,6 +331,8 @@ def run_optimize_loop(
                     reference_path=ref_path,
                     reference_texts=reference_texts,
                     output_root=output_dir,
+                    workflow_name=getattr(wf, "name", None),
+                    workflow_description=getattr(wf, "description", None),
                 )
             except Exception as ex:  # noqa: BLE001
                 logger.warning(

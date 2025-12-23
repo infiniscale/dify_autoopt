@@ -125,3 +125,4 @@ dmypy.json
 
 # Ruff
 .ruff_cache/
+config/config.yaml.*.bak

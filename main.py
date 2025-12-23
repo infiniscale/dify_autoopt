@@ -652,6 +652,8 @@ async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True
                 reference_path=reference_path,
                 reference_texts=reference_texts,
                 output_root=output_dir,
+                workflow_name=getattr(wf, "name", None),
+                workflow_description=getattr(wf, "description", None),
             )
             summaries.append(
                 {
