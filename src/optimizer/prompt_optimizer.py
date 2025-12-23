@@ -689,6 +689,21 @@ class PromptOptimizer:
             )
         except Exception:
             pass
+        try:
+            logger.debug(
+                "优化器入口参数",
+                extra={
+                    "workflow_id": workflow_id,
+                    "use_dspy_optimizer": bool(self.llm_config.get("use_dspy_optimizer", True)),
+                    "enable_prompt_rewrite": bool(self.llm_config.get("enable_prompt_rewrite", True)),
+                    "dspy_action_judge": bool(self.llm_config.get("dspy_action_judge", False)),
+                    "dspy_prompt_state_mode": _normalize_prompt_state_mode(
+                        self.llm_config.get("dspy_prompt_state_mode", "off")
+                    ),
+                },
+            )
+        except Exception:
+            pass
 
         if workflow_yaml:
             workflow_tree, workflow_path = workflow_yaml
@@ -763,6 +778,13 @@ class PromptOptimizer:
         fail_signal = _build_fail_signal_from_issues(issues, reference.constraints)
         actions = _actions_from_issues(issues, reference.constraints)
         use_dspy = self.llm_config.get("use_dspy_optimizer", True)
+        try:
+            logger.info(
+                "优化器策略选择",
+                extra={"workflow_id": workflow_id, "use_dspy_optimizer": bool(use_dspy)},
+            )
+        except Exception:
+            pass
         if use_dspy:
             dspy_optimizer = _DspyPromptOptimizer(self.llm_config)
             try:
@@ -797,6 +819,17 @@ class PromptOptimizer:
         if enable_rewrite and self.llm_config.get("url") and self.llm_config.get("model"):
             dspy_rewriter = _DspyRewriter(self.llm_config)
             rewriter = dspy_rewriter if dspy_rewriter.available else _LlmRewriter(self.llm_config)
+        try:
+            logger.debug(
+                "优化器重写器配置",
+                extra={
+                    "workflow_id": workflow_id,
+                    "enable_prompt_rewrite": bool(enable_rewrite),
+                    "rewriter": type(rewriter).__name__ if rewriter else None,
+                },
+            )
+        except Exception:
+            pass
 
         if rewriter:
             context_text = _format_fail_signal(fail_signal)
@@ -844,6 +877,240 @@ class PromptOptimizer:
         report.patched_path = patched_path
 
         self._maybe_write_report(report, output_root or self.default_output_root)
+        return report
+
+    def optimize_with_prompt_state(
+            self,
+            workflow_id: str,
+            run_results: Sequence[Dict[str, Any]],
+            *,
+            workflow_yaml: Optional[Tuple[Dict[str, Any], Path]] = None,
+            reference_path: Optional[str | Path] = None,
+            reference_spec: Optional[ReferenceSpec] = None,
+            reference_texts: Optional[Sequence[Optional[str]]] = None,
+            output_root: Optional[str | Path] = None,
+            apply_patches: bool = True,
+            # PromptState / optimize_prompt 关键参数
+            run_once_fn=None,
+            max_steps: int = 5,
+            beam_width: int = 1,
+            variant_count: int = 1,
+            action_budget: Optional[int] = DEFAULT_ACTION_BUDGET,
+            concurrency_manager: Optional[ConcurrencyManager] = None,
+            max_concurrency: Optional[int] = None,
+            checkpoint_dir: Optional[str | Path] = None,
+            resume_from_checkpoint: bool = False,
+    ) -> OptimizationReport:
+        """
+        Bridge entry: use optimize_prompt(PromptState + Action loop) to generate PromptPatch/OptimizationReport
+        while keeping external output format consistent with optimize_from_runs.
+        """
+        if workflow_yaml is None or not workflow_yaml[0] or not workflow_yaml[1]:
+            raise ValueError("workflow_yaml is required for optimize_with_prompt_state(...)")
+
+        if run_once_fn is None:
+            raise ValueError("run_once_fn is required for optimize_with_prompt_state(...)")
+
+        workflow_tree, workflow_path = workflow_yaml
+        try:
+            logger.info(
+                "PromptState optimizer entry",
+                extra={
+                    "workflow_id": workflow_id,
+                    "runs": len(run_results),
+                    "max_steps": max_steps,
+                    "beam_width": beam_width,
+                    "variant_count": variant_count,
+                    "action_budget": action_budget,
+                    "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir else None,
+                    "resume_from_checkpoint": resume_from_checkpoint,
+                },
+            )
+        except Exception:
+            pass
+        reference = reference_spec or _load_reference_spec(reference_path)
+
+        # 1) 用现有 run_results 做一次“基线问题检测”（保持 report.issues 行为一致）
+        samples = self._normalize_runs(run_results)
+        detector = PromptDeltaDetector(reference)
+        issues: List[DetectedIssue] = detector.detect(samples)
+
+        # 2) 选一个 representative run 提取上下文（占位符/输入等），用于 PromptState
+        representative = run_results[0] if run_results else {}
+        try:
+            placeholders_text = _extract_workflow_input(representative)
+        except Exception:
+            placeholders_text = ""
+
+        # 3) 遍历 DSL 里的 prompt blocks → 每条 message 单独做 PromptState 优化 → 产出 patch
+        patches: List[PromptPatch] = []
+        actions_acc: List[PromptAction] = []
+        seen_actions: set[tuple[str, str, str]] = set()
+
+        blocks = list(_iter_prompt_blocks(workflow_tree or {}))
+        try:
+            logger.debug(
+                "PromptState blocks ready",
+                extra={"workflow_id": workflow_id, "blocks": len(blocks)},
+            )
+        except Exception:
+            pass
+
+        # checkpoint/run_dir：每个 workflow 单独目录，避免互相覆盖
+        root_dir = Path(checkpoint_dir).expanduser() if checkpoint_dir else None
+        if root_dir:
+            root_dir.mkdir(parents=True, exist_ok=True)
+
+        for block in blocks:
+            for msg in (block.messages or []):
+                if not isinstance(msg, dict):
+                    continue
+                old_text = str(msg.get("text") or "")
+                field_path = str(msg.get("path") or "")
+                if not old_text.strip() or not field_path:
+                    continue
+
+                # PromptState 构建：force 模式（尽量结构化）
+                try:
+                    state = _build_prompt_state(
+                        old_text,
+                        constraints=reference.constraints,
+                        placeholders_text=placeholders_text,
+                        mode="force",
+                    )
+                except Exception:
+                    # 兜底：构建失败就跳过该条 message
+                    continue
+                try:
+                    logger.debug(
+                        "PromptState optimize message",
+                        extra={
+                            "workflow_id": workflow_id,
+                            "node_id": block.node_id,
+                            "field_path": field_path,
+                        },
+                    )
+                except Exception:
+                    pass
+
+                # 为每条 message 生成独立 run_dir（便于看 timeline.csv/summary.md）
+                per_run_dir = None
+                if root_dir:
+                    safe_node = _safe_dirname_from_id(block.node_id)
+                    per_run_dir = root_dir / safe_node / f"msg_{int(msg.get('index', 0))}"
+                    per_run_dir.mkdir(parents=True, exist_ok=True)
+
+                def _call_run_once(prompt_text: str):
+                    try:
+                        return run_once_fn(prompt_text, block, msg)
+                    except TypeError:
+                        try:
+                            return run_once_fn(prompt_text, block)
+                        except TypeError:
+                            return run_once_fn(prompt_text)
+
+                # 运行 optimize_prompt 得到最终 state
+                try:
+                    optimized_state = optimize_prompt(
+                        state,
+                        run_once_fn=_call_run_once,
+                        reference=reference,
+                        llm_config=self.llm_config,
+                        reference_texts=reference_texts,
+                        max_steps=max_steps,
+                        action_budget=action_budget,
+                        concurrency_manager=concurrency_manager,
+                        max_concurrency=max_concurrency,
+                        variant_count=variant_count,
+                        beam_width=beam_width,
+                        checkpoint_dir=per_run_dir,
+                        resume_from_checkpoint=resume_from_checkpoint,
+                        run_dir=per_run_dir,
+                    )
+                except Exception:
+                    # 单条失败不影响全局
+                    continue
+
+                new_text = _render_prompt_state(optimized_state).strip()
+                if not new_text or new_text.strip() == old_text.strip():
+                    continue
+
+                patches.append(
+                    PromptPatch(
+                        workflow_id=workflow_id,
+                        node_id=block.node_id,
+                        field_path=field_path,
+                        old=old_text,
+                        new=new_text,
+                        rationale="PromptState optimizer (optimize_prompt) updated this message",
+                        confidence=0.70,
+                        evidence_runs=[i for i in range(len(run_results))],
+                    )
+                )
+                try:
+                    logger.info(
+                        "PromptState patch generated",
+                        extra={
+                            "workflow_id": workflow_id,
+                            "node_id": block.node_id,
+                            "field_path": field_path,
+                        },
+                    )
+                except Exception:
+                    pass
+
+                # 额外：把最终 prompt 的 actions 也塞进 report.actions（便于验证接入已生效）
+                try:
+                    out = _call_run_once(new_text)
+                    post_issues, post_actions = _analyze_single_output(
+                        out,
+                        reference,
+                        llm_config=self.llm_config,
+                        reference_texts=reference_texts,
+                    )
+                    for a in post_actions:
+                        key = (a.type, a.target or "", a.content or "")
+                        if key in seen_actions:
+                            continue
+                        seen_actions.add(key)
+                        actions_acc.append(a)
+                except Exception:
+                    pass
+
+        # 4) 产出 report，并按原逻辑可选写 patched yaml
+        patched_path = None
+        if apply_patches and patches:
+            patched_path = self._apply_patches(
+                workflow_id=workflow_id,
+                workflow_tree=workflow_tree,
+                workflow_path=workflow_path,
+                patches=patches,
+                output_root=output_root,
+            )
+
+        stats = {
+            "prompt_state_enabled": True,
+            "prompt_state_blocks": len(blocks),
+            "prompt_state_patches": len(patches),
+            "prompt_state_checkpoint_dir": str(root_dir) if root_dir else None,
+        }
+
+        report = OptimizationReport(
+            workflow_id=workflow_id,
+            issues=issues,
+            patches=patches,
+            actions=actions_acc,
+            yaml_path=Path(workflow_path),
+            reference_path=Path(reference_path).expanduser() if reference_path else None,
+            patched_path=patched_path,
+            stats=stats,
+        )
+
+        try:
+            self._maybe_write_report(report, output_root=output_root)
+        except Exception:
+            pass
+
         return report
 
     def _normalize_runs(self, run_results: Sequence[Dict[str, Any]]) -> List[ExecutionSample]:
@@ -1423,6 +1690,16 @@ def _build_block_context(block: PromptBlock, fail_signal: FailSignal, constraint
         parts.append("Placeholders (must remain exactly):")
         parts.extend(f"- {ph}" for ph in block.brief.placeholders)
     return "\n".join(part for part in parts if part is not None)
+
+
+def _choose_primary_message(block: PromptBlock) -> Optional[Dict[str, Any]]:
+    """Select a stable primary message to receive PromptState updates."""
+    if not block.messages:
+        return None
+    for msg in block.messages:
+        if (msg.get("role") or "").lower() == "system":
+            return msg
+    return block.messages[0]
 
 
 def _validate_block_rewrite(block: PromptBlock, new_text: str) -> bool:
@@ -2419,6 +2696,21 @@ def optimize_prompt(
     stage_plateau = 0
     beam_width = max(1, int(beam_width))
     beam: List[Tuple[float, PromptState]] = [(0.0, state)]
+    try:
+        logger.info(
+            "PromptState optimize_prompt start",
+            extra={
+                "max_steps": max_steps,
+                "beam_width": beam_width,
+                "variant_count": variant_count,
+                "action_budget": action_budget_value,
+                "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir else None,
+                "resume_from_checkpoint": resume_from_checkpoint,
+                "max_concurrency": max_concurrency,
+            },
+        )
+    except Exception:
+        pass
     run_root = Path(checkpoint_dir) if checkpoint_dir else None
     timeline_path = None
     if run_root:
@@ -2532,6 +2824,21 @@ def optimize_prompt(
             results_with_scores.append((score, cand, prompt_text, issues, limited_actions))
         results_with_scores.sort(key=lambda item: item[0], reverse=True)
         score, candidate, prompt, issues, limited_actions = results_with_scores[0]
+        try:
+            logger.debug(
+                "PromptState step summary",
+                extra={
+                    "step": step,
+                    "stage": stage.name,
+                    "score": score,
+                    "issues": len(issues),
+                    "actions": len(limited_actions),
+                    "prompt_length": len(prompt),
+                    "no_improve_rounds": no_improve_rounds,
+                },
+            )
+        except Exception:
+            pass
         has_format_issue = any(_issue_is_format_related(issue) for issue in issues)
         if stage == OptimizationStage.FORMAT:
             if not has_format_issue:
@@ -3029,6 +3336,8 @@ class _DspyPromptOptimizer:
                     "workflow_llm_model": model,
                     "iterations": self.max_iterations,
                     "max_samples": self.max_samples,
+                    "action_judge": bool(cfg.get("dspy_action_judge", False)),
+                    "prompt_state_mode": _normalize_prompt_state_mode(cfg.get("dspy_prompt_state_mode", "off")),
                 },
             )
         except Exception:
@@ -3043,6 +3352,17 @@ class _DspyPromptOptimizer:
         constraints: Sequence[str],
     ) -> List[PromptPatch]:
         if not self.available or not prompts:
+            try:
+                logger.debug(
+                    "DSPy optimize_prompts skipped",
+                    extra={
+                        "workflow_id": workflow_id,
+                        "available": self.available,
+                        "prompts": len(prompts) if prompts else 0,
+                    },
+                )
+            except Exception:
+                pass
             return []
         optimizer_cm = _get_optimizer_concurrency_manager()
 
@@ -3055,11 +3375,15 @@ class _DspyPromptOptimizer:
             logger.info(
                 "DSPy optimizer concurrency",
                 extra={
+                    "workflow_id": workflow_id,
                     "mode": "prompts",
                     "total": len(prompts),
+                    "dataset_size": len(dataset),
                     "max_workers": max_workers,
                     "optimizer_limit": getattr(optimizer_cm, "limit", None) if optimizer_cm else None,
                     "fallback_used": optimizer_cm is None,
+                    "action_judge": bool(self.cfg.get("dspy_action_judge", False)),
+                    "prompt_state_mode": _normalize_prompt_state_mode(self.cfg.get("dspy_prompt_state_mode", "off")),
                 },
             )
         except Exception:
@@ -3138,6 +3462,17 @@ class _DspyPromptOptimizer:
             fail_signal: Optional[FailSignal] = None,
     ) -> List[PromptPatch]:
         if not self.available or not blocks:
+            try:
+                logger.debug(
+                    "DSPy optimize_blocks skipped",
+                    extra={
+                        "workflow_id": workflow_id,
+                        "available": self.available,
+                        "blocks": len(blocks) if blocks else 0,
+                    },
+                )
+            except Exception:
+                pass
             return []
         optimizer_cm = _get_optimizer_concurrency_manager()
         dataset = self._build_dataset(samples, reference_texts)
@@ -3150,11 +3485,15 @@ class _DspyPromptOptimizer:
             logger.info(
                 "DSPy optimizer concurrency",
                 extra={
+                    "workflow_id": workflow_id,
                     "mode": "blocks",
                     "total": len(blocks),
+                    "dataset_size": len(dataset),
                     "max_workers": max_workers,
                     "optimizer_limit": getattr(optimizer_cm, "limit", None) if optimizer_cm else None,
                     "fallback_used": optimizer_cm is None,
+                    "action_judge": bool(self.cfg.get("dspy_action_judge", False)),
+                    "prompt_state_mode": _normalize_prompt_state_mode(self.cfg.get("dspy_prompt_state_mode", "off")),
                 },
             )
         except Exception:

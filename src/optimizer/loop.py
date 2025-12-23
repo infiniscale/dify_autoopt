@@ -6,6 +6,7 @@ Stops on: no patches, target failure rate met, or max cycles reached.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -14,13 +15,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import yaml
 
 from src.config.bootstrap import get_runtime
-from src.optimizer.prompt_optimizer import PromptOptimizer, _status_from_run
+from src.optimizer.prompt_optimizer import PromptOptimizer, _set_by_pointer, _status_from_run, prompt_hash
 from src.optimizer.yaml_loader import load_workflow_yaml
 from src.utils.logger import get_logger
-from src.workflow.apps import _resolve_base_url, _resolve_token, _login_token, list_all_apps
 from src.workflow.api_keys import list_api_keys
-from src.workflow.export import _safe_dirname_from_id, export_app_dsl
+from src.workflow.apps import _resolve_base_url, _resolve_token, _login_token, list_all_apps
 from src.workflow.execute import _normalize_inputs, execute_workflow_v1
+from src.workflow.export import _safe_dirname_from_id, export_app_dsl
 from src.workflow.imports import import_app_yaml
 from src.workflow.publish import publish_workflow
 
@@ -324,14 +325,127 @@ def run_optimize_loop(
 
             optimizer = PromptOptimizer(default_output_root=output_dir, llm_config=llm_cfg)
             try:
-                report = optimizer.optimize_from_runs(
-                    workflow_id=current_app_id,
-                    run_results=run_results,
-                    workflow_yaml=(yaml_tree, Path(current_yaml_path)),
-                    reference_path=ref_path,
-                    reference_texts=reference_texts,
-                    output_root=output_dir,
-                )
+                opt_strategy = str(opt_cfg.get("strategy") or "").lower()
+                if opt_strategy == "prompt_state" and console_token:
+                    try:
+                        logger.info(
+                            "PromptState optimizer enabled (online)",
+                            extra={"workflow_id": current_app_id, "cycle": cycle},
+                        )
+                    except Exception:
+                        pass
+
+                    prompt_eval_cache: Dict[str, Tuple[str, str]] = {}
+                    fallback_run = run_results[0] if run_results else {}
+                    max_steps = opt_cfg.get("max_iterations")
+                    max_steps = int(max_steps) if isinstance(max_steps, int) and max_steps > 0 else 3
+                    beam_width = opt_cfg.get("beam_width")
+                    beam_width = int(beam_width) if isinstance(beam_width, int) and beam_width > 0 else 1
+                    variant_count = opt_cfg.get("variant_count")
+                    variant_count = int(variant_count) if isinstance(variant_count, int) and variant_count > 0 else 1
+                    action_budget = opt_cfg.get("action_budget")
+                    max_concurrency = opt_cfg.get("concurrency")
+                    max_concurrency = int(max_concurrency) if isinstance(max_concurrency,
+                                                                         int) and max_concurrency > 0 else None
+                    checkpoint_dir = Path(output_dir) / _safe_dirname_from_id(current_app_id) / f"prompt_state_c{cycle}"
+                    optimizer_cm = rt.optimizer_concurrency if rt else None
+
+                    def _online_run_once(prompt_text: str, block=None, message=None):
+                        if not message or not message.get("path"):
+                            return fallback_run
+                        key = prompt_hash(prompt_text)
+                        if key in prompt_eval_cache:
+                            app_id, api_key = prompt_eval_cache[key]
+                        else:
+                            try:
+                                temp_tree = copy.deepcopy(yaml_tree)
+                                _set_by_pointer(temp_tree, message["path"], prompt_text)
+                                yaml_content = yaml.safe_dump(temp_tree, allow_unicode=True, sort_keys=False)
+                                import_resp = import_app_yaml(
+                                    yaml_content=yaml_content, base_url=base_url, token=console_token
+                                )
+                                app_id = _extract_app_id_from_import(import_resp, current_app_id)
+                                publish_workflow(app_id, base_url=base_url, token=console_token)
+                                new_keys = list_api_keys(
+                                    base_url,
+                                    app_id,
+                                    console_token,
+                                    create_when_missing=True,
+                                    create_name=f"autoopt-eval-{cycle}",
+                                )
+                                api_key = _choose_api_key(new_keys, current_api_key)
+                                prompt_eval_cache[key] = (app_id, api_key)
+                            except Exception as exc:  # noqa: BLE001
+                                try:
+                                    logger.warning(
+                                        "PromptState 在线评估导入失败，回退到现有结果",
+                                        extra={"workflow_id": current_app_id, "error": str(exc)},
+                                    )
+                                except Exception:
+                                    pass
+                                return fallback_run
+                        eval_rows = rows[:1] if rows else []
+                        if not eval_rows:
+                            return fallback_run
+                        try:
+                            results = execute_workflow_v1(
+                                app_id,
+                                eval_rows,
+                                base_url=api_base,
+                                api_key=api_key,
+                                timeout=exec_timeout,
+                                retry_count=exec_retry,
+                                input_types=declared_types,
+                                output_dir=None,
+                                persist_results=False,
+                                concurrency=1,
+                                persist_metadata=exec_meta,
+                            )
+                            return results[0] if results else fallback_run
+                        except Exception as exc:  # noqa: BLE001
+                            try:
+                                logger.warning(
+                                    "PromptState 在线评估执行失败，回退到现有结果",
+                                    extra={"workflow_id": current_app_id, "error": str(exc)},
+                                )
+                            except Exception:
+                                pass
+                            return fallback_run
+
+                    report = optimizer.optimize_with_prompt_state(
+                        workflow_id=current_app_id,
+                        run_results=run_results,
+                        workflow_yaml=(yaml_tree, Path(current_yaml_path)),
+                        reference_path=ref_path,
+                        reference_texts=reference_texts,
+                        output_root=output_dir,
+                        run_once_fn=_online_run_once,
+                        max_steps=max_steps,
+                        beam_width=beam_width,
+                        variant_count=variant_count,
+                        action_budget=action_budget,
+                        concurrency_manager=optimizer_cm,
+                        max_concurrency=max_concurrency,
+                        checkpoint_dir=checkpoint_dir,
+                        resume_from_checkpoint=bool(opt_cfg.get("resume_prompt_state")),
+                    )
+                else:
+                    if opt_strategy == "prompt_state" and not console_token:
+                        try:
+                            logger.warning(
+                                "PromptState 在线评估缺少 console token，回退到旧优化路径",
+                                extra={"workflow_id": current_app_id, "cycle": cycle},
+                            )
+                        except Exception:
+                            pass
+                    report = optimizer.optimize_from_runs(
+                        workflow_id=current_app_id,
+                        run_results=run_results,
+                        workflow_yaml=(yaml_tree, Path(current_yaml_path)),
+                        reference_path=ref_path,
+                        reference_texts=reference_texts,
+                        output_root=output_dir,
+                    )
             except Exception as ex:  # noqa: BLE001
                 logger.warning(
                     "生成优化报告失败，终止自循环",
