@@ -902,6 +902,7 @@ class PromptOptimizer:
             max_concurrency: Optional[int] = None,
             checkpoint_dir: Optional[str | Path] = None,
             resume_from_checkpoint: bool = False,
+            workflow_context: Optional[str] = None,
     ) -> OptimizationReport:
         """
         Bridge entry: use optimize_prompt(PromptState + Action loop) to generate PromptPatch/OptimizationReport
@@ -1028,6 +1029,7 @@ class PromptOptimizer:
                         checkpoint_dir=per_run_dir,
                         resume_from_checkpoint=resume_from_checkpoint,
                         run_dir=per_run_dir,
+                        workflow_context=workflow_context,
                     )
                 except Exception:
                     # 单条失败不影响全局
@@ -2698,6 +2700,7 @@ def optimize_prompt(
         reference_hash: str = "",
         cache_path: Optional[str | Path] = None,
         retries: int = 3,
+        workflow_context: Optional[str] = None,
 ) -> PromptState:
     state = initial_state
     if run_dir and not checkpoint_dir:
@@ -2706,6 +2709,26 @@ def optimize_prompt(
         resumed = _load_latest_checkpoint(checkpoint_dir)
         if resumed:
             state = resumed
+    # Inject workflow_context as global constraint (consistent with optimize_from_runs)
+    if workflow_context:
+        constraint_lines = ["[WORKFLOW CONSTRAINT]"]
+        constraint_lines.append(workflow_context)
+        constraint_lines.append("The optimized prompt MUST align with the above workflow purpose.")
+        constraint_lines.append("[END WORKFLOW CONSTRAINT]")
+        workflow_constraint = "\n".join(constraint_lines)
+        # Remove any existing WORKFLOW CONSTRAINT before adding new one (handles checkpoint resume with changed context)
+        state.global_constraints = [
+            c for c in state.global_constraints
+            if not c.strip().startswith("[WORKFLOW CONSTRAINT]")
+        ]
+        state.global_constraints.insert(0, workflow_constraint)
+        logger.info(
+            "PromptState workflow_context injected as global constraint",
+            extra={
+                "workflow_context": workflow_context,
+                "constraint_preview": workflow_constraint[:200],
+            },
+        )
     cm = concurrency_manager
     if not cm and max_concurrency:
         cm = ConcurrencyManager(max_concurrency)
@@ -3867,7 +3890,7 @@ class _DspyPromptOptimizer:
                             f"[OPTIMIZATION CONSTRAINT]\n"
                             f"{workflow_context}"
                             f"The optimized prompt MUST align with the above workflow purpose.\n"
-                            f"[END CONSTRAINT]\n\n"
+                            f"[END OPTIMIZATION CONSTRAINT]\n\n"
                             f"[ORIGINAL PROMPT TO OPTIMIZE]\n"
                         )
                         prompt_with_context = constraint_prefix + masked_prompt
@@ -4045,7 +4068,7 @@ class _DspyPromptOptimizer:
                 constraint_lines.append(f"Workflow Name: {workflow_name}")
             if workflow_description:
                 constraint_lines.append(f"Workflow Description: {workflow_description}")
-            constraint_lines.append("You MUST optimize prompts to align with the above workflow purpose.")
+            constraint_lines.append("The optimized prompt MUST align with the above workflow purpose.")
             constraint_lines.append("[END WORKFLOW CONSTRAINT]")
             constraint_lines.append("")
             constraint_lines.append("Rewrite the prompt using judge feedback and constraints.")
