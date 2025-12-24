@@ -12,7 +12,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Dict, Sequence, Any
 
 import requests
 
@@ -648,6 +648,19 @@ async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True
         try:
             opt_strategy = str(ref_cfg.get("strategy") or "").lower()
             use_prompt_state = bool(run_workflows and opt_strategy == "prompt_state")
+
+            # Build workflow context for injection (used by both optimize paths)
+            wf_name = getattr(wf, "name", None)
+            wf_desc = getattr(wf, "description", None)
+            workflow_context = None
+            if wf_name or wf_desc:
+                context_parts = []
+                if wf_name:
+                    context_parts.append(f"Workflow Name: {wf_name}")
+                if wf_desc:
+                    context_parts.append(f"Workflow Description: {wf_desc}")
+                workflow_context = "\n".join(context_parts)
+
             if use_prompt_state:
                 try:
                     logger.info("PromptState optimizer enabled (offline)", extra={"workflow_id": wid})
@@ -746,20 +759,9 @@ async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True
                     max_concurrency=max_concurrency,
                     checkpoint_dir=checkpoint_dir,
                     resume_from_checkpoint=bool(ref_cfg.get("resume_prompt_state")),
+                    workflow_context=workflow_context,
                 )
             else:
-                # Build workflow context for injection
-                wf_name = getattr(wf, "name", None)
-                wf_desc = getattr(wf, "description", None)
-                workflow_context = None
-                if wf_name or wf_desc:
-                    context_parts = []
-                    if wf_name:
-                        context_parts.append(f"Workflow Name: {wf_name}")
-                    if wf_desc:
-                        context_parts.append(f"Workflow Description: {wf_desc}")
-                    workflow_context = "\n".join(context_parts)
-
                 report = optimizer.optimize_from_runs(
                     workflow_id=wid,
                     run_results=run_results,

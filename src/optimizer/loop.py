@@ -440,6 +440,7 @@ def run_optimize_loop(
                         max_concurrency=max_concurrency,
                         checkpoint_dir=checkpoint_dir,
                         resume_from_checkpoint=bool(opt_cfg.get("resume_prompt_state")),
+                        workflow_context=workflow_context,
                     )
                 else:
                     if opt_strategy == "prompt_state" and not console_token:
