@@ -37,7 +37,7 @@ def mock_dspy(monkeypatch):
             self.cfg = cfg
             self.available = True
 
-        def fake_optimize_prompts(self, workflow_id, prompts, samples, reference_texts, constraints):
+        def fake_optimize_prompts(self, workflow_id, prompts, samples, reference_texts, constraints, workflow_context=None):
             patches = []
             for prompt in prompts:
                 new_text = f"{prompt.text}\n\n- {suffix}"
@@ -63,6 +63,7 @@ def mock_dspy(monkeypatch):
                 reference_texts,
                 constraints,
                 fail_signal=None,
+                workflow_context=None,
         ):
             patches = []
             for block in blocks:

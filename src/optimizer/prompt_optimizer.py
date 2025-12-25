@@ -741,6 +741,7 @@ class PromptOptimizer:
             self.llm_config,
             constraints=reference.constraints,
             expected_outputs=reference.expected_outputs,
+            workflow_context=workflow_context,
         )
         if llm_output_issues:
             issues.extend(llm_output_issues)
@@ -785,7 +786,9 @@ class PromptOptimizer:
                 except Exception:
                     pass
                 continue
-            needs = True if not judge else judge.needs_change(prompt_text, issues, reference.constraints)
+            needs = True if not judge else judge.needs_change(
+                prompt_text, issues, reference.constraints, workflow_context=workflow_context
+            )
             if needs:
                 filtered_blocks.append(block)
         judged_no_change = total_prompts - len(filtered_blocks)
@@ -1090,6 +1093,7 @@ class PromptOptimizer:
                         reference,
                         llm_config=self.llm_config,
                         reference_texts=reference_texts,
+                        workflow_context=workflow_context,
                     )
                     for a in post_actions:
                         key = (a.type, a.target or "", a.content or "")
@@ -1282,6 +1286,7 @@ def _llm_output_judge(
     *,
     constraints: Sequence[str] | None = None,
     expected_outputs: Sequence[str] | None = None,
+    workflow_context: Optional[str] = None,
 ) -> Tuple[List[DetectedIssue], Dict[str, Any]]:
     """
     Use an external LLM to compare each output with its paired reference text.
@@ -1394,6 +1399,12 @@ def _llm_output_judge(
                     prompt_lines.append("Constraints (must be satisfied):")
                     for c in constraints:
                         prompt_lines.append(f"- {c}")
+                if workflow_context:
+                    prompt_lines.append("")
+                    prompt_lines.append("[WORKFLOW CONTEXT]")
+                    prompt_lines.append(workflow_context)
+                    prompt_lines.append("The output MUST align with the above workflow purpose.")
+                    prompt_lines.append("[END WORKFLOW CONTEXT]")
                 if expected_outputs:
                     prompt_lines.append("Expected baseline example:")
                     prompt_lines.append(str(expected_outputs[0]))
@@ -1422,6 +1433,7 @@ def _llm_output_judge(
                             "url": url,
                             "timeout": timeout,
                             "has_api_key": bool(api_key),
+                            "has_workflow_context": bool(workflow_context),
                         },
                     )
                 except Exception:
@@ -2641,6 +2653,7 @@ def _analyze_single_output(
         reference: ReferenceSpec,
         llm_config: Optional[Dict[str, Any]] = None,
         reference_texts: Optional[Sequence[Optional[str]]] = None,
+        workflow_context: Optional[str] = None,
 ) -> Tuple[List[DetectedIssue], List[PromptAction]]:
     sample = _output_to_sample(output)
     detector = PromptDeltaDetector(reference)
@@ -2654,6 +2667,7 @@ def _analyze_single_output(
         llm_config,
         constraints=reference.constraints,
         expected_outputs=reference.expected_outputs,
+        workflow_context=workflow_context,
     )
     if llm_issues:
         issues.extend(llm_issues)
@@ -2920,6 +2934,7 @@ def optimize_prompt(
             reference,
             llm_config=llm_config,
             reference_texts=reference_texts,
+            workflow_context=workflow_context,
         )
         score = score_report(issues=issues, actions=actions)
         return candidate, prompt_text, issues, actions, score
@@ -3326,7 +3341,13 @@ class _LlmPromptJudge:
         self.model = cfg.get("model")
         self.api_key = cfg.get("api_key")
 
-    def needs_change(self, prompt_text: str, issues: Sequence[DetectedIssue], constraints: Sequence[str]) -> bool:
+    def needs_change(
+        self,
+        prompt_text: str,
+        issues: Sequence[DetectedIssue],
+        constraints: Sequence[str],
+        workflow_context: Optional[str] = None,
+    ) -> bool:
         if not self.url or not self.model:
             # default: if we have detected issues, assume change is needed
             return bool(issues)
@@ -3335,8 +3356,15 @@ class _LlmPromptJudge:
         guidance = [
             "You are a prompt reviewer. Answer with 'yes' or 'no' only.",
             "Determine if this prompt likely needs improvement based on the following issues and constraints.",
-            "Issues:",
         ]
+        if workflow_context:
+            guidance.append("")
+            guidance.append("[WORKFLOW CONTEXT]")
+            guidance.append(workflow_context)
+            guidance.append("The prompt should align with the above workflow purpose.")
+            guidance.append("[END WORKFLOW CONTEXT]")
+            guidance.append("")
+        guidance.append("Issues:")
         if issues:
             for it in issues:
                 guidance.append(f"- {it.kind}: {it.message}")
@@ -3515,6 +3543,7 @@ class _DspyPromptOptimizer:
         samples: Sequence[ExecutionSample],
         reference_texts: Sequence[Optional[str]],
         constraints: Sequence[str],
+        workflow_context: Optional[str] = None,
     ) -> List[PromptPatch]:
         if not self.available or not prompts:
             try:
@@ -3530,6 +3559,9 @@ class _DspyPromptOptimizer:
                 pass
             return []
         optimizer_cm = _get_optimizer_concurrency_manager()
+
+        # Parse workflow context for injection
+        workflow_name, workflow_description = _parse_workflow_context(workflow_context)
 
         dataset = self._build_dataset(samples, reference_texts)
         if not dataset:
@@ -3549,6 +3581,8 @@ class _DspyPromptOptimizer:
                     "fallback_used": optimizer_cm is None,
                     "action_judge": True,
                     "prompt_state_mode": _normalize_prompt_state_mode(self.cfg.get("dspy_prompt_state_mode", "off")),
+                    "workflow_name": workflow_name,
+                    "workflow_description": workflow_description[:50] if workflow_description else None,
                 },
             )
         except Exception:
@@ -3557,9 +3591,9 @@ class _DspyPromptOptimizer:
         def _optimize_prompt(prompt: PromptLocation) -> Optional[PromptPatch]:
             # Avoid sharing ChainOfThought across threads
             predictor = self._dspy.ChainOfThought(self._predict_signature())  # type: ignore[attr-defined]
-            judge = self._dspy.ChainOfThought(self._judge_signature())  # type: ignore[attr-defined]
-            rewriter = self._dspy.ChainOfThought(self._rewrite_signature())  # type: ignore[attr-defined]
-            action_judge = self._dspy.ChainOfThought(self._action_judge_signature())  # type: ignore[attr-defined]
+            judge = self._dspy.ChainOfThought(self._judge_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
+            rewriter = self._dspy.ChainOfThought(self._rewrite_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
+            action_judge = self._dspy.ChainOfThought(self._action_judge_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
 
             improved = self._optimize_single(
                 prompt.text,
@@ -3678,9 +3712,9 @@ class _DspyPromptOptimizer:
 
         def _optimize_block(block: PromptBlock) -> List[PromptPatch]:
             predictor = self._dspy.ChainOfThought(self._predict_signature())  # type: ignore[attr-defined]
-            judge = self._dspy.ChainOfThought(self._judge_signature())  # type: ignore[attr-defined]
+            judge = self._dspy.ChainOfThought(self._judge_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
             rewriter = self._dspy.ChainOfThought(self._rewrite_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
-            action_judge = self._dspy.ChainOfThought(self._action_judge_signature())  # type: ignore[attr-defined]
+            action_judge = self._dspy.ChainOfThought(self._action_judge_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
 
             context_text = _build_block_context(block, effective_signal, constraints)
             placeholders_text = (
@@ -5042,25 +5076,52 @@ class _DspyPromptOptimizer:
 
         return WorkflowPredictor
 
-    def _judge_signature(self):
+    def _judge_signature(self, workflow_name: Optional[str] = None, workflow_description: Optional[str] = None):
         dspy = self._dspy
 
-        class JudgeSignature(dspy.Signature):  # type: ignore[attr-defined]
-            """Compare candidate output with reference JSON."""
+        # Build dynamic docstring with workflow context
+        if workflow_name or workflow_description:
+            doc_lines = ["Compare candidate output with reference JSON."]
+            doc_lines.append("")
+            doc_lines.append("[WORKFLOW CONTEXT]")
+            if workflow_name:
+                doc_lines.append(f"Workflow Name: {workflow_name}")
+            if workflow_description:
+                doc_lines.append(f"Workflow Description: {workflow_description}")
+            doc_lines.append("Consider the workflow purpose when judging output correctness.")
+            doc_lines.append("[END WORKFLOW CONTEXT]")
+            docstring = "\n".join(doc_lines)
+        else:
+            docstring = "Compare candidate output with reference JSON."
 
+        class JudgeSignature(dspy.Signature):  # type: ignore[attr-defined]
             reference = dspy.InputField(desc="Reference JSON text")  # type: ignore[attr-defined]
             candidate = dspy.InputField(desc="Candidate JSON output")  # type: ignore[attr-defined]
             verdict = dspy.OutputField(desc="Judge verdict pass/fail")  # type: ignore[attr-defined]
             feedback = dspy.OutputField(desc="Feedback for failures")  # type: ignore[attr-defined]
 
+        JudgeSignature.__doc__ = docstring
         return JudgeSignature
 
-    def _action_judge_signature(self):
+    def _action_judge_signature(self, workflow_name: Optional[str] = None, workflow_description: Optional[str] = None):
         dspy = self._dspy
 
-        class ActionJudgeSignature(dspy.Signature):  # type: ignore[attr-defined]
-            """Return actionable prompt update instructions."""
+        # Build dynamic docstring with workflow context
+        if workflow_name or workflow_description:
+            doc_lines = ["Return actionable prompt update instructions."]
+            doc_lines.append("")
+            doc_lines.append("[WORKFLOW CONTEXT]")
+            if workflow_name:
+                doc_lines.append(f"Workflow Name: {workflow_name}")
+            if workflow_description:
+                doc_lines.append(f"Workflow Description: {workflow_description}")
+            doc_lines.append("Consider the workflow purpose when generating prompt update actions.")
+            doc_lines.append("[END WORKFLOW CONTEXT]")
+            docstring = "\n".join(doc_lines)
+        else:
+            docstring = "Return actionable prompt update instructions."
 
+        class ActionJudgeSignature(dspy.Signature):  # type: ignore[attr-defined]
             reference = dspy.InputField(desc="Reference JSON text")  # type: ignore[attr-defined]
             candidate = dspy.InputField(desc="Candidate JSON output")  # type: ignore[attr-defined]
             prompt_state = dspy.InputField(desc="Current prompt state as JSON")  # type: ignore[attr-defined]
@@ -5069,6 +5130,7 @@ class _DspyPromptOptimizer:
                 desc="JSON array of actions to update prompt state",
             )
 
+        ActionJudgeSignature.__doc__ = docstring
         return ActionJudgeSignature
 
     def _rewrite_chain(
