@@ -9,19 +9,27 @@ fed to a more advanced optimizer (e.g., dspy) when available.
 
 from __future__ import annotations
 
-import difflib
-import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from contextlib import nullcontext
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-import re
+import ast
 import copy
+import difflib
+import hashlib
+import json
 import json as _json
+import pickle
+import random
+import re
+import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext, contextmanager
+from copy import deepcopy
+from dataclasses import dataclass, field, asdict, fields
+from enum import Enum, auto
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Literal, Optional, Sequence, Set, Tuple
 
 import yaml
-
 
 from src.optimizer.yaml_loader import load_workflow_yaml
 from src.utils.logger import get_logger
@@ -29,10 +37,16 @@ from src.workflow.export import _safe_dirname_from_id
 
 logger = get_logger("optimizer.prompt_optimizer")
 DEFAULT_DSPY_MAX_TOKENS = 4096
+DEFAULT_ACTION_BUDGET = 5
+DEFAULT_MAX_CONSTRAINTS = 20
+DEFAULT_SCHEMA_TIGHTEN_LIMIT = 2
+DEFAULT_MAX_PROMPT_GROWTH = 1.5
+DEFAULT_NO_IMPROVE_ROUNDS = 3
 _PLACEHOLDER_PATTERNS = [
     re.compile(r"\{\{\s*[^{}]+\s*\}\}"),  # {{ var }} or {{a.b}}
     re.compile(r"\$\{\s*[^${}]+\s*\}"),  # ${var}
 ]
+RESPONSE_CONTRACT_PLACEHOLDER = "{{RESPONSE_CONTRACT}}"
 REF_SOFT_SIMILARITY_THRESHOLD = 0.55
 
 
@@ -122,6 +136,40 @@ class PromptBlock:
 
 
 @dataclass
+class PromptState:
+    """Structured prompt state for slot-level optimization."""
+
+    base_prompt: str = ""
+    role: str = ""
+    task: str = ""
+    schema: str = ""
+    checkpoint_rules: Dict[str, str] = field(default_factory=dict)
+    strictness_level: int = 3
+    negative_examples: List[Dict[str, Any]] = field(default_factory=list)
+    global_constraints: List[str] = field(default_factory=list)
+    placeholders: List[str] = field(default_factory=list)
+    version: int = 1
+    structured: bool = False
+    schema_tighten_count: int = 0
+    schema_frozen: bool = False
+    protected_slots: List[str] = field(default_factory=list)
+    response_contract: Optional["ResponseContract"] = None
+
+
+@dataclass
+class ResponseContract:
+    format_type: Literal["json", "xml", "text"] = "json"
+    schema: str = ""
+    strict: bool = True
+
+
+class OptimizationStage(Enum):
+    FORMAT = auto()
+    RECALL = auto()
+    STRICT = auto()
+
+
+@dataclass
 class PromptPatch:
     """Patch suggestion for a prompt field."""
 
@@ -136,12 +184,30 @@ class PromptPatch:
 
 
 @dataclass
+class PromptAction:
+    """Actionable prompt update instruction."""
+
+    type: str
+    target: Optional[str] = None
+    content: Optional[str] = None
+    evidence_runs: List[int] = field(default_factory=list)
+
+
+@dataclass
+class TextBlock:
+    block_id: str
+    kind: Literal["instruction", "constraint", "example", "output", "other"]
+    text: str
+
+
+@dataclass
 class OptimizationReport:
     workflow_id: str
     issues: List[DetectedIssue]
     patches: List[PromptPatch]
     yaml_path: Path
     reference_path: Optional[Path]
+    actions: List[PromptAction] = field(default_factory=list)
     patched_path: Optional[Path] = None
     stats: Dict[str, Any] = field(default_factory=dict)
 
@@ -625,6 +691,7 @@ class PromptOptimizer:
         workflow_yaml: Optional[Tuple[Dict[str, Any], Path]] = None,
         output_root: Optional[str | Path] = None,
         apply_patches: bool = True,
+        workflow_context: Optional[str] = None,
     ) -> OptimizationReport:
         """Generate prompt patches from execution results and references."""
         reference = reference_spec or _load_reference_spec(reference_path)
@@ -637,6 +704,21 @@ class PromptOptimizer:
                     "runs": len(samples),
                     "has_reference_texts": bool(reference_texts),
                     "llm_configured": bool(self.llm_config),
+                },
+            )
+        except Exception:
+            pass
+        try:
+            logger.debug(
+                "优化器入口参数",
+                extra={
+                    "workflow_id": workflow_id,
+                    "use_dspy_optimizer": bool(self.llm_config.get("use_dspy_optimizer", True)),
+                    "enable_prompt_rewrite": bool(self.llm_config.get("enable_prompt_rewrite", True)),
+                    "dspy_action_judge": bool(self.llm_config.get("dspy_action_judge", False)),
+                    "dspy_prompt_state_mode": _normalize_prompt_state_mode(
+                        self.llm_config.get("dspy_prompt_state_mode", "off")
+                    ),
                 },
             )
         except Exception:
@@ -659,6 +741,7 @@ class PromptOptimizer:
             self.llm_config,
             constraints=reference.constraints,
             expected_outputs=reference.expected_outputs,
+            workflow_context=workflow_context,
         )
         if llm_output_issues:
             issues.extend(llm_output_issues)
@@ -703,7 +786,9 @@ class PromptOptimizer:
                 except Exception:
                     pass
                 continue
-            needs = True if not judge else judge.needs_change(prompt_text, issues, reference.constraints)
+            needs = True if not judge else judge.needs_change(
+                prompt_text, issues, reference.constraints, workflow_context=workflow_context
+            )
             if needs:
                 filtered_blocks.append(block)
         judged_no_change = total_prompts - len(filtered_blocks)
@@ -713,7 +798,15 @@ class PromptOptimizer:
 
         patches: List[PromptPatch] = []
         fail_signal = _build_fail_signal_from_issues(issues, reference.constraints)
+        actions = _actions_from_issues(issues, reference.constraints)
         use_dspy = self.llm_config.get("use_dspy_optimizer", True)
+        try:
+            logger.info(
+                "优化器策略选择",
+                extra={"workflow_id": workflow_id, "use_dspy_optimizer": bool(use_dspy)},
+            )
+        except Exception:
+            pass
         if use_dspy:
             dspy_optimizer = _DspyPromptOptimizer(self.llm_config)
             try:
@@ -724,6 +817,7 @@ class PromptOptimizer:
                     reference_texts or [],
                     reference.constraints,
                     fail_signal=fail_signal,
+                    workflow_context=workflow_context,
                 )
             except Exception as exc:  # noqa: BLE001
                 try:
@@ -748,6 +842,17 @@ class PromptOptimizer:
         if enable_rewrite and self.llm_config.get("url") and self.llm_config.get("model"):
             dspy_rewriter = _DspyRewriter(self.llm_config)
             rewriter = dspy_rewriter if dspy_rewriter.available else _LlmRewriter(self.llm_config)
+        try:
+            logger.debug(
+                "优化器重写器配置",
+                extra={
+                    "workflow_id": workflow_id,
+                    "enable_prompt_rewrite": bool(enable_rewrite),
+                    "rewriter": type(rewriter).__name__ if rewriter else None,
+                },
+            )
+        except Exception:
+            pass
 
         if rewriter:
             context_text = _format_fail_signal(fail_signal)
@@ -773,6 +878,7 @@ class PromptOptimizer:
             workflow_id=workflow_id,
             issues=issues,
             patches=patches,
+            actions=actions,
             yaml_path=workflow_path,
             reference_path=Path(reference_path) if reference_path else None,
             stats={
@@ -794,6 +900,244 @@ class PromptOptimizer:
         report.patched_path = patched_path
 
         self._maybe_write_report(report, output_root or self.default_output_root)
+        return report
+
+    def optimize_with_prompt_state(
+            self,
+            workflow_id: str,
+            run_results: Sequence[Dict[str, Any]],
+            *,
+            workflow_yaml: Optional[Tuple[Dict[str, Any], Path]] = None,
+            reference_path: Optional[str | Path] = None,
+            reference_spec: Optional[ReferenceSpec] = None,
+            reference_texts: Optional[Sequence[Optional[str]]] = None,
+            output_root: Optional[str | Path] = None,
+            apply_patches: bool = True,
+            # PromptState / optimize_prompt 关键参数
+            run_once_fn=None,
+            max_steps: int = 5,
+            beam_width: int = 1,
+            variant_count: int = 1,
+            action_budget: Optional[int] = DEFAULT_ACTION_BUDGET,
+            concurrency_manager: Optional[ConcurrencyManager] = None,
+            max_concurrency: Optional[int] = None,
+            checkpoint_dir: Optional[str | Path] = None,
+            resume_from_checkpoint: bool = False,
+            workflow_context: Optional[str] = None,
+    ) -> OptimizationReport:
+        """
+        Bridge entry: use optimize_prompt(PromptState + Action loop) to generate PromptPatch/OptimizationReport
+        while keeping external output format consistent with optimize_from_runs.
+        """
+        if workflow_yaml is None or not workflow_yaml[0] or not workflow_yaml[1]:
+            raise ValueError("workflow_yaml is required for optimize_with_prompt_state(...)")
+
+        if run_once_fn is None:
+            raise ValueError("run_once_fn is required for optimize_with_prompt_state(...)")
+
+        workflow_tree, workflow_path = workflow_yaml
+        try:
+            logger.info(
+                "PromptState optimizer entry",
+                extra={
+                    "workflow_id": workflow_id,
+                    "runs": len(run_results),
+                    "max_steps": max_steps,
+                    "beam_width": beam_width,
+                    "variant_count": variant_count,
+                    "action_budget": action_budget,
+                    "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir else None,
+                    "resume_from_checkpoint": resume_from_checkpoint,
+                },
+            )
+        except Exception:
+            pass
+        reference = reference_spec or _load_reference_spec(reference_path)
+
+        # 1) 用现有 run_results 做一次“基线问题检测”（保持 report.issues 行为一致）
+        samples = self._normalize_runs(run_results)
+        detector = PromptDeltaDetector(reference)
+        issues: List[DetectedIssue] = detector.detect(samples)
+
+        # 2) 选一个 representative run 提取上下文（占位符/输入等），用于 PromptState
+        representative = run_results[0] if run_results else {}
+        try:
+            placeholders_text = _extract_workflow_input(representative)
+        except Exception:
+            placeholders_text = ""
+
+        # 3) 遍历 DSL 里的 prompt blocks → 每条 message 单独做 PromptState 优化 → 产出 patch
+        patches: List[PromptPatch] = []
+        actions_acc: List[PromptAction] = []
+        seen_actions: set[tuple[str, str, str]] = set()
+
+        blocks = list(_iter_prompt_blocks(workflow_tree or {}))
+        try:
+            logger.debug(
+                "PromptState blocks ready",
+                extra={"workflow_id": workflow_id, "blocks": len(blocks)},
+            )
+        except Exception:
+            pass
+
+        # checkpoint/run_dir：每个 workflow 单独目录，避免互相覆盖
+        root_dir = Path(checkpoint_dir).expanduser() if checkpoint_dir else None
+        if root_dir:
+            root_dir.mkdir(parents=True, exist_ok=True)
+
+        for block in blocks:
+            for msg in (block.messages or []):
+                if not isinstance(msg, dict):
+                    continue
+                old_text = str(msg.get("text") or "")
+                field_path = str(msg.get("path") or "")
+                if not old_text.strip() or not field_path:
+                    continue
+
+                # PromptState 构建：force 模式（尽量结构化）
+                try:
+                    state = _build_prompt_state(
+                        old_text,
+                        constraints=reference.constraints,
+                        placeholders_text=placeholders_text,
+                        mode="force",
+                    )
+                except Exception:
+                    # 兜底：构建失败就跳过该条 message
+                    continue
+                try:
+                    logger.debug(
+                        "PromptState optimize message",
+                        extra={
+                            "workflow_id": workflow_id,
+                            "node_id": block.node_id,
+                            "field_path": field_path,
+                        },
+                    )
+                except Exception:
+                    pass
+
+                # 为每条 message 生成独立 run_dir（便于看 timeline.csv/summary.md）
+                per_run_dir = None
+                if root_dir:
+                    safe_node = _safe_dirname_from_id(block.node_id)
+                    per_run_dir = root_dir / safe_node / f"msg_{int(msg.get('index', 0))}"
+                    per_run_dir.mkdir(parents=True, exist_ok=True)
+
+                def _call_run_once(prompt_text: str):
+                    try:
+                        return run_once_fn(prompt_text, block, msg)
+                    except TypeError:
+                        try:
+                            return run_once_fn(prompt_text, block)
+                        except TypeError:
+                            return run_once_fn(prompt_text)
+
+                # 运行 optimize_prompt 得到最终 state
+                try:
+                    optimized_state = optimize_prompt(
+                        state,
+                        run_once_fn=_call_run_once,
+                        reference=reference,
+                        llm_config=self.llm_config,
+                        reference_texts=reference_texts,
+                        max_steps=max_steps,
+                        action_budget=action_budget,
+                        concurrency_manager=concurrency_manager,
+                        max_concurrency=max_concurrency,
+                        variant_count=variant_count,
+                        beam_width=beam_width,
+                        checkpoint_dir=per_run_dir,
+                        resume_from_checkpoint=resume_from_checkpoint,
+                        run_dir=per_run_dir,
+                        workflow_context=workflow_context,
+                    )
+                except Exception:
+                    # 单条失败不影响全局
+                    continue
+
+                new_text = _render_prompt_state(optimized_state).strip()
+                new_text = _restore_response_contract(new_text, optimized_state.response_contract).strip()
+                if not new_text or new_text.strip() == old_text.strip():
+                    continue
+
+                patches.append(
+                    PromptPatch(
+                        workflow_id=workflow_id,
+                        node_id=block.node_id,
+                        field_path=field_path,
+                        old=old_text,
+                        new=new_text,
+                        rationale="PromptState optimizer (optimize_prompt) updated this message",
+                        confidence=0.70,
+                        evidence_runs=[i for i in range(len(run_results))],
+                    )
+                )
+                try:
+                    logger.info(
+                        "PromptState patch generated",
+                        extra={
+                            "workflow_id": workflow_id,
+                            "node_id": block.node_id,
+                            "field_path": field_path,
+                        },
+                    )
+                except Exception:
+                    pass
+
+                # 额外：把最终 prompt 的 actions 也塞进 report.actions（便于验证接入已生效）
+                try:
+                    out = _call_run_once(new_text)
+                    post_issues, post_actions = _analyze_single_output(
+                        out,
+                        reference,
+                        llm_config=self.llm_config,
+                        reference_texts=reference_texts,
+                        workflow_context=workflow_context,
+                    )
+                    for a in post_actions:
+                        key = (a.type, a.target or "", a.content or "")
+                        if key in seen_actions:
+                            continue
+                        seen_actions.add(key)
+                        actions_acc.append(a)
+                except Exception:
+                    pass
+
+        # 4) 产出 report，并按原逻辑可选写 patched yaml
+        patched_path = None
+        if apply_patches and patches:
+            patched_path = self._apply_patches(
+                workflow_id=workflow_id,
+                workflow_tree=workflow_tree,
+                workflow_path=workflow_path,
+                patches=patches,
+                output_root=output_root,
+            )
+
+        stats = {
+            "prompt_state_enabled": True,
+            "prompt_state_blocks": len(blocks),
+            "prompt_state_patches": len(patches),
+            "prompt_state_checkpoint_dir": str(root_dir) if root_dir else None,
+        }
+
+        report = OptimizationReport(
+            workflow_id=workflow_id,
+            issues=issues,
+            patches=patches,
+            actions=actions_acc,
+            yaml_path=Path(workflow_path),
+            reference_path=Path(reference_path).expanduser() if reference_path else None,
+            patched_path=patched_path,
+            stats=stats,
+        )
+
+        try:
+            self._maybe_write_report(report, output_root=output_root)
+        except Exception:
+            pass
+
         return report
 
     def _normalize_runs(self, run_results: Sequence[Dict[str, Any]]) -> List[ExecutionSample]:
@@ -845,6 +1189,15 @@ class PromptOptimizer:
                         "evidence_runs": p.evidence_runs,
                     }
                     for p in report.patches
+                ],
+                "actions": [
+                    {
+                        "type": a.type,
+                        "target": a.target,
+                        "content": a.content,
+                        "evidence_runs": a.evidence_runs,
+                    }
+                    for a in report.actions
                 ],
                 "stats": report.stats,
                 "patched_path": str(report.patched_path) if report.patched_path else None,
@@ -933,6 +1286,7 @@ def _llm_output_judge(
     *,
     constraints: Sequence[str] | None = None,
     expected_outputs: Sequence[str] | None = None,
+    workflow_context: Optional[str] = None,
 ) -> Tuple[List[DetectedIssue], Dict[str, Any]]:
     """
     Use an external LLM to compare each output with its paired reference text.
@@ -1045,6 +1399,12 @@ def _llm_output_judge(
                     prompt_lines.append("Constraints (must be satisfied):")
                     for c in constraints:
                         prompt_lines.append(f"- {c}")
+                if workflow_context:
+                    prompt_lines.append("")
+                    prompt_lines.append("[WORKFLOW CONTEXT]")
+                    prompt_lines.append(workflow_context)
+                    prompt_lines.append("The output MUST align with the above workflow purpose.")
+                    prompt_lines.append("[END WORKFLOW CONTEXT]")
                 if expected_outputs:
                     prompt_lines.append("Expected baseline example:")
                     prompt_lines.append(str(expected_outputs[0]))
@@ -1073,6 +1433,7 @@ def _llm_output_judge(
                             "url": url,
                             "timeout": timeout,
                             "has_api_key": bool(api_key),
+                            "has_workflow_context": bool(workflow_context),
                         },
                     )
                 except Exception:
@@ -1272,6 +1633,35 @@ def _placeholders_preserved(original_placeholders: Sequence[str], new_text: str)
     return set(original_placeholders) == set(_extract_placeholders(new_text))
 
 
+def _parse_workflow_context(workflow_context: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Parse workflow context string to extract name and description.
+
+    The workflow_context string is expected to have the format:
+        Workflow Name: <name>
+        Workflow Description: <description>
+
+    Args:
+        workflow_context: The workflow context string or None.
+
+    Returns:
+        A tuple of (workflow_name, workflow_description), either of which may be None.
+    """
+    if not workflow_context:
+        return None, None
+
+    workflow_name: Optional[str] = None
+    workflow_description: Optional[str] = None
+
+    for line in workflow_context.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("Workflow Name:"):
+            workflow_name = line[len("Workflow Name:"):].strip()
+        elif line.startswith("Workflow Description:"):
+            workflow_description = line[len("Workflow Description:"):].strip()
+
+    return workflow_name, workflow_description
+
+
 def _build_fail_signal_from_issues(issues: Sequence[DetectedIssue], constraints: Sequence[str]) -> FailSignal:
     """Map detected issues into structured fail signals for rewrites."""
     tags: List[str] = []
@@ -1366,12 +1756,1398 @@ def _build_block_context(block: PromptBlock, fail_signal: FailSignal, constraint
     return "\n".join(part for part in parts if part is not None)
 
 
+def _choose_primary_message(block: PromptBlock) -> Optional[Dict[str, Any]]:
+    """Select a stable primary message to receive PromptState updates."""
+    if not block.messages:
+        return None
+    for msg in block.messages:
+        if (msg.get("role") or "").lower() == "system":
+            return msg
+    return block.messages[0]
+
+
 def _validate_block_rewrite(block: PromptBlock, new_text: str) -> bool:
     """Validate rewritten block keeps markers and placeholders."""
     if block.brief and not _placeholders_preserved(block.brief.placeholders, new_text):
         return False
     markers_ok = _split_block_by_markers(block, new_text) is not None
     return markers_ok
+
+
+def _normalize_prompt_state_mode(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"true", "1", "yes", "auto"}:
+        return "auto"
+    if raw in {"force", "strict"}:
+        return "force"
+    return "off"
+
+
+def _parse_prompt_sections(text: str) -> Dict[str, str]:
+    headers = {
+        "ROLE": "role",
+        "TASK": "task",
+        "GLOBAL CONSTRAINTS": "global_constraints",
+        "CHECKPOINT RULES": "checkpoint_rules",
+        "STRICTNESS LEVEL": "strictness_level",
+        "OUTPUT JSON SCHEMA": "schema",
+        "JSON SCHEMA": "schema",
+        "NEGATIVE EXAMPLES": "negative_examples",
+    }
+    sections: Dict[str, List[str]] = {}
+    current: Optional[str] = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.endswith(":"):
+            key = stripped[:-1].strip().upper()
+            if key in headers:
+                current = headers[key]
+                sections[current] = []
+                continue
+        if current:
+            sections[current].append(line)
+    return {key: "\n".join(lines).strip() for key, lines in sections.items() if lines}
+
+
+def _render_response_contract(contract: ResponseContract) -> str:
+    header = "OUTPUT JSON SCHEMA" if contract.format_type == "json" else "OUTPUT FORMAT"
+    return f"{header}:\n{contract.schema}".strip()
+
+
+def _render_response_contract_placeholder(contract: ResponseContract) -> str:
+    header = "OUTPUT JSON SCHEMA" if contract.format_type == "json" else "OUTPUT FORMAT"
+    return f"{header}:\n{RESPONSE_CONTRACT_PLACEHOLDER}"
+
+
+def _extract_response_contract(prompt_text: str) -> Tuple[str, Optional[ResponseContract]]:
+    if not prompt_text:
+        return prompt_text, None
+    if RESPONSE_CONTRACT_PLACEHOLDER in prompt_text:
+        return prompt_text, None
+    pattern = re.compile(
+        r"(?ms)^(OUTPUT JSON SCHEMA|JSON SCHEMA|OUTPUT FORMAT):\n(.*?)(?=^\S.*?:\n|\Z)"
+    )
+    match = pattern.search(prompt_text)
+    if not match:
+        return prompt_text, None
+    header = match.group(1)
+    schema_body = match.group(2).strip()
+    if not schema_body:
+        return prompt_text, None
+    format_type = "json" if "JSON" in header else "text"
+    contract = ResponseContract(format_type=format_type, schema=schema_body, strict=True)
+    replacement = f"{header}:\n{RESPONSE_CONTRACT_PLACEHOLDER}"
+    new_text = pattern.sub(replacement, prompt_text, count=1)
+    return new_text, contract
+
+
+def _restore_response_contract(prompt_text: str, contract: Optional[ResponseContract]) -> str:
+    if not contract:
+        return prompt_text
+    if RESPONSE_CONTRACT_PLACEHOLDER in prompt_text:
+        return prompt_text.replace(RESPONSE_CONTRACT_PLACEHOLDER, contract.schema)
+    rendered = _render_response_contract(contract)
+    if not prompt_text.strip():
+        return rendered
+    return f"{prompt_text}\n\n{rendered}"
+
+
+def _validate_response_contract(contract: ResponseContract, candidate: str) -> Optional[str]:
+    if not contract.strict:
+        return None
+    if contract.format_type == "json":
+        payload = _safe_json_from_text(candidate)
+        if not isinstance(payload, dict):
+            return "ResponseContract requires valid JSON object output"
+        schema_obj = _safe_json_from_text(contract.schema)
+        if isinstance(schema_obj, dict):
+            required = schema_obj.get("required")
+            if isinstance(required, list):
+                missing = [key for key in required if key not in payload]
+                if missing:
+                    return f"ResponseContract missing required fields: {missing}"
+    return None
+
+
+def _parse_bullet_list(text: str) -> List[str]:
+    items: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("-"):
+            stripped = stripped[1:].strip()
+        if stripped:
+            items.append(stripped)
+    return items
+
+
+def _parse_checkpoint_rules(text: str) -> Dict[str, str]:
+    rules: Dict[str, str] = {}
+    for line in _parse_bullet_list(text):
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            rules[key] = value
+    return rules
+
+
+def _parse_negative_examples(text: str) -> List[Dict[str, Any]]:
+    examples: List[Dict[str, Any]] = []
+    current: Dict[str, Any] = {}
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("-"):
+            stripped = stripped[1:].strip()
+        lower = stripped.lower()
+        if lower.startswith("wrong:"):
+            if current:
+                examples.append(current)
+            current = {"bad_output": stripped.split(":", 1)[1].strip()}
+        elif lower.startswith("reason:"):
+            if current:
+                current["reason"] = stripped.split(":", 1)[1].strip()
+        else:
+            if not current:
+                current = {"bad_output": stripped}
+            else:
+                current["bad_output"] = f"{current.get('bad_output', '')}\n{stripped}".strip()
+    if current:
+        examples.append(current)
+    return examples
+
+
+def _build_prompt_state(
+        prompt_text: str,
+        constraints: Sequence[str],
+        placeholders_text: str,
+        mode: str,
+) -> PromptState:
+    sections = _parse_prompt_sections(prompt_text)
+    structured = bool(sections)
+    role = sections.get("role", "").strip()
+    task = sections.get("task", "").strip()
+    schema = sections.get("schema", "").strip()
+    if schema == RESPONSE_CONTRACT_PLACEHOLDER:
+        schema = ""
+    strictness = 3
+    strictness_text = sections.get("strictness_level", "").strip()
+    if strictness_text:
+        match = re.search(r"\d+", strictness_text)
+        if match:
+            strictness = max(1, min(5, int(match.group(0))))
+    global_constraints = _parse_bullet_list(sections.get("global_constraints", ""))
+    checkpoint_rules = _parse_checkpoint_rules(sections.get("checkpoint_rules", ""))
+    negative_examples = _parse_negative_examples(sections.get("negative_examples", ""))
+    placeholders = _extract_placeholders(prompt_text)
+    if not placeholders and placeholders_text:
+        placeholders = [p.strip() for p in placeholders_text.split(";") if p.strip()]
+    base_prompt = ""
+    if not structured:
+        base_prompt = prompt_text
+    response_contract = None
+    protected_slots: List[str] = []
+    if schema:
+        response_contract = ResponseContract(format_type="json", schema=schema, strict=True)
+        protected_slots.append("response_contract")
+        schema = ""
+    state = PromptState(
+        base_prompt=base_prompt,
+        role=role,
+        task=task,
+        schema=schema,
+        checkpoint_rules=checkpoint_rules,
+        strictness_level=strictness,
+        negative_examples=negative_examples,
+        global_constraints=global_constraints,
+        placeholders=placeholders,
+        structured=structured,
+        schema_frozen=bool(response_contract),
+        protected_slots=protected_slots,
+        response_contract=response_contract,
+    )
+    if mode == "force" and not structured and not state.base_prompt:
+        state.task = prompt_text
+        state.structured = True
+    for constraint in constraints:
+        if constraint and constraint not in state.global_constraints:
+            state.global_constraints.append(constraint)
+    return state
+
+
+def _render_prompt_state(state: PromptState, context_text: str = "") -> str:
+    parts: List[str] = []
+    if state.base_prompt:
+        parts.append(state.base_prompt)
+    if state.role:
+        parts.append(f"ROLE:\n{state.role}")
+    if state.task:
+        parts.append(f"TASK:\n{state.task}")
+    if state.global_constraints:
+        parts.append("GLOBAL CONSTRAINTS:")
+        parts.extend(f"- {c}" for c in state.global_constraints)
+    if state.checkpoint_rules:
+        parts.append("CHECKPOINT RULES:")
+        for key, value in state.checkpoint_rules.items():
+            parts.append(f"- {key}: {value}")
+    parts.append(f"STRICTNESS LEVEL:\n{state.strictness_level}")
+    if state.negative_examples:
+        parts.append("NEGATIVE EXAMPLES:")
+        for ex in state.negative_examples:
+            bad = ex.get("bad_output") or ex.get("bad") or ""
+            if bad:
+                parts.append(f"- Wrong: {bad}")
+            reason = ex.get("reason") or ""
+            if reason:
+                parts.append(f"  Reason: {reason}")
+    if context_text:
+        parts.append("NODE CONTEXT:")
+        parts.append(context_text)
+    if state.placeholders:
+        parts.append("PLACEHOLDERS (MUST REMAIN EXACTLY):")
+        parts.extend(f"- {ph}" for ph in state.placeholders)
+    return "\n\n".join(part for part in parts if part)
+
+
+def _serialize_prompt_state(state: PromptState) -> str:
+    payload = {
+        "base_prompt": state.base_prompt,
+        "role": state.role,
+        "task": state.task,
+        "schema": state.schema,
+        "checkpoint_rules": state.checkpoint_rules,
+        "strictness_level": state.strictness_level,
+        "negative_examples": state.negative_examples,
+        "global_constraints": state.global_constraints,
+        "placeholders": state.placeholders,
+        "version": state.version,
+        "schema_tighten_count": state.schema_tighten_count,
+        "schema_frozen": state.schema_frozen,
+        "protected_slots": state.protected_slots,
+        "response_contract": asdict(state.response_contract) if state.response_contract else None,
+    }
+    try:
+        return _json.dumps(payload, ensure_ascii=False)
+    except Exception:
+        return _coerce_text(payload)
+
+
+def _safe_json_from_text(text: str) -> Optional[Any]:
+    if not text:
+        return None
+    try:
+        return _json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return _json.loads(text[start: end + 1])
+            except Exception:
+                return None
+    return None
+
+
+def _parse_enum_constraint(constraint: str) -> Optional[List[str]]:
+    lower = constraint.lower()
+    if "enum" not in lower:
+        return None
+    parts = constraint.split(":", 1)
+    if len(parts) != 2:
+        return None
+    payload = parts[1].strip()
+    if not payload:
+        return None
+    try:
+        return _json.loads(payload.replace("'", "\""))
+    except Exception:
+        return None
+
+
+def _apply_schema_constraint(state: PromptState, field: str, constraint: str) -> None:
+    if not field or not constraint:
+        return
+    schema_obj = _safe_json_from_text(state.schema)
+    if not isinstance(schema_obj, dict):
+        state.global_constraints.append(f"Schema constraint for {field}: {constraint}")
+        return
+    props = schema_obj.setdefault("properties", {})
+    field_schema = props.get(field)
+    if not isinstance(field_schema, dict):
+        field_schema = {}
+    enum_values = _parse_enum_constraint(constraint)
+    if enum_values:
+        field_schema["enum"] = enum_values
+    else:
+        desc = str(field_schema.get("description") or "").strip()
+        if constraint not in desc:
+            field_schema["description"] = f"{desc} {constraint}".strip()
+    props[field] = field_schema
+    try:
+        state.schema = _json.dumps(schema_obj, ensure_ascii=False, indent=2)
+    except Exception:
+        state.schema = _coerce_text(schema_obj)
+
+
+def _apply_prompt_actions(
+        state: PromptState,
+        actions: Sequence[Any],
+        *,
+        action_budget: Optional[int] = DEFAULT_ACTION_BUDGET,
+        max_constraints: int = DEFAULT_MAX_CONSTRAINTS,
+        max_strictness: int = 5,
+        schema_tighten_limit: int = DEFAULT_SCHEMA_TIGHTEN_LIMIT,
+        normalize: bool = True,
+) -> PromptState:
+    if normalize:
+        normalized = _normalize_actions(actions, state, action_budget=action_budget)
+    else:
+        normalized = list(actions)
+    protected_slots = set(state.protected_slots or [])
+    has_contract = state.response_contract is not None
+    for action in normalized:
+        payload = action
+        if isinstance(action, PromptAction):
+            payload = {
+                "type": action.type,
+                "target": action.target,
+                "content": action.content,
+            }
+        if not isinstance(payload, dict):
+            continue
+        action_type = str(payload.get("type") or payload.get("action") or "").strip().lower()
+        target = str(
+            payload.get("target")
+            or payload.get("slot")
+            or payload.get("section")
+            or payload.get("field")
+            or ""
+        ).strip().lower()
+        if target in protected_slots or target in {"output_format", "response_schema", "response_contract"}:
+            continue
+        if action_type == "tighten_schema" and (has_contract or "response_contract" in protected_slots):
+            continue
+        if action_type in {"add_checkpoint_rule", "modify_checkpoint_rule", "add_rule"}:
+            checkpoint = str(payload.get("checkpoint") or payload.get("target") or "").strip()
+            content = str(payload.get("content") or payload.get("rule") or "").strip()
+            if checkpoint and content:
+                state.checkpoint_rules[checkpoint] = content
+        elif action_type in {"add_global_constraint", "add_constraint"}:
+            content = str(payload.get("content") or payload.get("constraint") or "").strip()
+            if content and content not in state.global_constraints:
+                state.global_constraints.append(content)
+        elif action_type == "tighten_schema":
+            if state.schema_frozen:
+                continue
+            field = str(payload.get("field") or payload.get("target") or "").strip()
+            constraint = str(payload.get("constraint") or payload.get("content") or "").strip()
+            if not constraint:
+                continue
+            if field and not _safe_json_from_text(constraint):
+                temp_state = PromptState(schema=state.schema)
+                _apply_schema_constraint(temp_state, field, constraint)
+                new_schema_text = temp_state.schema
+            else:
+                new_schema_text = constraint
+            if not _safe_json_from_text(new_schema_text):
+                if constraint and constraint not in state.global_constraints:
+                    state.global_constraints.append(constraint)
+                continue
+            current_score = _schema_strength_score(state.schema)
+            new_score = _schema_strength_score(new_schema_text)
+            if new_score < current_score:
+                continue
+            state.schema = new_schema_text
+            state.schema_tighten_count += 1
+            if state.schema_tighten_count >= schema_tighten_limit:
+                state.schema_frozen = True
+        elif action_type == "add_negative_example":
+            example = payload.get("example") or {}
+            if isinstance(example, dict):
+                state.negative_examples.append(example)
+            else:
+                bad_output = str(payload.get("bad_output") or payload.get("output") or example).strip()
+                reason = str(payload.get("reason") or "").strip()
+                if bad_output:
+                    entry: Dict[str, Any] = {"bad_output": bad_output}
+                    if reason:
+                        entry["reason"] = reason
+                    state.negative_examples.append(entry)
+        elif action_type == "increase_strictness":
+            amount = payload.get("amount")
+            try:
+                delta = int(amount) if amount is not None else 1
+            except Exception:
+                delta = 1
+            state.strictness_level = max(1, min(max_strictness, state.strictness_level + delta))
+    if max_constraints is not None and len(state.global_constraints) > max_constraints:
+        state.global_constraints = state.global_constraints[-max_constraints:]
+    state.version += 1
+    state.structured = True
+    return state
+
+
+def _actions_from_fail_signal(
+        signal: FailSignal,
+        issues: Sequence[DetectedIssue],
+) -> List[PromptAction]:
+    evidence: List[int] = sorted({idx for issue in issues for idx in issue.evidence_runs})
+    actions: List[PromptAction] = []
+    seen: Set[Tuple[str, Optional[str], Optional[str]]] = set()
+    for gap in signal.constraint_gaps:
+        content = gap
+        marker = "constraint not observed in outputs:"
+        if marker in gap.lower():
+            content = gap.split(":", 1)[-1].strip() or gap
+        key = ("add_global_constraint", None, content)
+        if key in seen:
+            continue
+        seen.add(key)
+        actions.append(
+            PromptAction(
+                type="add_global_constraint",
+                content=content,
+                evidence_runs=evidence,
+            )
+        )
+    for missing in signal.missing_fields:
+        key = ("add_checkpoint_rule", "missing", missing)
+        if key in seen:
+            continue
+        seen.add(key)
+        actions.append(
+            PromptAction(
+                type="add_checkpoint_rule",
+                target="missing",
+                content=missing,
+                evidence_runs=evidence,
+            )
+        )
+    for fmt in signal.format_errors:
+        key = ("tighten_schema", None, fmt)
+        if key in seen:
+            continue
+        seen.add(key)
+        actions.append(
+            PromptAction(
+                type="tighten_schema",
+                content=fmt,
+                evidence_runs=evidence,
+            )
+        )
+    for gap in signal.semantic_gaps:
+        key = ("modify_checkpoint_rule", "semantic", gap)
+        if key in seen:
+            continue
+        seen.add(key)
+        actions.append(
+            PromptAction(
+                type="modify_checkpoint_rule",
+                target="semantic",
+                content=gap,
+                evidence_runs=evidence,
+            )
+        )
+    return actions
+
+
+def _parse_list_literal(text: str) -> List[str]:
+    if not text:
+        return []
+    try:
+        parsed = ast.literal_eval(text)
+    except Exception:
+        return []
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed if str(item)]
+    return []
+
+
+def _extract_items_from_message(message: str, key: str) -> List[str]:
+    marker = f"{key}="
+    if marker not in message:
+        return []
+    tail = message.split(marker, 1)[1]
+    start = tail.find("[")
+    end = tail.find("]")
+    if start == -1 or end == -1 or end <= start:
+        return []
+    return _parse_list_literal(tail[start: end + 1])
+
+
+def _extract_constraint_from_message(message: str) -> str:
+    if ":" in message:
+        return message.split(":", 1)[1].strip()
+    return message
+
+
+def _actions_from_llm_mismatch(issue: DetectedIssue) -> List[PromptAction]:
+    actions: List[PromptAction] = []
+    missing_items = _extract_items_from_message(issue.message, "missing_items")
+    incorrect_items = _extract_items_from_message(issue.message, "incorrect_items")
+    fmt_ok = "format_ok=false" in issue.message.lower()
+    for item in missing_items:
+        actions.append(
+            PromptAction(
+                type="add_checkpoint_rule",
+                target=item,
+                content=f"Must include: {item}",
+                evidence_runs=issue.evidence_runs,
+            )
+        )
+    for item in incorrect_items:
+        actions.append(
+            PromptAction(
+                type="add_global_constraint",
+                content=f"Avoid: {item}",
+                evidence_runs=issue.evidence_runs,
+            )
+        )
+    if fmt_ok:
+        actions.append(
+            PromptAction(
+                type="tighten_schema",
+                content="Ensure output strictly matches JSON schema.",
+                evidence_runs=issue.evidence_runs,
+            )
+        )
+    if not actions:
+        actions.append(
+            PromptAction(
+                type="modify_checkpoint_rule",
+                target="mismatch",
+                content=issue.message,
+                evidence_runs=issue.evidence_runs,
+            )
+        )
+    return actions
+
+
+def _action_from_constraint_missing(issue: DetectedIssue, _: Sequence[str]) -> List[PromptAction]:
+    constraint = _extract_constraint_from_message(issue.message)
+    if not constraint:
+        return []
+    return [
+        PromptAction(
+            type="add_global_constraint",
+            content=constraint,
+            evidence_runs=issue.evidence_runs,
+        )
+    ]
+
+
+def _action_from_low_similarity(issue: DetectedIssue, _: Sequence[str]) -> List[PromptAction]:
+    return [
+        PromptAction(
+            type="modify_checkpoint_rule",
+            target="semantic",
+            content=issue.message,
+            evidence_runs=issue.evidence_runs,
+        )
+    ]
+
+
+def _action_from_llm_mismatch(issue: DetectedIssue, _: Sequence[str]) -> List[PromptAction]:
+    return _actions_from_llm_mismatch(issue)
+
+
+ISSUE_TO_ACTION: Dict[str, Callable[[DetectedIssue, Sequence[str]], List[PromptAction]]] = {
+    "constraint_missing": _action_from_constraint_missing,
+    "low_similarity": _action_from_low_similarity,
+    "llm_output_mismatch": _action_from_llm_mismatch,
+}
+
+
+def _dedupe_actions(actions: Sequence[PromptAction]) -> List[PromptAction]:
+    seen: Set[Tuple[str, Optional[str], Optional[str]]] = set()
+    result: List[PromptAction] = []
+    for action in actions:
+        key = (action.type, action.target, action.content)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(action)
+    return result
+
+
+def _actions_from_issues(
+        issues: Sequence[DetectedIssue],
+        constraints: Sequence[str],
+) -> List[PromptAction]:
+    actions: List[PromptAction] = []
+    for issue in issues:
+        handler = ISSUE_TO_ACTION.get(issue.kind)
+        if handler:
+            actions.extend(handler(issue, constraints))
+    if not actions and issues:
+        fail_signal = _build_fail_signal_from_issues(issues, constraints)
+        actions = _actions_from_fail_signal(fail_signal, issues)
+    return _normalize_actions(actions, action_budget=None)
+
+
+def normalize_action(action: PromptAction) -> PromptAction:
+    action.type = (action.type or "").strip().lower()
+    if action.target is not None:
+        action.target = str(action.target).strip()
+    if action.content is not None:
+        action.content = str(action.content).strip()
+    return action
+
+
+def dedupe_merge_actions(actions: Sequence[PromptAction]) -> List[PromptAction]:
+    merged: Dict[Tuple[str, Optional[str]], PromptAction] = {}
+    constraint_seen: Set[str] = set()
+    for action in actions:
+        action = normalize_action(action)
+        if action.type == "add_global_constraint":
+            if not action.content or action.content in constraint_seen:
+                continue
+            constraint_seen.add(action.content)
+            merged[(action.type, action.content)] = action
+            continue
+        key = (action.type, action.target)
+        if key not in merged:
+            merged[key] = action
+            continue
+        existing = merged[key]
+        existing.evidence_runs = sorted(set(existing.evidence_runs + action.evidence_runs))
+        if len(action.content or "") > len(existing.content or ""):
+            existing.content = action.content
+    return list(merged.values())
+
+
+def limit_actions(actions: Sequence[PromptAction], k: int = DEFAULT_ACTION_BUDGET) -> List[PromptAction]:
+    priority = {
+        "tighten_schema": 0,
+        "add_checkpoint_rule": 1,
+        "modify_checkpoint_rule": 1,
+        "add_global_constraint": 2,
+        "increase_strictness": 3,
+    }
+    sorted_actions = sorted(actions, key=lambda a: priority.get(a.type, 99))
+    return sorted_actions[: max(0, k)]
+
+
+def clamp_state(state: PromptState) -> PromptState:
+    state.strictness_level = max(1, min(state.strictness_level, 5))
+    if len(state.global_constraints) > DEFAULT_MAX_CONSTRAINTS:
+        state.global_constraints = state.global_constraints[-DEFAULT_MAX_CONSTRAINTS:]
+    state.schema = state.schema or ""
+    return state
+
+
+def _schema_strength_score(schema_text: str) -> int:
+    schema_obj = _safe_json_from_text(schema_text)
+    if not isinstance(schema_obj, dict):
+        text = schema_text or ""
+        return (
+                text.count('"required"') * 2
+                + text.count('"enum"') * 2
+                + text.count("additionalProperties") * 3
+        )
+    score = 0
+    if schema_obj.get("additionalProperties") is False:
+        score += 5
+    required = schema_obj.get("required")
+    if isinstance(required, list):
+        score += len(required) * 3
+    properties = schema_obj.get("properties")
+    if isinstance(properties, dict):
+        score += len(properties)
+        for value in properties.values():
+            if not isinstance(value, dict):
+                continue
+            enum_vals = value.get("enum")
+            if isinstance(enum_vals, list):
+                score += len(enum_vals)
+    return score
+
+
+def _coerce_prompt_action(action: Any) -> Optional[PromptAction]:
+    if isinstance(action, PromptAction):
+        return action
+    if not isinstance(action, dict):
+        return None
+    action_type = str(action.get("type") or action.get("action") or "").strip()
+    if not action_type:
+        return None
+    target = action.get("target")
+    content = action.get("content")
+    evidence_runs = action.get("evidence_runs") or []
+    if isinstance(evidence_runs, list):
+        evidence_runs = [int(x) for x in evidence_runs if str(x).isdigit()]
+    else:
+        evidence_runs = []
+    return PromptAction(
+        type=action_type,
+        target=str(target).strip() if target is not None else None,
+        content=str(content).strip() if content is not None else None,
+        evidence_runs=evidence_runs,
+    )
+
+
+def _normalize_actions(
+        actions: Sequence[Any],
+        state: Optional[PromptState] = None,
+        *,
+        action_budget: Optional[int] = DEFAULT_ACTION_BUDGET,
+) -> List[PromptAction]:
+    merged: Dict[Tuple[str, Optional[str]], PromptAction] = {}
+    schema_scores: Dict[Tuple[str, Optional[str]], int] = {}
+    for raw in actions:
+        action = _coerce_prompt_action(raw)
+        if not action:
+            continue
+        action_type = action.type.strip().lower()
+        action.type = action_type
+        if action_type == "add_global_constraint":
+            if not action.content:
+                continue
+            if not action.target:
+                action.target = action.content
+        if action_type in {"add_checkpoint_rule", "modify_checkpoint_rule"} and not action.target:
+            action.target = "generic"
+        key = (action_type, action.target)
+        if action_type == "tighten_schema" and not action.content:
+            continue
+        if key not in merged:
+            merged[key] = action
+            if action_type == "tighten_schema":
+                schema_scores[key] = _schema_strength_score(action.content or "")
+            continue
+        existing = merged[key]
+        if action_type in {"add_checkpoint_rule", "modify_checkpoint_rule"}:
+            if len(action.evidence_runs) >= len(existing.evidence_runs):
+                merged[key] = action
+        elif action_type == "tighten_schema":
+            new_score = _schema_strength_score(action.content or "")
+            if new_score >= schema_scores.get(key, 0):
+                merged[key] = action
+                schema_scores[key] = new_score
+        elif action_type == "add_global_constraint":
+            continue
+        elif action_type == "increase_strictness":
+            if len(action.evidence_runs) >= len(existing.evidence_runs):
+                merged[key] = action
+    normalized = dedupe_merge_actions(list(merged.values()))
+    if action_budget is not None and action_budget > 0 and len(normalized) > action_budget:
+        normalized.sort(
+            key=lambda item: (-len(item.evidence_runs), item.type, item.target or "", item.content or ""),
+        )
+        normalized = normalized[:action_budget]
+    return normalized
+
+
+def apply_actions(
+        state: PromptState,
+        actions: Sequence[PromptAction],
+        *,
+        action_budget: Optional[int] = DEFAULT_ACTION_BUDGET,
+        max_constraints: int = DEFAULT_MAX_CONSTRAINTS,
+        schema_tighten_limit: int = DEFAULT_SCHEMA_TIGHTEN_LIMIT,
+        max_strictness: int = 5,
+        normalize: bool = True,
+) -> PromptState:
+    """Public action executor for prompt state updates."""
+    normalized = _normalize_actions(actions, state, action_budget=action_budget) if normalize else list(actions)
+    return _apply_prompt_actions(
+        state,
+        normalized,
+        action_budget=None,
+        max_constraints=max_constraints,
+        schema_tighten_limit=schema_tighten_limit,
+        max_strictness=max_strictness,
+        normalize=False,
+    )
+
+
+class ConcurrencyManager:
+    def __init__(self, max_concurrency: int) -> None:
+        self.limit = max(1, int(max_concurrency))
+        self.sem = threading.Semaphore(self.limit)
+
+    @contextmanager
+    def slot(self):
+        self.sem.acquire()
+        try:
+            yield
+        finally:
+            self.sem.release()
+
+    def set_limit(self, n: int) -> None:
+        self.limit = max(1, int(n))
+        self.sem = threading.Semaphore(self.limit)
+
+
+class SqliteCache:
+    def __init__(self, path: str | Path) -> None:
+        self.path = str(path)
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self.conn.execute("CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, value BLOB)")
+
+    def get(self, key: str) -> Any:
+        cursor = self.conn.execute("SELECT value FROM cache WHERE key=?", (key,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        try:
+            return pickle.loads(row[0])
+        except Exception:
+            return None
+
+    def set(self, key: str, value: Any) -> None:
+        blob = pickle.dumps(value)
+        self.conn.execute(
+            "INSERT OR REPLACE INTO cache (key, value) VALUES (?, ?)",
+            (key, blob),
+        )
+        self.conn.commit()
+
+
+def safe_run_once(run_fn, prompt_text: str, retries: int = 3):
+    for attempt in range(retries):
+        try:
+            return run_fn(prompt_text)
+        except TimeoutError:
+            time.sleep((2 ** attempt) + random.random())
+        except Exception as exc:
+            if "JSON" in str(exc):
+                raise
+            time.sleep(1)
+    raise RuntimeError("run_once failed after retries")
+
+
+def generate_variants(state: PromptState) -> List[PromptState]:
+    variants: List[PromptState] = []
+    base = copy.deepcopy(state)
+    variants.append(base)
+    up = copy.deepcopy(state)
+    up.strictness_level = min(5, state.strictness_level + 1)
+    variants.append(up)
+    down = copy.deepcopy(state)
+    down.strictness_level = max(1, state.strictness_level - 1)
+    variants.append(down)
+    return variants
+
+
+def _output_to_sample(output: Any) -> ExecutionSample:
+    if isinstance(output, ExecutionSample):
+        return output
+    if isinstance(output, dict):
+        status = _status_from_run(output)
+        output_text = _extract_output_text(output)
+        metrics: Dict[str, Any] = {}
+        if isinstance(output.get("metrics"), dict):
+            metrics = output.get("metrics") or {}
+        return ExecutionSample(index=1, status=status, output_text=output_text, metrics=metrics, raw=output)
+    return ExecutionSample(index=1, status="success", output_text=str(output), metrics={}, raw={"output": output})
+
+
+def _analyze_single_output(
+        output: Any,
+        reference: ReferenceSpec,
+        llm_config: Optional[Dict[str, Any]] = None,
+        reference_texts: Optional[Sequence[Optional[str]]] = None,
+        workflow_context: Optional[str] = None,
+) -> Tuple[List[DetectedIssue], List[PromptAction]]:
+    sample = _output_to_sample(output)
+    detector = PromptDeltaDetector(reference)
+    issues = detector.detect([sample])
+    judge_refs = reference_texts
+    if not judge_refs and reference.expected_outputs:
+        judge_refs = [reference.expected_outputs[0]]
+    llm_issues, _ = _llm_output_judge(
+        [sample],
+        judge_refs,
+        llm_config,
+        constraints=reference.constraints,
+        expected_outputs=reference.expected_outputs,
+        workflow_context=workflow_context,
+    )
+    if llm_issues:
+        issues.extend(llm_issues)
+    actions = _actions_from_issues(issues, reference.constraints)
+    return issues, actions
+
+
+def prompt_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def score_report(
+        report: Optional[Any] = None,
+        *,
+        issues: Optional[Sequence[DetectedIssue]] = None,
+        actions: Optional[Sequence[PromptAction]] = None,
+) -> float:
+    if report is not None:
+        issues = getattr(report, "issues", None)
+        actions = getattr(report, "actions", None)
+    issue_count = len(issues or [])
+    action_count = len(actions or [])
+    return 100.0 - 10.0 * issue_count - 2.0 * action_count
+
+
+def _issue_is_format_related(issue: DetectedIssue) -> bool:
+    kind = (issue.kind or "").lower()
+    message = (issue.message or "").lower()
+    if "format" in message or "json" in message or "schema" in message:
+        return True
+    if "format_ok" in message:
+        return True
+    if kind in {"llm_output_mismatch"} and "format_ok" in message:
+        return True
+    return False
+
+
+def _filter_actions_for_stage(stage: OptimizationStage, actions: Sequence[PromptAction]) -> List[PromptAction]:
+    if stage == OptimizationStage.FORMAT:
+        allowed = {"tighten_schema", "add_global_constraint"}
+        return [action for action in actions if action.type in allowed]
+    if stage == OptimizationStage.RECALL:
+        return [action for action in actions if action.type != "increase_strictness"]
+    return list(actions)
+
+
+def _serialize_issues(issues: Sequence[DetectedIssue]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "kind": issue.kind,
+            "severity": issue.severity,
+            "message": issue.message,
+            "evidence_runs": issue.evidence_runs,
+        }
+        for issue in issues
+    ]
+
+
+def _serialize_actions(actions: Sequence[PromptAction]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "type": action.type,
+            "target": action.target,
+            "content": action.content,
+            "evidence_runs": action.evidence_runs,
+        }
+        for action in actions
+    ]
+
+
+def _prompt_state_from_dict(payload: Dict[str, Any]) -> PromptState:
+    allowed = {field_def.name for field_def in fields(PromptState)}
+    filtered = {key: value for key, value in payload.items() if key in allowed}
+    contract = filtered.get("response_contract")
+    if isinstance(contract, dict):
+        try:
+            filtered["response_contract"] = ResponseContract(**contract)
+        except Exception:
+            filtered["response_contract"] = None
+    return PromptState(**filtered)
+
+
+def save_checkpoint(
+        run_dir: str | Path,
+        step: int,
+        state: PromptState,
+        report: Dict[str, Any],
+        prompt_text: str,
+) -> None:
+    root = Path(run_dir)
+    step_dir = root / f"{step:03d}"
+    step_dir.mkdir(parents=True, exist_ok=True)
+    (step_dir / "state.json").write_text(
+        json.dumps(asdict(state), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (step_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (step_dir / "prompt.txt").write_text(prompt_text, encoding="utf-8")
+    latest_dir = root / "latest"
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    (latest_dir / "state.json").write_text(
+        json.dumps(asdict(state), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (latest_dir / "report.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (latest_dir / "prompt.txt").write_text(prompt_text, encoding="utf-8")
+
+
+def _load_latest_checkpoint(run_dir: str | Path) -> Optional[PromptState]:
+    latest_state = Path(run_dir) / "latest" / "state.json"
+    if not latest_state.exists():
+        return None
+    try:
+        payload = json.loads(latest_state.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            return _prompt_state_from_dict(payload)
+    except Exception:
+        return None
+    return None
+
+
+def optimize_prompt(
+        initial_state: PromptState,
+        run_once_fn,
+        reference: ReferenceSpec,
+        *,
+        llm_config: Optional[Dict[str, Any]] = None,
+        reference_texts: Optional[Sequence[Optional[str]]] = None,
+        max_steps: int = 5,
+        action_budget: Optional[int] = DEFAULT_ACTION_BUDGET,
+        max_constraints: int = DEFAULT_MAX_CONSTRAINTS,
+        schema_tighten_limit: int = DEFAULT_SCHEMA_TIGHTEN_LIMIT,
+        max_strictness: int = 5,
+        max_prompt_growth: float = DEFAULT_MAX_PROMPT_GROWTH,
+        max_no_improve_rounds: int = DEFAULT_NO_IMPROVE_ROUNDS,
+        checkpoint_dir: Optional[str | Path] = None,
+        resume_from_checkpoint: bool = False,
+        concurrency_manager: Optional[ConcurrencyManager] = None,
+        max_concurrency: Optional[int] = None,
+        variant_count: int = 1,
+        variants_fn: Optional[Callable[[PromptState], List[PromptState]]] = None,
+        beam_width: int = 1,
+        cache: Optional[Dict[Tuple[str, str], Any]] = None,
+        input_hash: str = "",
+        run_dir: Optional[str | Path] = None,
+        reference_hash: str = "",
+        cache_path: Optional[str | Path] = None,
+        retries: int = 3,
+        workflow_context: Optional[str] = None,
+) -> PromptState:
+    state = initial_state
+    if run_dir and not checkpoint_dir:
+        checkpoint_dir = run_dir
+    if checkpoint_dir and resume_from_checkpoint:
+        resumed = _load_latest_checkpoint(checkpoint_dir)
+        if resumed:
+            state = resumed
+    # Inject workflow_context as global constraint (consistent with optimize_from_runs)
+    if workflow_context:
+        constraint_lines = ["[WORKFLOW CONSTRAINT]"]
+        constraint_lines.append(workflow_context)
+        constraint_lines.append("The optimized prompt MUST align with the above workflow purpose.")
+        constraint_lines.append("[END WORKFLOW CONSTRAINT]")
+        workflow_constraint = "\n".join(constraint_lines)
+        # Remove any existing WORKFLOW CONSTRAINT before adding new one (handles checkpoint resume with changed context)
+        state.global_constraints = [
+            c for c in state.global_constraints
+            if not c.strip().startswith("[WORKFLOW CONSTRAINT]")
+        ]
+        state.global_constraints.insert(0, workflow_constraint)
+        logger.info(
+            "PromptState workflow_context injected as global constraint",
+            extra={
+                "workflow_context": workflow_context,
+                "constraint_preview": workflow_constraint[:200],
+            },
+        )
+    cm = concurrency_manager
+    if not cm and max_concurrency:
+        cm = ConcurrencyManager(max_concurrency)
+    cache_store = cache
+    cache_backend = None
+    if cache_path:
+        cache_backend = SqliteCache(cache_path)
+    elif checkpoint_dir:
+        cache_backend = SqliteCache(Path(checkpoint_dir) / "cache.sqlite")
+    cache_lock = threading.Lock()
+    best_state = copy.deepcopy(state)
+    best_score = float("-inf")
+    no_improve_rounds = 0
+    seen_hashes: Set[str] = set()
+    initial_prompt = _restore_response_contract(_render_prompt_state(state), state.response_contract)
+    initial_length = max(1, len(initial_prompt))
+    action_budget_value = action_budget if action_budget is not None else DEFAULT_ACTION_BUDGET
+    stage = OptimizationStage.FORMAT
+    stage_plateau = 0
+    beam_width = max(1, int(beam_width))
+    beam: List[Tuple[float, PromptState]] = [(0.0, state)]
+    try:
+        logger.info(
+            "PromptState optimize_prompt start",
+            extra={
+                "max_steps": max_steps,
+                "beam_width": beam_width,
+                "variant_count": variant_count,
+                "action_budget": action_budget_value,
+                "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir else None,
+                "resume_from_checkpoint": resume_from_checkpoint,
+                "max_concurrency": max_concurrency,
+            },
+        )
+    except Exception:
+        pass
+    run_root = Path(checkpoint_dir) if checkpoint_dir else None
+    timeline_path = None
+    if run_root:
+        run_root.mkdir(parents=True, exist_ok=True)
+        timeline_path = run_root / "timeline.csv"
+        if not timeline_path.exists():
+            timeline_path.write_text(
+                "step,stage,score,issue_count,action_count,concurrency\n",
+                encoding="utf-8",
+            )
+
+    def _run_once(prompt_text: str):
+        key = (prompt_hash(prompt_text), input_hash or reference_hash)
+        if cache_backend is not None:
+            with cache_lock:
+                cached = cache_backend.get(f"{key[0]}:{key[1]}")
+            if cached is not None:
+                return cached
+        if cache_store is not None:
+            with cache_lock:
+                if key in cache_store:
+                    return cache_store[key]
+
+        def _call(text: str):
+            with (cm.slot() if cm else nullcontext()):
+                return run_once_fn(text)
+
+        output = safe_run_once(_call, prompt_text, retries=retries)
+        if cache_backend is not None:
+            with cache_lock:
+                cache_backend.set(f"{key[0]}:{key[1]}", output)
+        if cache_store is not None:
+            with cache_lock:
+                cache_store[key] = output
+        return output
+
+    def _evaluate_state(candidate: PromptState):
+        prompt_text = _restore_response_contract(
+            _render_prompt_state(candidate),
+            candidate.response_contract,
+        )
+        output = _run_once(prompt_text)
+        issues, actions = _analyze_single_output(
+            output,
+            reference,
+            llm_config=llm_config,
+            reference_texts=reference_texts,
+            workflow_context=workflow_context,
+        )
+        score = score_report(issues=issues, actions=actions)
+        return candidate, prompt_text, issues, actions, score
+
+    stop_state: Optional[PromptState] = None
+    last_step = -1
+    for step in range(max_steps):
+        last_step = step
+        json_repair_needed = False
+        candidates: List[PromptState] = []
+        for _, base_state in beam:
+            if variants_fn:
+                variants = variants_fn(base_state)
+            else:
+                variants = generate_variants(base_state)
+            if variant_count > 0:
+                variants = variants[: max(1, variant_count)]
+            if not variants:
+                variants = [base_state]
+            candidates.extend(variants)
+        if not candidates:
+            candidates = [state]
+        results: List[Tuple[PromptState, str, List[DetectedIssue], List[PromptAction]]] = []
+        if len(candidates) <= 1:
+            cand, prompt_text, issues, actions, _ = _evaluate_state(candidates[0])
+            results.append((cand, prompt_text, issues, actions))
+        else:
+            max_workers = len(candidates)
+            if max_concurrency:
+                max_workers = min(max_workers, int(max_concurrency))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(_evaluate_state, cand) for cand in candidates]
+                for future in as_completed(futures):
+                    try:
+                        cand, prompt_text, issues, actions, _ = future.result()
+                        results.append((cand, prompt_text, issues, actions))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Variant evaluation failed", extra={"error": str(exc)})
+                        if "JSON" in str(exc):
+                            json_repair_needed = True
+        if not results:
+            if json_repair_needed:
+                repair_action = PromptAction(
+                    type="add_global_constraint",
+                    content="你必须输出严格合法的 JSON，不得输出任何额外文本",
+                )
+                state = apply_actions(
+                    state,
+                    [repair_action],
+                    action_budget=None,
+                    max_constraints=max_constraints,
+                    schema_tighten_limit=schema_tighten_limit,
+                    max_strictness=max_strictness,
+                    normalize=False,
+                )
+                state = clamp_state(state)
+                beam = [(0.0, state)]
+                continue
+            break
+        results_with_scores: List[Tuple[float, PromptState, str, List[DetectedIssue], List[PromptAction]]] = []
+        for cand, prompt_text, issues, actions in results:
+            normalized_actions = [normalize_action(action) for action in actions]
+            stage_actions = _filter_actions_for_stage(stage, normalized_actions)
+            merged_actions = dedupe_merge_actions(stage_actions)
+            limited_actions = limit_actions(merged_actions, k=action_budget_value)
+            score = score_report(issues=issues, actions=limited_actions)
+            results_with_scores.append((score, cand, prompt_text, issues, limited_actions))
+        results_with_scores.sort(key=lambda item: item[0], reverse=True)
+        score, candidate, prompt, issues, limited_actions = results_with_scores[0]
+        try:
+            logger.debug(
+                "PromptState step summary",
+                extra={
+                    "step": step,
+                    "stage": stage.name,
+                    "score": score,
+                    "issues": len(issues),
+                    "actions": len(limited_actions),
+                    "prompt_length": len(prompt),
+                    "no_improve_rounds": no_improve_rounds,
+                },
+            )
+        except Exception:
+            pass
+        has_format_issue = any(_issue_is_format_related(issue) for issue in issues)
+        if stage == OptimizationStage.FORMAT:
+            if not has_format_issue:
+                stage = OptimizationStage.RECALL
+                stage_plateau = 0
+                logger.info("enter stage: RECALL")
+        elif stage == OptimizationStage.RECALL:
+            if not has_format_issue:
+                stage_plateau += 1
+                if stage_plateau >= 2:
+                    stage = OptimizationStage.STRICT
+                    stage_plateau = 0
+                    logger.info("enter stage: STRICT")
+            else:
+                stage_plateau = 0
+        prompt_key = prompt_hash(prompt)
+        if prompt_key in seen_hashes:
+            logger.warning("Prompt optimization detected loop, rolling back to best state")
+            stop_state = best_state
+            break
+        seen_hashes.add(prompt_key)
+        if len(prompt) > int(initial_length * max_prompt_growth):
+            logger.warning("Prompt exceeded growth budget, rolling back to best state")
+            stop_state = best_state
+            break
+        if score > best_score:
+            best_score = score
+            best_state = copy.deepcopy(candidate)
+            no_improve_rounds = 0
+        else:
+            no_improve_rounds += 1
+        if not issues:
+            break
+        if not limited_actions:
+            break
+        if no_improve_rounds >= max_no_improve_rounds:
+            logger.warning("Prompt optimization plateaued, rolling back to best state")
+            stop_state = best_state
+            break
+        error_rate = min(1.0, len(issues) / max(1, len(reference.expected_outputs) or 1))
+        report_payload = {
+            "step": step,
+            "stage": stage.name,
+            "score": score,
+            "error_rate": error_rate,
+            "issues": _serialize_issues(issues),
+            "actions": _serialize_actions(limited_actions),
+        }
+        state = apply_actions(
+            candidate,
+            limited_actions,
+            action_budget=None,
+            max_constraints=max_constraints,
+            schema_tighten_limit=schema_tighten_limit,
+            max_strictness=max_strictness,
+            normalize=False,
+        )
+        state = clamp_state(state)
+        beam = [(score, state)]
+        if beam_width > 1:
+            beam_candidates: List[Tuple[float, PromptState]] = []
+            for cand_score, cand_state, _, cand_issues, cand_actions in results_with_scores:
+                next_state = cand_state
+                if cand_actions:
+                    next_state = apply_actions(
+                        copy.deepcopy(cand_state),
+                        cand_actions,
+                        action_budget=None,
+                        max_constraints=max_constraints,
+                        schema_tighten_limit=schema_tighten_limit,
+                        max_strictness=max_strictness,
+                        normalize=False,
+                    )
+                    next_state = clamp_state(next_state)
+                beam_candidates.append((cand_score, next_state))
+            beam_candidates.sort(key=lambda item: item[0], reverse=True)
+            beam = beam_candidates[:beam_width]
+        if checkpoint_dir:
+            save_checkpoint(checkpoint_dir, step, state, report_payload, prompt)
+        if timeline_path:
+            concurrency_value = getattr(cm, "limit", 1) if cm else 1
+            with timeline_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    f"{step},{stage.name},{score},{len(issues)},{len(limited_actions)},{concurrency_value}\n"
+                )
+        if cm and hasattr(cm, "set_limit"):
+            if error_rate > 0.3 and cm.limit > 1:
+                cm.set_limit(cm.limit - 1)
+                logger.warning("high error rate, reduce concurrency to %d", cm.limit)
+            elif error_rate < 0.05 and max_concurrency:
+                cm.set_limit(min(cm.limit + 1, int(max_concurrency)))
+    if stop_state:
+        state = stop_state
+    if run_root:
+        summary_path = run_root / "summary.md"
+        concurrency_value = getattr(cm, "limit", 1) if cm else 1
+        total_steps = last_step + 1 if last_step >= 0 else 0
+        summary_path.write_text(
+            "\n".join(
+                [
+                    "# Optimization Summary",
+                    "",
+                    f"- Final Stage: {stage.name}",
+                    f"- Best Score: {best_score}",
+                    f"- Total Steps: {total_steps}",
+                    f"- Final Concurrency: {concurrency_value}",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    return state
+
+
+def _parse_action_judge_output(raw: str) -> Tuple[str, List[Dict[str, Any]]]:
+    verdict = ""
+    actions: List[Dict[str, Any]] = []
+    parsed = _safe_json_from_text(raw)
+    if isinstance(parsed, dict):
+        verdict = str(parsed.get("verdict") or "").lower()
+        action_items = parsed.get("actions") or []
+        if isinstance(action_items, list):
+            actions = [item for item in action_items if isinstance(item, dict)]
+    if not verdict:
+        lower = raw.lower()
+        if "pass" in lower:
+            verdict = "pass"
+        elif "fail" in lower:
+            verdict = "fail"
+    return verdict or "fail", actions
 
 
 def _safe_rewrite_prompt(current: str, rewrite_fn) -> str:
@@ -1565,7 +3341,13 @@ class _LlmPromptJudge:
         self.model = cfg.get("model")
         self.api_key = cfg.get("api_key")
 
-    def needs_change(self, prompt_text: str, issues: Sequence[DetectedIssue], constraints: Sequence[str]) -> bool:
+    def needs_change(
+        self,
+        prompt_text: str,
+        issues: Sequence[DetectedIssue],
+        constraints: Sequence[str],
+        workflow_context: Optional[str] = None,
+    ) -> bool:
         if not self.url or not self.model:
             # default: if we have detected issues, assume change is needed
             return bool(issues)
@@ -1574,8 +3356,15 @@ class _LlmPromptJudge:
         guidance = [
             "You are a prompt reviewer. Answer with 'yes' or 'no' only.",
             "Determine if this prompt likely needs improvement based on the following issues and constraints.",
-            "Issues:",
         ]
+        if workflow_context:
+            guidance.append("")
+            guidance.append("[WORKFLOW CONTEXT]")
+            guidance.append(workflow_context)
+            guidance.append("The prompt should align with the above workflow purpose.")
+            guidance.append("[END WORKFLOW CONTEXT]")
+            guidance.append("")
+        guidance.append("Issues:")
         if issues:
             for it in issues:
                 guidance.append(f"- {it.kind}: {it.message}")
@@ -1740,6 +3529,8 @@ class _DspyPromptOptimizer:
                     "workflow_llm_model": model,
                     "iterations": self.max_iterations,
                     "max_samples": self.max_samples,
+                    "action_judge": True,
+                    "prompt_state_mode": _normalize_prompt_state_mode(cfg.get("dspy_prompt_state_mode", "off")),
                 },
             )
         except Exception:
@@ -1752,22 +3543,57 @@ class _DspyPromptOptimizer:
         samples: Sequence[ExecutionSample],
         reference_texts: Sequence[Optional[str]],
         constraints: Sequence[str],
+        workflow_context: Optional[str] = None,
     ) -> List[PromptPatch]:
         if not self.available or not prompts:
+            try:
+                logger.debug(
+                    "DSPy optimize_prompts skipped",
+                    extra={
+                        "workflow_id": workflow_id,
+                        "available": self.available,
+                        "prompts": len(prompts) if prompts else 0,
+                    },
+                )
+            except Exception:
+                pass
             return []
         optimizer_cm = _get_optimizer_concurrency_manager()
+
+        # Parse workflow context for injection
+        workflow_name, workflow_description = _parse_workflow_context(workflow_context)
 
         dataset = self._build_dataset(samples, reference_texts)
         if not dataset:
             return []
         patches: List[PromptPatch] = []
         max_workers = self._effective_workers(len(prompts))
+        try:
+            logger.info(
+                "DSPy optimizer concurrency",
+                extra={
+                    "workflow_id": workflow_id,
+                    "mode": "prompts",
+                    "total": len(prompts),
+                    "dataset_size": len(dataset),
+                    "max_workers": max_workers,
+                    "optimizer_limit": getattr(optimizer_cm, "limit", None) if optimizer_cm else None,
+                    "fallback_used": optimizer_cm is None,
+                    "action_judge": True,
+                    "prompt_state_mode": _normalize_prompt_state_mode(self.cfg.get("dspy_prompt_state_mode", "off")),
+                    "workflow_name": workflow_name,
+                    "workflow_description": workflow_description[:50] if workflow_description else None,
+                },
+            )
+        except Exception:
+            pass
 
         def _optimize_prompt(prompt: PromptLocation) -> Optional[PromptPatch]:
             # Avoid sharing ChainOfThought across threads
             predictor = self._dspy.ChainOfThought(self._predict_signature())  # type: ignore[attr-defined]
-            judge = self._dspy.ChainOfThought(self._judge_signature())  # type: ignore[attr-defined]
-            rewriter = self._dspy.ChainOfThought(self._rewrite_signature())  # type: ignore[attr-defined]
+            judge = self._dspy.ChainOfThought(self._judge_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
+            rewriter = self._dspy.ChainOfThought(self._rewrite_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
+            action_judge = self._dspy.ChainOfThought(self._action_judge_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
 
             improved = self._optimize_single(
                 prompt.text,
@@ -1776,7 +3602,8 @@ class _DspyPromptOptimizer:
                 predictor,
                 judge,
                 rewriter,
-                optimizer_cm,
+                optimizer_cm=optimizer_cm,
+                action_judge=action_judge,
             )
 
             if not improved or improved.strip() == prompt.text.strip():
@@ -1822,6 +3649,151 @@ class _DspyPromptOptimizer:
         prompt_order = {p.path: idx for idx, p in enumerate(prompts)}
         patches.sort(key=lambda p: prompt_order.get(p.field_path, 0))
 
+    def optimize_blocks(
+            self,
+            workflow_id: str,
+            blocks: Sequence[PromptBlock],
+            samples: Sequence[ExecutionSample],
+            reference_texts: Sequence[Optional[str]],
+            constraints: Sequence[str],
+            fail_signal: Optional[FailSignal] = None,
+            workflow_context: Optional[str] = None,
+    ) -> List[PromptPatch]:
+        if not self.available or not blocks:
+            try:
+                logger.debug(
+                    "DSPy optimize_blocks skipped",
+                    extra={
+                        "workflow_id": workflow_id,
+                        "available": self.available,
+                        "blocks": len(blocks) if blocks else 0,
+                    },
+                )
+            except Exception:
+                pass
+            return []
+        optimizer_cm = _get_optimizer_concurrency_manager()
+        dataset = self._build_dataset(samples, reference_texts)
+        if not dataset:
+            return []
+        max_workers = self._effective_workers(len(blocks))
+        patches: List[PromptPatch] = []
+        effective_signal = fail_signal or FailSignal()
+
+        # Parse workflow context for injection
+        workflow_name, workflow_description = _parse_workflow_context(workflow_context)
+
+        try:
+            logger.info(
+                "DSPy optimizer concurrency",
+                extra={
+                    "workflow_id": workflow_id,
+                    "mode": "blocks",
+                    "total": len(blocks),
+                    "dataset_size": len(dataset),
+                    "max_workers": max_workers,
+                    "optimizer_limit": getattr(optimizer_cm, "limit", None) if optimizer_cm else None,
+                    "fallback_used": optimizer_cm is None,
+                    "action_judge": True,
+                    "prompt_state_mode": _normalize_prompt_state_mode(self.cfg.get("dspy_prompt_state_mode", "off")),
+                    "workflow_name": workflow_name,
+                    "workflow_description": workflow_description[:50] if workflow_description else None,
+                },
+            )
+        except Exception:
+            pass
+        block_order = {block.node_id: idx for idx, block in enumerate(blocks)}
+        message_order: Dict[Tuple[str, str], int] = {}
+        for block in blocks:
+            for idx, msg in enumerate(block.messages):
+                key = (block.node_id, str(msg.get("path") or ""))
+                if key not in message_order:
+                    message_order[key] = idx
+
+        def _optimize_block(block: PromptBlock) -> List[PromptPatch]:
+            predictor = self._dspy.ChainOfThought(self._predict_signature())  # type: ignore[attr-defined]
+            judge = self._dspy.ChainOfThought(self._judge_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
+            rewriter = self._dspy.ChainOfThought(self._rewrite_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
+            action_judge = self._dspy.ChainOfThought(self._action_judge_signature(workflow_name, workflow_description))  # type: ignore[attr-defined]
+
+            context_text = _build_block_context(block, effective_signal, constraints)
+            placeholders_text = (
+                "; ".join(block.brief.placeholders) if block.brief and block.brief.placeholders else ""
+            )
+            improved = self._optimize_single(
+                block.merged_text,
+                dataset,
+                constraints,
+                predictor,
+                judge,
+                rewriter,
+                optimizer_cm=optimizer_cm,
+                context_text=context_text,
+                placeholders_text=placeholders_text,
+                action_judge=action_judge,
+                fail_signal=effective_signal,
+                workflow_name=workflow_name,
+                workflow_description=workflow_description,
+            )
+            if not improved or improved.strip() == block.merged_text.strip():
+                return []
+            if not _validate_block_rewrite(block, improved):
+                try:
+                    logger.warning(
+                        "DSPy block rewrite校验失败，保持原提示词",
+                        extra={"workflow_id": workflow_id, "node_id": block.node_id},
+                    )
+                except Exception:
+                    pass
+                return []
+            split_texts = _split_block_by_markers(block, improved)
+            if not split_texts:
+                return []
+            block_patches: List[PromptPatch] = []
+            for msg, new_text in zip(block.messages, split_texts):
+                if new_text is None:
+                    continue
+                old_text = str(msg.get("text") or "")
+                if new_text.strip() == old_text.strip():
+                    continue
+                block_patches.append(
+                    PromptPatch(
+                        workflow_id=workflow_id,
+                        node_id=block.node_id,
+                        field_path=msg.get("path", ""),
+                        old=old_text,
+                        new=new_text,
+                        rationale="DSPy optimizer updated prompt block with node context",
+                        confidence=0.75,
+                        evidence_runs=[record["run_index"] for record in dataset],
+                    )
+                )
+            return block_patches
+
+        if max_workers <= 1:
+            for block in blocks:
+                patches.extend(_optimize_block(block))
+            patches.sort(
+                key=lambda p: (
+                    block_order.get(p.node_id, 0),
+                    message_order.get((p.node_id, p.field_path), 0),
+                )
+            )
+            return patches
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(_optimize_block, block): block for block in blocks}
+
+            for future in as_completed(future_map):
+                block_patches = future.result()
+                if block_patches:
+                    patches.extend(block_patches)
+        patches.sort(
+            key=lambda p: (
+                block_order.get(p.node_id, 0),
+                message_order.get((p.node_id, p.field_path), 0),
+            )
+        )
         return patches
 
     def _build_dataset(
@@ -1873,109 +3845,1175 @@ class _DspyPromptOptimizer:
         # Fallback cap to avoid QPS spikes when no manager is configured
         return max(1, min(4, total))
 
-    def _optimize_single(
+    def _split_prompt_to_blocks(self, prompt: str) -> List[TextBlock]:
+        if not prompt:
+            return [TextBlock(block_id="b0", kind="other", text="")]
+        blocks: List[TextBlock] = []
+        parts = prompt.split("\n\n")
+        for i, part in enumerate(parts):
+            if not part.strip():
+                continue
+            kind = "instruction"
+            lower = part.lower()
+            if "输出" in part or "output" in lower:
+                kind = "output"
+            elif "示例" in part or "example" in lower:
+                kind = "example"
+            elif "必须" in part or "约束" in part:
+                kind = "constraint"
+            blocks.append(TextBlock(block_id=f"b{i}", kind=kind, text=part + "\n\n"))
+        return blocks or [TextBlock(block_id="b0", kind="other", text=prompt)]
+
+    def _merge_blocks(self, blocks: Sequence[TextBlock]) -> str:
+        return "".join(block.text for block in blocks)
+
+    def _select_block(self, blocks: Sequence[TextBlock], step: int = 0) -> TextBlock:
+        if not blocks:
+            return TextBlock(block_id="b0", kind="other", text="")
+        idx = step % len(blocks)
+        return blocks[idx]
+
+    def _apply_block_action(
+            self,
+            blocks: Sequence[TextBlock],
+            target_id: str,
+            action: Optional[Dict[str, Any]],
+    ) -> List[TextBlock]:
+        if not action:
+            return list(blocks)
+        content = action.get("content")
+        if content is None:
+            content = action.get("text")
+        if content is None:
+            return list(blocks)
+        updated: List[TextBlock] = []
+        for block in blocks:
+            if block.block_id == target_id:
+                new_text = str(content)
+                if block.text.endswith("\n\n") and not new_text.endswith("\n\n"):
+                    new_text = new_text.rstrip() + "\n\n"
+                updated.append(
+                    TextBlock(
+                        block_id=block.block_id,
+                        kind=block.kind,
+                        text=new_text,
+                    )
+                )
+            else:
+                updated.append(block)
+        return updated
+
+    def _mask_role_markers(self, text: str) -> Tuple[str, Dict[str, str]]:
+        token_map: Dict[str, str] = {}
+
+        def _replace(match: re.Match) -> str:
+            token = f"[[ROLE_MARKER_{len(token_map)}]]"
+            token_map[token] = match.group(0)
+            return token
+
+        masked = re.sub(r"</?ROLE::[^>]+::\d+>", _replace, text)
+        return masked, token_map
+
+    def _restore_role_markers(self, text: str, token_map: Dict[str, str]) -> str:
+        restored = text
+        for token, marker in token_map.items():
+            restored = restored.replace(token, marker)
+        return restored
+
+    def _markers_preserved(self, text: str, token_map: Dict[str, str]) -> bool:
+        return all(token in text for token in token_map)
+
+    def _build_block_context(
+            self,
+            all_blocks: Sequence[TextBlock],
+            target_block: TextBlock,
+            constraints: Sequence[str],
+            fail_signal: Optional[FailSignal],
+            failures: Optional[Sequence[str]] = None,
+            context_text: str = "",
+    ) -> str:
+        parts: List[str] = []
+        if all_blocks:
+            parts.append("Full prompt:")
+            parts.append(self._merge_blocks(all_blocks))
+        parts.append("")
+        parts.append(f"Target block ({target_block.block_id}, {target_block.kind}):")
+        parts.append(target_block.text)
+        if failures:
+            parts.append("")
+            parts.append("Judge feedback:")
+            parts.extend(f"- {item}" for item in failures)
+        if context_text:
+            parts.append("")
+            parts.append("Node context:")
+            parts.append(context_text)
+        if fail_signal:
+            parts.append("")
+            parts.append("Failure signals:")
+            parts.append(_format_fail_signal(fail_signal))
+        if constraints:
+            parts.append("")
+            parts.append("Constraints:")
+            parts.extend(f"- {item}" for item in constraints)
+        return "\n".join(part for part in parts if part is not None)
+
+    def _propose_block_action(
         self,
-        current_prompt: str,
+            target_block: TextBlock,
+            all_blocks: Sequence[TextBlock],
+            constraints: Sequence[str],
+            fail_signal: Optional[FailSignal],
         dataset: Sequence[Dict[str, Any]],
-        constraints: Sequence[str],
-        predictor,
-        judge,
         rewriter,
-        optimizer_cm=None,
+            *,
+            failures: Optional[Sequence[str]] = None,
+            placeholders_text: str = "",
+            context_text: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        if not target_block.text.strip():
+            return None
+        context = self._build_block_context(
+            all_blocks,
+            target_block,
+            constraints,
+            fail_signal,
+            failures=failures,
+            context_text=context_text,
+        )
+        reference = dataset[0]["reference"] if dataset else ""
+        placeholders = placeholders_text or "; ".join(_extract_placeholders(target_block.text))
+        feedback_text = "\n".join(f"- {item}" for item in failures) if failures else ""
+
+        masked_block, marker_map = self._mask_role_markers(target_block.text)
+
+        def _do_rewrite(masked_prompt: str) -> str:
+            response = self._rewrite_chain(
+                rewriter,
+                context=context,
+                instruction=masked_prompt,
+                reference=reference,
+                constraints=constraints,
+                placeholders=placeholders,
+                failures=feedback_text,
+            )
+            return response.get("rewritten_prompt") or response.get("output") or masked_prompt
+
+        rewritten_masked = _safe_rewrite_prompt(masked_block, _do_rewrite)
+        if marker_map and not self._markers_preserved(rewritten_masked, marker_map):
+            return None
+        rewritten = self._restore_role_markers(rewritten_masked, marker_map)
+        if rewritten.strip() == target_block.text.strip():
+            return None
+        return {"type": "rewrite", "content": rewritten}
+
+    def _judge_prompt(
+            self,
+            prompt_text: str,
+            dataset: Sequence[Dict[str, Any]],
+            predictor,
+            judge,
+    ) -> Tuple[float, List[str]]:
+        if not dataset:
+            return 0.0, ["Empty dataset"]
+        failures: List[str] = []
+        passes = 0
+        for record in dataset:
+            candidate = ""
+            try:
+                prediction = predictor(
+                    workflow_input=record["workflow_input"],
+                    prompt_template=prompt_text,
+                )
+                candidate = self._extract_prediction_output(prediction)
+            except Exception as exc:  # noqa: BLE001
+                fallback = _extract_lm_response_from_exception(exc)
+                if fallback:
+                    candidate = fallback
+                    try:
+                        logger.debug(
+                            "DSPy predictor解析失败，使用原始 LM 响应回退",
+                            extra={
+                                "workflow_input": record["workflow_input"][:200],
+                                "fallback_preview": candidate[:200],
+                            },
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        logger.warning(
+                            "DSPy predictor 执行失败",
+                            extra={
+                                "workflow_input": record["workflow_input"][:200],
+                                "error": str(exc),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    failures.append(f"DSPy predictor failed: {exc}")
+                    continue
+            if not candidate.strip():
+                failures.append("DSPy predictor returned empty response")
+                continue
+            try:
+                verdict = judge(
+                    reference=record["reference"],
+                    candidate=candidate,
+                )
+                verdict_raw = getattr(verdict, "verdict", None)
+                verdict_text = (verdict_raw or "").lower()
+                feedback = getattr(verdict, "feedback", "") or ""
+                soft_pass, soft_score = _is_reference_soft_satisfied(record["reference"], candidate)
+                if ("fail" in verdict_text or not verdict_text) and soft_pass:
+                    verdict_text = "pass"
+                    if not feedback:
+                        feedback = f"Soft-passed by similarity≈{soft_score:.2f} to reference"
+            except Exception as exc:  # noqa: BLE001
+                fallback_feedback = _extract_lm_response_from_exception(exc)
+                detail = fallback_feedback or str(exc)
+                try:
+                    logger.warning(
+                        "DSPy judge 执行失败，记为不通过",
+                        extra={
+                            "workflow_input": record["workflow_input"][:200],
+                            "error": str(exc),
+                            "fallback": detail[:200],
+                        },
+                    )
+                except Exception:
+                    pass
+                failures.append(f"DSPy judge failed: {detail}")
+                continue
+            if "fail" in verdict_text or not verdict_text:
+                failures.append(feedback or f"Mismatch against reference:\n{record['reference'][:400]}")
+                continue
+            passes += 1
+        score = passes / max(len(dataset), 1)
+        return score, failures
+
+    def _optimize_single(
+            self,
+            current_prompt: str,
+            dataset: Sequence[Dict[str, Any]],
+            constraints: Sequence[str],
+            predictor,
+            judge,
+            rewriter,
+            *,
+            optimizer_cm=None,
+            context_text: str = "",
+            placeholders_text: str = "",
+            action_judge=None,
+            fail_signal: Optional[FailSignal] = None,
+            workflow_name: Optional[str] = None,
+            workflow_description: Optional[str] = None,
     ) -> str:
         cm = optimizer_cm
 
         with (cm.slot() if cm else nullcontext()):
             prompt_text = current_prompt
-            for _ in range(max(1, self.max_iterations)):
-                failures: List[str] = []
-                for record in dataset:
-                    candidate = ""
-                    try:
-                        prediction = predictor(
-                            workflow_input=record["workflow_input"],
-                            prompt_template=prompt_text,
-                        )
-                        candidate = self._extract_prediction_output(prediction)
-                    except Exception as exc:  # noqa: BLE001
-                        fallback = _extract_lm_response_from_exception(exc)
-                        if fallback:
-                            candidate = fallback
+            prompt_text, response_contract = _extract_response_contract(prompt_text)
+
+            def _ensure_contract_placeholder(text: str) -> str:
+                if not response_contract:
+                    return text
+                if RESPONSE_CONTRACT_PLACEHOLDER in text:
+                    return text
+                placeholder = _render_response_contract_placeholder(response_contract)
+                if not text.strip():
+                    return placeholder
+                return f"{text}\n\n{placeholder}"
+
+            prompt_text = _ensure_contract_placeholder(prompt_text)
+            use_action_judge = action_judge is not None
+            state: Optional[PromptState] = _build_prompt_state(
+                prompt_text,
+                constraints,
+                placeholders_text,
+                mode="auto",
+            )
+            if state and state.response_contract and not response_contract:
+                response_contract = state.response_contract
+            if state and response_contract:
+                state.response_contract = response_contract
+                if "response_contract" not in state.protected_slots:
+                    state.protected_slots.append("response_contract")
+                state.schema_frozen = True
+            if not state or not state.structured:
+                state = None
+            if state:
+                prompt_text = _render_prompt_state(state, context_text=context_text)
+                prompt_text = _ensure_contract_placeholder(prompt_text)
+
+            judge_cache: Dict[Tuple[str, int], Dict[str, Any]] = {}
+            prediction_cache: Dict[Tuple[str, int], str] = {}
+            dataset_by_run = {int(record.get("run_index", idx)): record for idx, record in enumerate(dataset)}
+            record_index_map = {id(record): run_id for run_id, record in dataset_by_run.items()}
+
+            def _evaluate_prompt(
+                    candidate_prompt: str,
+                    eval_records: Optional[Sequence[Dict[str, Any]]] = None,
+            ) -> Tuple[float, List[str], List[int]]:
+                """
+                返回 (score, failures)
+                score：0~1 的通过率（含 soft-pass），用于比较是否改进
+                failures：用于 fallback rewrite 的反馈
+                """
+                local_failures: List[str] = []
+                failed_runs: List[int] = []
+                passed = 0
+                total = 0
+                records = eval_records if eval_records is not None else dataset
+                eval_prompt = _restore_response_contract(candidate_prompt, response_contract)
+                prompt_hash = hashlib.sha256(eval_prompt.encode("utf-8")).hexdigest()
+
+                for record in records:
+                    run_index = int(
+                        record.get("run_index", record_index_map.get(id(record), total))
+                    )
+                    total += 1
+                    cache_key = (prompt_hash, run_index)
+                    cached = judge_cache.get(cache_key)
+                    if cached:
+                        if cached.get("predictor_failed"):
+                            local_failures.append(cached["predictor_failed"])
+                            failed_runs.append(run_index)
+                            continue
+                        if cached.get("candidate_empty"):
+                            local_failures.append("DSPy predictor returned empty response")
+                            failed_runs.append(run_index)
+                            continue
+                        verdict_text = cached.get("verdict_text", "")
+                        feedback = cached.get("feedback", "")
+                    else:
+                        candidate = prediction_cache.get(cache_key)
+                        if candidate is None:
+                            try:
+                                prediction = predictor(
+                                    workflow_input=record["workflow_input"],
+                                    prompt_template=eval_prompt,
+                                )
+                                candidate = self._extract_prediction_output(prediction)
+                            except Exception as exc:  # noqa: BLE001
+                                fallback = _extract_lm_response_from_exception(exc)
+                                message = f"DSPy predictor failed: {fallback or str(exc)}"
+                                local_failures.append(message)
+                                failed_runs.append(run_index)
+                                judge_cache[cache_key] = {"predictor_failed": message}
+                                continue
+                            prediction_cache[cache_key] = candidate
+
+                        if not candidate.strip():
+                            local_failures.append("DSPy predictor returned empty response")
+                            failed_runs.append(run_index)
+                            judge_cache[cache_key] = {"candidate_empty": True}
+                            continue
+
+                        if response_contract:
+                            contract_error = _validate_response_contract(response_contract, candidate)
+                            if contract_error:
+                                local_failures.append(contract_error)
+                                failed_runs.append(run_index)
+                                judge_cache[cache_key] = {
+                                    "candidate": candidate,
+                                    "verdict_text": "fail",
+                                    "feedback": contract_error,
+                                }
+                                continue
+
+                        try:
+                            verdict = judge(reference=record["reference"], candidate=candidate)
+                            verdict_raw = getattr(verdict, "verdict", None)
+                            verdict_text = (verdict_raw or "").lower()
+                            feedback = getattr(verdict, "feedback", "") or ""
+                            soft_pass, soft_score = _is_reference_soft_satisfied(record["reference"], candidate)
+                            if ("fail" in verdict_text or not verdict_text) and soft_pass:
+                                verdict_text = "pass"
+                                if not feedback:
+                                    feedback = f"Soft-passed by similarity≈{soft_score:.2f} to reference"
+                        except Exception as exc:  # noqa: BLE001
+                            fallback_feedback = _extract_lm_response_from_exception(exc)
+                            local_failures.append(f"DSPy judge failed: {fallback_feedback or str(exc)}")
+                            failed_runs.append(run_index)
+                            judge_cache[cache_key] = {
+                                "candidate": candidate,
+                                "verdict_text": "",
+                                "feedback": fallback_feedback or str(exc),
+                            }
+                            continue
+                        judge_cache[cache_key] = {
+                            "candidate": candidate,
+                            "verdict_text": verdict_text,
+                            "feedback": feedback,
+                        }
+
+                    if "fail" in verdict_text or not verdict_text:
+                        local_failures.append(feedback or f"Mismatch against reference:\n{record['reference'][:400]}")
+                        failed_runs.append(run_index)
+                    else:
+                        passed += 1
+
+                score = (passed / total) if total else 0.0
+                return score, local_failures, failed_runs
+
+            score_margin = 0.02
+            slot_stats: Dict[str, Dict[str, int]] = {}
+            no_improve_rounds = 0
+            same_failure_rounds = 0
+            prev_failure_signature = ""
+            prev_fail_count = 0
+
+            def _failure_signature(failures: Sequence[str]) -> str:
+                if not failures:
+                    return ""
+                keys: Set[str] = set()
+                for item in failures:
+                    normalized = " ".join(str(item).split())
+                    key = hashlib.sha256(normalized[:80].encode("utf-8")).hexdigest()[:8]
+                    keys.add(key)
+                return "|".join(sorted(keys))
+
+            def _failure_count(failures: Sequence[str], failed_runs: Sequence[int]) -> int:
+                return len(failed_runs) if failed_runs else len(failures)
+
+            def _summarize_action(payload: Any, limit: int = 200) -> str:
+                if payload is None:
+                    return ""
+                try:
+                    text = _json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                except Exception:
+                    text = str(payload)
+                if len(text) > limit:
+                    return f"{text[:limit]}..."
+                return text
+
+            def _failure_key(failures: Sequence[str]) -> str:
+                if not failures:
+                    return ""
+                return str(failures[0])[:120]
+
+            def _slot_key_for_action(action: Dict[str, Any]) -> str:
+                action_type = str(action.get("type") or action.get("action") or "").strip().lower()
+                mapping = {
+                    "add_global_constraint": "global_constraints",
+                    "add_constraint": "global_constraints",
+                    "add_checkpoint_rule": "checkpoint_rules",
+                    "modify_checkpoint_rule": "checkpoint_rules",
+                    "tighten_schema": "response_contract",
+                    "increase_strictness": "strictness_level",
+                    "add_negative_example": "negative_examples",
+                    "rewrite": "base_prompt",
+                }
+                return mapping.get(action_type, action_type or "unknown")
+
+            def _slot_stats_for(slot_key: str) -> Dict[str, int]:
+                if slot_key not in slot_stats:
+                    slot_stats[slot_key] = {
+                        "consecutive_no_gain": 0,
+                        "accepted_count": 0,
+                        "frozen_until_iter": -1,
+                    }
+                return slot_stats[slot_key]
+
+            def _is_slot_frozen(slot_key: str, current_step: int) -> bool:
+                stats = _slot_stats_for(slot_key)
+                return stats.get("frozen_until_iter", -1) > current_step
+
+            def _build_eval_records(
+                    failed_runs: Sequence[int],
+                    *,
+                    use_subset: bool = True,
+            ) -> Optional[List[Dict[str, Any]]]:
+                if not failed_runs or not use_subset:
+                    return None
+                eval_records = [dataset_by_run[run_id] for run_id in failed_runs if run_id in dataset_by_run]
+                if len(eval_records) >= 3:
+                    return eval_records
+                pass_ids = [run_id for run_id in dataset_by_run if run_id not in set(failed_runs)]
+                if not pass_ids:
+                    return eval_records
+                extra_count = min(3, len(pass_ids))
+                if extra_count >= 2:
+                    extra_ids = random.sample(pass_ids, k=extra_count)
+                    eval_records.extend(
+                        dataset_by_run[run_id] for run_id in extra_ids if run_id in dataset_by_run
+                    )
+                return eval_records
+
+            def _is_improved(
+                    trial_score: float,
+                    trial_failed_runs: Sequence[int],
+                    base_score: float,
+                    base_failed_runs: Sequence[int],
+                    eval_total: Optional[int] = None,
+            ) -> bool:
+                fail_improved = (
+                        base_failed_runs
+                        and len(trial_failed_runs) <= max(0, len(base_failed_runs) - 1)
+                )
+                margin = score_margin
+                if eval_total is not None and eval_total <= 3:
+                    margin = min(margin, 0.01)
+                if fail_improved:
+                    return True
+                score_improved = trial_score >= base_score + margin
+                return score_improved
+
+            freeze_fail_threshold = 3
+            freeze_stale_rounds = 3
+
+            def _init_block_stats(
+                    blocks: Sequence[TextBlock],
+                    prior: Optional[Dict[str, Dict[str, Any]]] = None,
+                    reset: bool = False,
+            ) -> Dict[str, Dict[str, Any]]:
+                stats: Dict[str, Dict[str, Any]] = {}
+                for block in blocks:
+                    prev = None if reset else (prior or {}).get(block.block_id)
+                    default_frozen = block.kind == "output"
+                    stats[block.block_id] = {
+                        "fail_count": prev.get("fail_count", 0) if prev else 0,
+                        "success_count": prev.get("success_count", 0) if prev else 0,
+                        "last_improved_iter": prev.get("last_improved_iter", -1) if prev else -1,
+                        "frozen": default_frozen or (prev.get("frozen", False) if prev else False),
+                    }
+                return stats
+
+            def _refresh_freeze_flags(current_step: int) -> None:
+                for stats in block_stats.values():
+                    if stats.get("frozen"):
+                        continue
+                    if stats.get("fail_count", 0) >= freeze_fail_threshold:
+                        stats["frozen"] = True
+                        continue
+                    last_improved = stats.get("last_improved_iter", -1)
+                    if last_improved >= 0 and current_step - last_improved >= freeze_stale_rounds:
+                        stats["frozen"] = True
+
+            def _select_block_with_stats(current_step: int) -> Optional[TextBlock]:
+                _refresh_freeze_flags(current_step)
+                candidates = [
+                    b for b in best_blocks if not block_stats.get(b.block_id, {}).get("frozen", False)
+                ]
+                if not candidates:
+                    return None
+                scored: List[Tuple[float, TextBlock]] = []
+                for block in candidates:
+                    stats = block_stats[block.block_id]
+                    recent_success = stats.get("last_improved_iter", -1) == current_step - 1
+                    recent_fail = stats.get("fail_count", 0) > 0 and not recent_success
+                    block_weight = 1.0
+                    priority = (2.0 if recent_success else -1.0 if recent_fail else 0.0) * block_weight
+                    scored.append((priority, block))
+                max_priority = max(score for score, _ in scored)
+                top_blocks = [block for score, block in scored if score == max_priority]
+                return top_blocks[current_step % len(top_blocks)]
+
+            text_blocks = self._split_prompt_to_blocks(prompt_text)
+            if not text_blocks:
+                text_blocks = [TextBlock(block_id="b0", kind="other", text=prompt_text)]
+
+            best_blocks = text_blocks
+            best_prompt = self._merge_blocks(best_blocks)
+            best_prompt = _ensure_contract_placeholder(best_prompt)
+            best_score, best_failures, best_failed_runs = _evaluate_prompt(best_prompt)
+            prev_failure_signature = _failure_signature(best_failures)
+            prev_fail_count = _failure_count(best_failures, best_failed_runs)
+            same_failure_rounds = 1
+            block_stats = _init_block_stats(best_blocks)
+
+            for step in range(max(1, self.max_iterations)):
+                if best_score >= 1.0:
+                    break
+                step_improved = False
+                if use_action_judge and state:
+                    action_prompt = _restore_response_contract(prompt_text, response_contract)
+                    actions_to_apply: List[Dict[str, Any]] = []
+                    for record in dataset:
+                        candidate = ""
+                        try:
+                            prediction = predictor(
+                                workflow_input=record["workflow_input"],
+                                prompt_template=action_prompt,
+                            )
+                            candidate = self._extract_prediction_output(prediction)
+                        except Exception as exc:  # noqa: BLE001
+                            fallback = _extract_lm_response_from_exception(exc)
+                            candidate = fallback or ""
+                            continue
+                        if not candidate.strip():
+                            continue
+                        try:
+                            action_resp = action_judge(
+                                reference=record["reference"],
+                                candidate=candidate,
+                                prompt_state=_serialize_prompt_state(state),
+                            )
+                            verdict_raw = _coerce_text(getattr(action_resp, "verdict", "") or "")
+                            actions_raw = _coerce_text(
+                                getattr(action_resp, "actions_json", "") or getattr(action_resp, "actions", "") or ""
+                            )
+                            verdict_text = verdict_raw.lower().strip()
+                            actions: List[Dict[str, Any]] = []
+                            if actions_raw:
+                                parsed_actions = _safe_json_from_text(actions_raw)
+                                if isinstance(parsed_actions, list):
+                                    actions = [item for item in parsed_actions if isinstance(item, dict)]
+                                elif isinstance(parsed_actions, dict):
+                                    actions = [parsed_actions]
+                            if not verdict_text or not actions:
+                                payload_raw = _coerce_text(action_resp)
+                                verdict_text, actions = _parse_action_judge_output(payload_raw)
+                            if verdict_text != "pass" and actions:
+                                actions_to_apply.extend(actions)
+                        except Exception:
+                            continue
+                    if actions_to_apply:
+                        base_score, base_failures, base_failed_runs = _evaluate_prompt(prompt_text)
+                        use_subset = len(dataset) >= 8 or len(actions_to_apply) >= 5
+                        eval_records = _build_eval_records(base_failed_runs, use_subset=use_subset)
+                        base_compare_score = base_score
+                        base_compare_failed_runs = base_failed_runs
+                        if eval_records:
+                            base_compare_score, _, base_compare_failed_runs = _evaluate_prompt(
+                                prompt_text,
+                                eval_records=eval_records,
+                            )
+                        eval_total = len(eval_records) if eval_records else len(dataset)
+                        base_fail_count = _failure_count(base_failures, base_failed_runs)
+                        eval_scope = "subset" if eval_records else "full"
+
+                        uniq_actions: List[Dict[str, Any]] = []
+                        seen = set()
+                        for action in actions_to_apply:
+                            try:
+                                key = _json.dumps(action, ensure_ascii=False, sort_keys=True)
+                            except Exception:
+                                key = str(action)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            uniq_actions.append(action)
+
+                        improved = False
+                        best_action_score = base_compare_score
+                        best_state = state
+                        best_action_failed_runs = base_compare_failed_runs
+                        slot_tried: Set[str] = set()
+                        slot_accepted: Set[str] = set()
+
+                        for action in uniq_actions:
+                            slot_key = _slot_key_for_action(action)
+                            if _is_slot_frozen(slot_key, step):
+                                continue
+                            slot_tried.add(slot_key)
+                            trial_state = deepcopy(best_state)
+                            trial_state = _apply_prompt_actions(trial_state, [action])
+                            trial_prompt = _render_prompt_state(trial_state, context_text=context_text)
+                            trial_prompt = _ensure_contract_placeholder(trial_prompt)
+
+                            trial_score, trial_failures, trial_failed_runs = _evaluate_prompt(
+                                trial_prompt,
+                                eval_records=eval_records,
+                            )
+                            trial_fail_count = _failure_count(trial_failures, trial_failed_runs)
+                            accepted = _is_improved(
+                                trial_score,
+                                trial_failed_runs,
+                                best_action_score,
+                                best_action_failed_runs,
+                                eval_total=eval_total,
+                            )
+                            if accepted:
+                                best_action_score = trial_score
+                                best_action_failed_runs = trial_failed_runs
+                                best_state = trial_state
+                                improved = True
+                                slot_accepted.add(slot_key)
                             try:
                                 logger.debug(
-                                    "DSPy predictor解析失败，使用原始 LM 响应回退",
+                                    "DSPy action_judge trial",
                                     extra={
-                                        "workflow_input": record["workflow_input"][:200],
-                                        "fallback_preview": candidate[:200],
+                                        "slot_name": slot_key,
+                                        "base_score": base_score,
+                                        "base_fail_cnt": base_fail_count,
+                                        "trial_score": trial_score,
+                                        "trial_fail_cnt": trial_fail_count,
+                                        "eval_scope": eval_scope,
+                                        "accepted": accepted,
+                                        "action_json": _summarize_action(action),
+                                        "failure_key": _failure_key(trial_failures or base_failures),
                                     },
                                 )
                             except Exception:
                                 pass
-                        else:
-                            try:
-                                logger.warning(
-                                    "DSPy predictor 执行失败",
-                                    extra={
-                                        "workflow_input": record["workflow_input"][:200],
-                                        "error": str(exc),
-                                    },
-                                )
-                            except Exception:
-                                pass
-                            failures.append(f"DSPy predictor failed: {exc}")
+
+                        for slot_key in slot_tried:
+                            stats = _slot_stats_for(slot_key)
+                            if slot_key in slot_accepted:
+                                stats["accepted_count"] = stats.get("accepted_count", 0) + 1
+                                stats["consecutive_no_gain"] = 0
+                                stats["frozen_until_iter"] = -1
+                            else:
+                                stats["consecutive_no_gain"] = stats.get("consecutive_no_gain", 0) + 1
+                                if stats.get("accepted_count", 0) > 0 and stats["consecutive_no_gain"] >= 2:
+                                    stats["frozen_until_iter"] = step + 1
+                                elif stats.get("accepted_count", 0) == 0 and stats["consecutive_no_gain"] >= 3:
+                                    stats["frozen_until_iter"] = step + 2
+
+                        if improved:
+                            state = best_state
+                            prompt_text = _render_prompt_state(state, context_text=context_text)
+                            prompt_text = _ensure_contract_placeholder(prompt_text)
+                            text_blocks = self._split_prompt_to_blocks(prompt_text)
+                            if not text_blocks:
+                                text_blocks = [TextBlock(block_id="b0", kind="other", text=prompt_text)]
+                            best_blocks = text_blocks
+                            block_stats = _init_block_stats(best_blocks, block_stats)
+                            best_prompt = self._merge_blocks(best_blocks)
+                            best_prompt = _ensure_contract_placeholder(best_prompt)
+                            best_score, best_failures, best_failed_runs = _evaluate_prompt(best_prompt)
+                            no_improve_rounds = 0
+                            same_failure_rounds = 0
+                            prev_failure_signature = _failure_signature(best_failures)
+                            prev_fail_count = _failure_count(best_failures, best_failed_runs)
+                            step_improved = True
                             continue
-                    if not candidate.strip():
-                        failures.append("DSPy predictor returned empty response")
-                        continue
-                    try:
-                        verdict = judge(
-                            reference=record["reference"],
-                            candidate=candidate,
-                        )
-                        verdict_raw = getattr(verdict, "verdict", None)
-                        verdict_text = (verdict_raw or "").lower()
-                        feedback = getattr(verdict, "feedback", "") or ""
-                        soft_pass, soft_score = _is_reference_soft_satisfied(record["reference"], candidate)
-                        if ("fail" in verdict_text or not verdict_text) and soft_pass:
-                            verdict_text = "pass"
-                            if not feedback:
-                                feedback = f"Soft-passed by similarity≈{soft_score:.2f} to reference"
-                    except Exception as exc:  # noqa: BLE001
-                        fallback_feedback = _extract_lm_response_from_exception(exc)
-                        detail = fallback_feedback or str(exc)
-                        try:
-                            logger.warning(
-                                "DSPy judge 执行失败，记为不通过",
-                                extra={
-                                    "workflow_input": record["workflow_input"][:200],
-                                    "error": str(exc),
-                                    "fallback": detail[:200],
-                                },
-                            )
-                        except Exception:
-                            pass
-                        failures.append(f"DSPy judge failed: {detail}")
-                        continue
-                    if "fail" in verdict_text or not verdict_text:
-                        failures.append(feedback or f"Mismatch against reference:\n{record['reference'][:400]}")
-                if not failures:
+
+                        best_failures.extend(base_failures)
+                target = _select_block_with_stats(step)
+                if not target:
                     break
-                feedback_text = "\n".join(f"- {item}" for item in failures)
+                action = self._propose_block_action(
+                    target_block=target,
+                    all_blocks=best_blocks,
+                    constraints=constraints,
+                    fail_signal=fail_signal,
+                    dataset=dataset,
+                    rewriter=rewriter,
+                    failures=best_failures,
+                    placeholders_text=placeholders_text,
+                    context_text=context_text,
+                )
+                if not action:
+                    stats = block_stats.get(target.block_id)
+                    if stats is not None:
+                        stats["fail_count"] = stats.get("fail_count", 0) + 1
+                    _refresh_freeze_flags(step)
+                    continue
+                candidate_blocks = self._apply_block_action(best_blocks, target.block_id, action)
+                candidate_prompt = self._merge_blocks(candidate_blocks)
+                candidate_prompt = _ensure_contract_placeholder(candidate_prompt)
+                prior_best_score = best_score
+                prior_best_fail_count = _failure_count(best_failures, best_failed_runs)
+                eval_records = None
+                base_subset_score = None
+                base_subset_failed_runs: List[int] = []
+                if best_failed_runs:
+                    use_subset = len(dataset) >= 8
+                    eval_records = _build_eval_records(best_failed_runs, use_subset=use_subset)
+                    if eval_records:
+                        base_subset_score, _, base_subset_failed_runs = _evaluate_prompt(
+                            prompt_text,
+                            eval_records=eval_records,
+                        )
+                trial_score_for_log = None
+                if eval_records and base_subset_score is not None:
+                    trial_subset_score, trial_subset_failures, trial_subset_failed_runs = _evaluate_prompt(
+                        candidate_prompt,
+                        eval_records=eval_records,
+                    )
+                    trial_score_for_log = trial_subset_score
+                    if not _is_improved(
+                            trial_subset_score,
+                            trial_subset_failed_runs,
+                            base_subset_score,
+                            base_subset_failed_runs,
+                            eval_total=len(eval_records),
+                    ):
+                        score = prior_best_score
+                        failures = trial_subset_failures
+                        failed_runs = best_failed_runs
+                    else:
+                        score, failures, failed_runs = _evaluate_prompt(candidate_prompt)
+                        trial_score_for_log = score
+                else:
+                    score, failures, failed_runs = _evaluate_prompt(candidate_prompt)
+                    trial_score_for_log = score
+                trial_fail_count = _failure_count(failures, failed_runs)
+                if _is_improved(score, failed_runs, best_score, best_failed_runs, eval_total=len(dataset)):
+                    best_score = score
+                    best_blocks = candidate_blocks
+                    best_failures = failures
+                    best_failed_runs = failed_runs
+                    prompt_text = candidate_prompt
+                    stats = block_stats.get(target.block_id)
+                    if stats is not None:
+                        stats["success_count"] = stats.get("success_count", 0) + 1
+                        stats["fail_count"] = 0
+                        stats["last_improved_iter"] = step
+                        stats["frozen"] = False
+                    if use_action_judge:
+                        state = _build_prompt_state(
+                            prompt_text,
+                            constraints,
+                            placeholders_text,
+                            mode="auto",
+                        )
+                        if state and response_contract:
+                            state.response_contract = response_contract
+                            if "response_contract" not in state.protected_slots:
+                                state.protected_slots.append("response_contract")
+                            state.schema_frozen = True
+                        if not state or not state.structured:
+                            state = None
+                    step_improved = True
+                    no_improve_rounds = 0
+                    same_failure_rounds = 0
+                    prev_failure_signature = _failure_signature(best_failures)
+                    prev_fail_count = _failure_count(best_failures, best_failed_runs)
+                    try:
+                        logger.debug(
+                            "DSPy block action accepted",
+                            extra={
+                                "block_id": target.block_id,
+                                "base_score": prior_best_score,
+                                "base_fail_cnt": prior_best_fail_count,
+                                "trial_score": trial_score_for_log,
+                                "trial_fail_cnt": trial_fail_count,
+                                "accepted": True,
+                            },
+                        )
+                    except Exception:
+                        pass
+                else:
+                    stats = block_stats.get(target.block_id)
+                    if stats is not None:
+                        stats["fail_count"] = stats.get("fail_count", 0) + 1
+                    _refresh_freeze_flags(step)
+                    try:
+                        action_preview = action.get("content") if isinstance(action, dict) else ""
+                        if action_preview:
+                            action_preview = str(action_preview)[:120]
+                        logger.debug(
+                            "DSPy block action rejected",
+                            extra={
+                                "block_id": target.block_id,
+                                "base_score": prior_best_score,
+                                "base_fail_cnt": prior_best_fail_count,
+                                "trial_score": trial_score_for_log,
+                                "trial_fail_cnt": trial_fail_count,
+                                "accepted": False,
+                                "action_preview": action_preview,
+                                "failure_key": _failure_key(failures),
+                            },
+                        )
+                    except Exception:
+                        pass
+                if step_improved:
+                    continue
+                if not best_failures:
+                    break
+                no_improve_rounds += 1
+                failure_sig = _failure_signature(best_failures)
+                fail_count = _failure_count(best_failures, best_failed_runs)
+                if failure_sig == prev_failure_signature:
+                    same_failure_rounds += 1
+                else:
+                    same_failure_rounds = 1
+                    prev_failure_signature = failure_sig
+                prev_fail_count_snapshot = prev_fail_count
+                prev_fail_count = fail_count
+                failure_text = " ".join(best_failures).lower()
+                rewrite_keywords = [
+                    "json",
+                    "schema",
+                    "format",
+                    "missing required",
+                    "invalid",
+                    "mismatch",
+                ]
+                structural_issue = any(keyword in failure_text for keyword in rewrite_keywords)
+                stable_failures = (
+                        fail_count >= 3
+                        and no_improve_rounds >= 2
+                        and fail_count >= prev_fail_count_snapshot
+                )
+                state_unstructured = not state or not state.structured
+                should_rewrite = state_unstructured or structural_issue or stable_failures
+                if (no_improve_rounds >= 2 or same_failure_rounds >= 2) and not should_rewrite:
+                    break
+                if not should_rewrite:
+                    break
+                feedback_text = "\n".join(f"- {item}" for item in best_failures)
+
+                workflow_context = ""
+                if workflow_name:
+                    workflow_context += f"Workflow Name: {workflow_name}\n"
+                if workflow_description:
+                    workflow_context += f"Workflow Description: {workflow_description}\n"
+
+                placeholders = _extract_placeholders(prompt_text)
+                old_state_for_rewrite = state
+                if old_state_for_rewrite is None:
+                    candidate_state = _build_prompt_state(
+                        prompt_text,
+                        constraints,
+                        placeholders_text,
+                        mode="auto",
+                    )
+                    if candidate_state and response_contract:
+                        candidate_state.response_contract = response_contract
+                        if "response_contract" not in candidate_state.protected_slots:
+                            candidate_state.protected_slots.append("response_contract")
+                        candidate_state.schema_frozen = True
+                    if candidate_state and candidate_state.structured:
+                        old_state_for_rewrite = candidate_state
+                slot_texts: Dict[str, str] = {}
+                if old_state_for_rewrite and old_state_for_rewrite.structured:
+                    if old_state_for_rewrite.base_prompt:
+                        slot_texts["base_prompt"] = old_state_for_rewrite.base_prompt
+                    if old_state_for_rewrite.role:
+                        slot_texts["role"] = old_state_for_rewrite.role
+                    if old_state_for_rewrite.task:
+                        slot_texts["task"] = old_state_for_rewrite.task
+                    if old_state_for_rewrite.global_constraints:
+                        slot_texts["global_constraints"] = "\n".join(
+                            f"- {c}" for c in old_state_for_rewrite.global_constraints
+                        )
+                    if old_state_for_rewrite.checkpoint_rules:
+                        slot_texts["checkpoint_rules"] = "\n".join(
+                            f"- {k}: {v}" for k, v in old_state_for_rewrite.checkpoint_rules.items()
+                        )
+                    if old_state_for_rewrite.negative_examples:
+                        slot_texts["negative_examples"] = "\n".join(
+                            f"- Wrong: {ex.get('bad_output') or ex.get('bad') or ''}".strip()
+                            for ex in old_state_for_rewrite.negative_examples
+                        )
+                    slot_texts["strictness_level"] = str(old_state_for_rewrite.strictness_level)
+                    if old_state_for_rewrite.response_contract:
+                        slot_texts["response_contract"] = _render_response_contract(
+                            old_state_for_rewrite.response_contract
+                        )
+                locked_sections: List[str] = []
+                if old_state_for_rewrite and old_state_for_rewrite.response_contract:
+                    if old_state_for_rewrite.response_contract.schema:
+                        locked_sections.append(old_state_for_rewrite.response_contract.schema)
+                locked_scope_text = ""
+                if locked_sections:
+                    locked_payload = "\n\n".join(locked_sections)
+                    locked_scope_text = (
+                        "STRICT RULE:\n"
+                        "The following sections define the REQUIRED OUTPUT FORMAT.\n"
+                        "They are SYSTEM-LOCKED and MUST NOT be modified.\n\n"
+                        "[LOCKED SECTIONS]\n"
+                        f"{locked_payload}\n"
+                        "[END LOCKED SECTIONS]"
+                    )
+                allowed_blocks = [
+                    block for block in best_blocks if not block_stats.get(block.block_id, {}).get("frozen", False)
+                ]
+                protected_blocks = [
+                    block for block in best_blocks if block_stats.get(block.block_id, {}).get("frozen", False)
+                ]
+                if not allowed_blocks and protected_blocks:
+                    break
+                protected_slots = set(old_state_for_rewrite.protected_slots or []) if old_state_for_rewrite else set()
+                frozen_slots = {
+                    slot_key
+                    for slot_key, stats in slot_stats.items()
+                    if stats.get("frozen_until_iter", -1) > step
+                }
+                if response_contract:
+                    protected_slots.add("response_contract")
+                slot_scope_lines: List[str] = []
+                if slot_texts and (protected_slots or frozen_slots):
+                    slot_scope_lines.append("[SLOT SCOPE]")
+                    if protected_slots:
+                        slot_scope_lines.append("PROTECTED_SLOTS (do NOT modify):")
+                        for slot_key in sorted(protected_slots):
+                            slot_scope_lines.append(f"- {slot_key}:")
+                            slot_scope_lines.append(slot_texts.get(slot_key, "<empty>"))
+                    if frozen_slots:
+                        slot_scope_lines.append("FROZEN_SLOTS (do NOT modify this round):")
+                        for slot_key in sorted(frozen_slots):
+                            slot_scope_lines.append(f"- {slot_key}:")
+                            slot_scope_lines.append(slot_texts.get(slot_key, "<empty>"))
+                    allowed_slots = [
+                        key for key in slot_texts.keys() if key not in protected_slots and key not in frozen_slots
+                    ]
+                    if allowed_slots:
+                        slot_scope_lines.append("ALLOWED_SLOTS (only these may be modified):")
+                        slot_scope_lines.append(", ".join(sorted(allowed_slots)))
+                    slot_scope_lines.append("[END SLOT SCOPE]")
+                slot_scope_text = "\n".join(slot_scope_lines)
+                locked_slot_lines: List[str] = []
+                if slot_texts and protected_slots:
+                    locked_slot_lines.append("You MUST NOT modify the text in [LOCKED].")
+                    locked_slot_lines.append("[LOCKED]")
+                    for slot_key in sorted(protected_slots):
+                        locked_slot_lines.append(f"[{slot_key}]")
+                        locked_slot_lines.append(slot_texts.get(slot_key, "<empty>"))
+                    locked_slot_lines.append("[END LOCKED]")
+                locked_slot_text = "\n".join(locked_slot_lines)
+
+                scope_lines: List[str] = []
+                if allowed_blocks or protected_blocks:
+                    scope_lines.append("[REWRITE SCOPE]")
+                    if allowed_blocks:
+                        scope_lines.append("Only rewrite the following sections:")
+                        for block in allowed_blocks:
+                            preview = block.text.strip().replace("\n", " ")
+                            scope_lines.append(f"- {block.block_id}: {preview[:120]}")
+                    if protected_blocks:
+                        scope_lines.append("Do NOT modify sections:")
+                        for block in protected_blocks:
+                            preview = block.text.strip().replace("\n", " ")
+                            scope_lines.append(f"- {block.block_id}: {preview[:120]}")
+                    scope_lines.append("[END REWRITE SCOPE]")
+                scope_text = "\n".join(scope_lines)
 
                 def _do_rewrite(masked_prompt: str) -> str:
-                    rewrite = rewriter(
-                        current_prompt=masked_prompt,
-                        failures=feedback_text,
-                        constraints="\n".join(constraints) if constraints else "None",
-                    )
+                    prompt_with_context = masked_prompt
+                    if workflow_context:
+                        constraint_prefix = (
+                            "[OPTIMIZATION CONSTRAINT]\n"
+                            f"{workflow_context}"
+                            "The optimized prompt MUST align with the above workflow purpose.\n"
+                            "[END OPTIMIZATION CONSTRAINT]\n\n"
+                            "[ORIGINAL PROMPT TO OPTIMIZE]\n"
+                        )
+                        prompt_with_context = constraint_prefix + masked_prompt
+                    if locked_scope_text:
+                        prompt_with_context = f"{locked_scope_text}\n\n{prompt_with_context}"
+                    if locked_slot_text:
+                        prompt_with_context = f"{locked_slot_text}\n\n{prompt_with_context}"
+                    if slot_scope_text:
+                        prompt_with_context = f"{slot_scope_text}\n\n{prompt_with_context}"
+                    if scope_text:
+                        prompt_with_context = f"{scope_text}\n\n{prompt_with_context}"
+                    try:
+                        rewrite = rewriter(
+                            current_prompt=prompt_with_context,
+                            failures=feedback_text,
+                            constraints="\n".join(constraints) if constraints else "None",
+                            context=context_text,
+                            placeholders="; ".join(placeholders) if placeholders else "None",
+                        )
+                    except TypeError:
+                        rewrite = rewriter(
+                            current_prompt=prompt_with_context,
+                            failures=feedback_text,
+                            constraints="\n".join(constraints) if constraints else "None",
+                        )
                     return getattr(rewrite, "optimized_prompt", "") or masked_prompt
 
-
                 new_prompt = _safe_rewrite_prompt(prompt_text, _do_rewrite)
+                if old_state_for_rewrite and old_state_for_rewrite.protected_slots and new_prompt != prompt_text:
+                    new_state = _build_prompt_state(
+                        new_prompt,
+                        constraints,
+                        placeholders_text,
+                        mode="auto",
+                    )
+                    if not new_state or not new_state.structured:
+                        if not response_contract:
+                            new_prompt = prompt_text
+                    else:
+                        protected_slots = set(old_state_for_rewrite.protected_slots or [])
+                        frozen_slots = {
+                            slot_key
+                            for slot_key, stats in slot_stats.items()
+                            if stats.get("frozen_until_iter", -1) > step
+                        }
+                        slots_to_restore = protected_slots | frozen_slots
+                        for slot_key in slots_to_restore:
+                            if slot_key == "base_prompt":
+                                new_state.base_prompt = old_state_for_rewrite.base_prompt
+                            elif slot_key == "role":
+                                new_state.role = old_state_for_rewrite.role
+                            elif slot_key == "task":
+                                new_state.task = old_state_for_rewrite.task
+                            elif slot_key == "global_constraints":
+                                new_state.global_constraints = list(old_state_for_rewrite.global_constraints)
+                            elif slot_key == "checkpoint_rules":
+                                new_state.checkpoint_rules = dict(old_state_for_rewrite.checkpoint_rules)
+                            elif slot_key == "strictness_level":
+                                new_state.strictness_level = old_state_for_rewrite.strictness_level
+                            elif slot_key == "negative_examples":
+                                new_state.negative_examples = copy.deepcopy(
+                                    old_state_for_rewrite.negative_examples
+                                )
+                            elif slot_key == "response_contract":
+                                new_state.response_contract = old_state_for_rewrite.response_contract
+                                if "response_contract" not in new_state.protected_slots:
+                                    new_state.protected_slots.append("response_contract")
+                                new_state.schema_frozen = True
+                        new_prompt = _render_prompt_state(new_state, context_text=context_text)
+                        new_prompt = _ensure_contract_placeholder(new_prompt)
+                new_prompt = _ensure_contract_placeholder(new_prompt)
+                if protected_blocks and new_prompt != prompt_text:
+                    protected_map = {block.block_id: block.text for block in protected_blocks}
+                    new_blocks = self._split_prompt_to_blocks(new_prompt)
+                    if len(new_blocks) != len(best_blocks):
+                        new_prompt = prompt_text
+                    else:
+                        aligned_blocks: List[TextBlock] = []
+                        protected_changed = False
+                        for block in new_blocks:
+                            protected_text = protected_map.get(block.block_id)
+                            if protected_text is not None and block.text != protected_text:
+                                aligned_blocks.append(
+                                    TextBlock(
+                                        block_id=block.block_id,
+                                        kind=block.kind,
+                                        text=protected_text,
+                                    )
+                                )
+                                protected_changed = True
+                            else:
+                                aligned_blocks.append(block)
+                        if protected_changed:
+                            new_prompt = self._merge_blocks(aligned_blocks)
                 if new_prompt == prompt_text:
                     break
+                rewrite_score, rewrite_failures, rewrite_failed_runs = _evaluate_prompt(new_prompt)
+                best_fail_count = _failure_count(best_failures, best_failed_runs)
+                rewrite_fail_count = _failure_count(rewrite_failures, rewrite_failed_runs)
+                rewrite_worse = rewrite_score + score_margin < best_score
+                rewrite_failures_worse = rewrite_fail_count > best_fail_count
+                if rewrite_worse or rewrite_failures_worse:
+                    break
                 prompt_text = new_prompt
-            return prompt_text
+                text_blocks = self._split_prompt_to_blocks(prompt_text)
+                if not text_blocks:
+                    text_blocks = [TextBlock(block_id="b0", kind="other", text=prompt_text)]
+                best_blocks = text_blocks
+                block_stats = _init_block_stats(best_blocks, reset=True)
+                slot_stats = {}
+                best_prompt = self._merge_blocks(best_blocks)
+                best_prompt = _ensure_contract_placeholder(best_prompt)
+                best_score, best_failures, best_failed_runs = _evaluate_prompt(best_prompt)
+                no_improve_rounds = 0
+                same_failure_rounds = 1
+                prev_failure_signature = _failure_signature(best_failures)
+                prev_fail_count = _failure_count(best_failures, best_failed_runs)
+                if use_action_judge:
+                    state = _build_prompt_state(
+                        prompt_text,
+                        constraints,
+                        placeholders_text,
+                        mode="auto",
+                    )
+                    if state and response_contract:
+                        state.response_contract = response_contract
+                        if "response_contract" not in state.protected_slots:
+                            state.protected_slots.append("response_contract")
+                        state.schema_frozen = True
+                    if not state or not state.structured:
+                        state = None
+            final_prompt = self._merge_blocks(best_blocks)
+            return _restore_response_contract(final_prompt, response_contract)
 
     def _build_lm(self):
         raw_model = str(self.cfg.get("dspy_model") or self.cfg.get("model"))
@@ -2038,31 +5076,148 @@ class _DspyPromptOptimizer:
 
         return WorkflowPredictor
 
-    def _judge_signature(self):
+    def _judge_signature(self, workflow_name: Optional[str] = None, workflow_description: Optional[str] = None):
         dspy = self._dspy
 
-        class JudgeSignature(dspy.Signature):  # type: ignore[attr-defined]
-            """Compare candidate output with reference JSON."""
+        # Build dynamic docstring with workflow context
+        if workflow_name or workflow_description:
+            doc_lines = ["Compare candidate output with reference JSON."]
+            doc_lines.append("")
+            doc_lines.append("[WORKFLOW CONTEXT]")
+            if workflow_name:
+                doc_lines.append(f"Workflow Name: {workflow_name}")
+            if workflow_description:
+                doc_lines.append(f"Workflow Description: {workflow_description}")
+            doc_lines.append("Consider the workflow purpose when judging output correctness.")
+            doc_lines.append("[END WORKFLOW CONTEXT]")
+            docstring = "\n".join(doc_lines)
+        else:
+            docstring = "Compare candidate output with reference JSON."
 
+        class JudgeSignature(dspy.Signature):  # type: ignore[attr-defined]
             reference = dspy.InputField(desc="Reference JSON text")  # type: ignore[attr-defined]
             candidate = dspy.InputField(desc="Candidate JSON output")  # type: ignore[attr-defined]
             verdict = dspy.OutputField(desc="Judge verdict pass/fail")  # type: ignore[attr-defined]
             feedback = dspy.OutputField(desc="Feedback for failures")  # type: ignore[attr-defined]
 
+        JudgeSignature.__doc__ = docstring
         return JudgeSignature
 
-    def _rewrite_signature(self):
+    def _action_judge_signature(self, workflow_name: Optional[str] = None, workflow_description: Optional[str] = None):
         dspy = self._dspy
 
-        class RewriteSignature(dspy.Signature):  # type: ignore[attr-defined]
-            """Rewrite prompt using judge feedback and constraints."""
+        # Build dynamic docstring with workflow context
+        if workflow_name or workflow_description:
+            doc_lines = ["Return actionable prompt update instructions."]
+            doc_lines.append("")
+            doc_lines.append("[WORKFLOW CONTEXT]")
+            if workflow_name:
+                doc_lines.append(f"Workflow Name: {workflow_name}")
+            if workflow_description:
+                doc_lines.append(f"Workflow Description: {workflow_description}")
+            doc_lines.append("Consider the workflow purpose when generating prompt update actions.")
+            doc_lines.append("[END WORKFLOW CONTEXT]")
+            docstring = "\n".join(doc_lines)
+        else:
+            docstring = "Return actionable prompt update instructions."
 
-            current_prompt = dspy.InputField(desc="Original prompt text")  # type: ignore[attr-defined]
+        class ActionJudgeSignature(dspy.Signature):  # type: ignore[attr-defined]
+            reference = dspy.InputField(desc="Reference JSON text")  # type: ignore[attr-defined]
+            candidate = dspy.InputField(desc="Candidate JSON output")  # type: ignore[attr-defined]
+            prompt_state = dspy.InputField(desc="Current prompt state as JSON")  # type: ignore[attr-defined]
+            verdict = dspy.OutputField(desc="Judge verdict pass/fail")  # type: ignore[attr-defined]
+            actions_json = dspy.OutputField(  # type: ignore[attr-defined]
+                desc="JSON array of actions to update prompt state",
+            )
+
+        ActionJudgeSignature.__doc__ = docstring
+        return ActionJudgeSignature
+
+    def _rewrite_chain(
+            self,
+            rewriter,
+            *,
+            context: str,
+            instruction: str,
+            reference: str,
+            constraints: Sequence[str],
+            placeholders: str,
+            failures: str = "",
+    ) -> Dict[str, Any]:
+        merged_context = context
+        if reference:
+            merged_context = f"{context}\n\nReference output:\n{reference}".strip()
+        try:
+            rewrite = rewriter(
+                current_prompt=instruction,
+                failures=failures or "None",
+                constraints="\n".join(constraints) if constraints else "None",
+                context=merged_context,
+                placeholders=placeholders or "None",
+            )
+        except TypeError:
+            rewrite = rewriter(
+                current_prompt=instruction,
+                failures=failures or "None",
+                constraints="\n".join(constraints) if constraints else "None",
+            )
+        return {
+            "rewritten_prompt": getattr(rewrite, "optimized_prompt", None),
+            "output": getattr(rewrite, "output", None),
+        }
+
+    def _rewrite_signature(
+        self,
+        workflow_name: Optional[str] = None,
+        workflow_description: Optional[str] = None,
+    ):
+        """Generate a RewriteSignature with optional workflow-specific system message.
+
+        Args:
+            workflow_name: Human-readable name of the workflow for context.
+            workflow_description: Description of the workflow purpose for context.
+
+        Returns:
+            A DSPy Signature class with appropriate docstring for the system message.
+        """
+        dspy = self._dspy
+
+        # Build dynamic docstring based on workflow information
+        # Use explicit constraint markers for better visibility
+        if workflow_name or workflow_description:
+            constraint_lines = ["[WORKFLOW CONSTRAINT]"]
+            if workflow_name:
+                constraint_lines.append(f"Workflow Name: {workflow_name}")
+            if workflow_description:
+                constraint_lines.append(f"Workflow Description: {workflow_description}")
+            constraint_lines.append("The optimized prompt MUST align with the above workflow purpose.")
+            constraint_lines.append("[END WORKFLOW CONSTRAINT]")
+            constraint_lines.append("")
+            constraint_lines.append("Rewrite the prompt using judge feedback and constraints.")
+            docstring = "\n".join(constraint_lines)
+        else:
+            docstring = "Rewrite prompt using judge feedback and constraints."
+
+        class RewriteSignature(dspy.Signature):  # type: ignore[attr-defined]
+            current_prompt = dspy.InputField(desc="Original prompt text with workflow context prefix")  # type: ignore[attr-defined]
             failures = dspy.InputField(desc="Judge feedback details")  # type: ignore[attr-defined]
             constraints = dspy.InputField(desc="Constraints checklist")  # type: ignore[attr-defined]
             context = dspy.InputField(desc="Node brief and failure signals")  # type: ignore[attr-defined]
             placeholders = dspy.InputField(desc="Placeholders that must stay intact")  # type: ignore[attr-defined]
-            optimized_prompt = dspy.OutputField(desc="Improved prompt text")  # type: ignore[attr-defined]
+            optimized_prompt = dspy.OutputField(desc="Improved prompt text that aligns with the workflow purpose")  # type: ignore[attr-defined]
+
+        # Dynamically set the docstring
+        RewriteSignature.__doc__ = docstring
+
+        # Log the generated system prompt for debugging
+        logger.debug(
+            "GLM System Prompt (RewriteSignature docstring) 已生成",
+            extra={
+                "workflow_name": workflow_name,
+                "workflow_description": workflow_description,
+                "system_prompt": docstring,
+            },
+        )
 
         return RewriteSignature
 

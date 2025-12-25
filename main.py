@@ -12,6 +12,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, Sequence, Any
 
 import requests
 
@@ -359,7 +360,7 @@ async def main(argv: list[str] | None = None) -> int:
 
             rt = get_runtime()
             opt_cfg = (rt.app.optimization or {}) if rt and getattr(rt, "app", None) else {}
-            cfg_max_cycles = opt_cfg.get("max_iterations")
+            cfg_max_cycles = opt_cfg.get("loop_max_cycles", opt_cfg.get("max_iterations"))
             cfg_exit_ratio = opt_cfg.get("exit_ratio")
 
             max_cycles = args.max_cycles if args.max_cycles is not None else (cfg_max_cycles if isinstance(cfg_max_cycles, int) and cfg_max_cycles > 0 else 3)
@@ -645,14 +646,131 @@ async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True
             continue
 
         try:
-            report = optimizer.optimize_from_runs(
-                workflow_id=wid,
-                run_results=run_results,
-                workflow_yaml=(yaml_tree, yaml_path),
-                reference_path=reference_path,
-                reference_texts=reference_texts,
-                output_root=output_dir,
-            )
+            opt_strategy = str(ref_cfg.get("strategy") or "").lower()
+            use_prompt_state = opt_strategy == "prompt_state"
+
+            # Build workflow context for injection (used by both optimize paths)
+            wf_name = getattr(wf, "name", None)
+            wf_desc = getattr(wf, "description", None)
+            workflow_context = None
+            if wf_name or wf_desc:
+                context_parts = []
+                if wf_name:
+                    context_parts.append(f"Workflow Name: {wf_name}")
+                if wf_desc:
+                    context_parts.append(f"Workflow Description: {wf_desc}")
+                workflow_context = "\n".join(context_parts)
+
+            if use_prompt_state:
+                try:
+                    logger.info("PromptState optimizer enabled (offline)", extra={"workflow_id": wid})
+                except Exception:
+                    pass
+
+                def _select_representative_run(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+                    for item in results:
+                        try:
+                            status = _status_from_run(item) if _status_from_run else str(item.get("status", "")).lower()
+                        except Exception:
+                            status = str(item.get("status", "")).lower() if isinstance(item, dict) else "unknown"
+                        if status not in {"success", "succeeded"}:
+                            return item
+                    return results[0] if results else {}
+
+                sample_run = _select_representative_run(run_results)
+
+                def _offline_run_once(prompt_text: str, *_args, **_kwargs):
+                    llm = (ref_cfg.get("llm") or {}) if isinstance(ref_cfg, dict) else {}
+                    url = llm.get("url")
+                    model = llm.get("model")
+                    api_key = llm.get("api_key") or llm.get("key")
+                    try:
+                        timeout = float(llm.get("timeout", 60))
+                    except Exception:
+                        timeout = 60
+
+                    if not url or not model:
+                        return sample_run or {}
+
+                    try:
+                        workflow_input = None
+                        if isinstance(sample_run, dict):
+                            workflow_input = (
+                                    sample_run.get("input")
+                                    or sample_run.get("inputs")
+                                    or sample_run.get("workflow_input")
+                            )
+
+                        user_content = ""
+                        if workflow_input is not None:
+                            user_content += f"WORKFLOW_INPUT:\n{workflow_input}\n\n"
+                        user_content += f"PROMPT:\n{prompt_text}\n\nReturn the workflow output text only."
+
+                        payload = {
+                            "model": model,
+                            "messages": [
+                                {"role": "system",
+                                 "content": "You simulate the workflow output based on input and prompt."},
+                                {"role": "user", "content": user_content},
+                            ],
+                            "stream": False,
+                        }
+                        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+                        resp.raise_for_status()
+                        data = resp.json()
+
+                        text = ""
+                        try:
+                            text = (((data.get("choices") or [])[0] or {}).get("message") or {}).get("content") or ""
+                        except Exception:
+                            text = str(data)
+
+                        return {"output": text, "status": "success"}
+                    except Exception:
+                        return sample_run or {}
+
+                max_steps = ref_cfg.get("prompt_state_max_steps", ref_cfg.get("max_iterations"))
+                max_steps = int(max_steps) if isinstance(max_steps, int) and max_steps > 0 else 5
+                beam_width = ref_cfg.get("beam_width")
+                beam_width = int(beam_width) if isinstance(beam_width, int) and beam_width > 0 else 1
+                variant_count = ref_cfg.get("variant_count")
+                variant_count = int(variant_count) if isinstance(variant_count, int) and variant_count > 0 else 1
+                action_budget = ref_cfg.get("action_budget")
+                max_concurrency = ref_cfg.get("concurrency")
+                max_concurrency = int(max_concurrency) if isinstance(max_concurrency,
+                                                                     int) and max_concurrency > 0 else None
+                checkpoint_dir = Path(output_dir) / _safe_dirname_from_id(wid) / "prompt_state"
+                optimizer_cm = rt.optimizer_concurrency if rt else None
+
+                report = optimizer.optimize_with_prompt_state(
+                    workflow_id=wid,
+                    run_results=run_results,
+                    workflow_yaml=(yaml_tree, yaml_path),
+                    reference_path=reference_path,
+                    reference_texts=reference_texts,
+                    output_root=output_dir,
+                    run_once_fn=_offline_run_once,
+                    max_steps=max_steps,
+                    beam_width=beam_width,
+                    variant_count=variant_count,
+                    action_budget=action_budget,
+                    concurrency_manager=optimizer_cm,
+                    max_concurrency=max_concurrency,
+                    checkpoint_dir=checkpoint_dir,
+                    resume_from_checkpoint=bool(ref_cfg.get("resume_prompt_state")),
+                    workflow_context=workflow_context,
+                )
+            else:
+                report = optimizer.optimize_from_runs(
+                    workflow_id=wid,
+                    run_results=run_results,
+                    workflow_yaml=(yaml_tree, yaml_path),
+                    reference_path=reference_path,
+                    reference_texts=reference_texts,
+                    output_root=output_dir,
+                    workflow_context=workflow_context,
+                )
             summaries.append(
                 {
                     "workflow_id": wid,

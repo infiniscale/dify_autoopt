@@ -37,7 +37,7 @@ def mock_dspy(monkeypatch):
             self.cfg = cfg
             self.available = True
 
-        def fake_optimize(self, workflow_id, prompts, samples, reference_texts, constraints):
+        def fake_optimize_prompts(self, workflow_id, prompts, samples, reference_texts, constraints, workflow_context=None):
             patches = []
             for prompt in prompts:
                 new_text = f"{prompt.text}\n\n- {suffix}"
@@ -55,8 +55,44 @@ def mock_dspy(monkeypatch):
                 )
             return patches
 
+        def fake_optimize_blocks(
+                self,
+                workflow_id,
+                blocks,
+                samples,
+                reference_texts,
+                constraints,
+                fail_signal=None,
+                workflow_context=None,
+        ):
+            patches = []
+            for block in blocks:
+                for msg in block.messages:
+                    old_text = str(msg.get("text") or "")
+                    new_text = f"{old_text}\n\n- {suffix}"
+                    patches.append(
+                        PromptPatch(
+                            workflow_id=workflow_id,
+                            node_id=block.node_id,
+                            field_path=msg.get("path", ""),
+                            old=old_text,
+                            new=new_text,
+                            rationale="mock dspy patch",
+                            confidence=0.9,
+                            evidence_runs=[s.index for s in samples],
+                        )
+                    )
+            return patches
+
         monkeypatch.setattr("src.optimizer.prompt_optimizer._DspyPromptOptimizer.__init__", fake_init)
-        monkeypatch.setattr("src.optimizer.prompt_optimizer._DspyPromptOptimizer.optimize_prompts", fake_optimize)
+        monkeypatch.setattr(
+            "src.optimizer.prompt_optimizer._DspyPromptOptimizer.optimize_prompts",
+            fake_optimize_prompts,
+        )
+        monkeypatch.setattr(
+            "src.optimizer.prompt_optimizer._DspyPromptOptimizer.optimize_blocks",
+            fake_optimize_blocks,
+        )
 
     return _activate
 
@@ -174,4 +210,3 @@ def test_reads_prompts_from_workflow_graph_section(tmp_path: Path, mock_dspy):
     )
 
     assert report.patches, "Expected patches when constraints are missing in nested workflow graph"
-

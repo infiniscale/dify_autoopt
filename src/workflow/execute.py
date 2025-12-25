@@ -29,6 +29,25 @@ RESULT_DIRNAME = "result"
 PLACEHOLDER_ID = "{ID}"
 PLACEHOLDER_TIME = "{TIME}"
 TIME_FORMAT = "%Y%m%d%H%M%S"
+SUCCESS_STATUSES = {"success", "partial_success"}
+RETRYABLE_STATUSES = {"timeout", "failed", "error", "canceled"}
+
+
+class WorkflowRetryExhausted(RuntimeError):
+    def __init__(
+            self,
+            message: str,
+            *,
+            last_result: Optional[Dict[str, Any]] = None,
+            last_error: Optional[Exception] = None,
+            status: Optional[str] = None,
+            attempts: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.last_result = last_result
+        self.last_error = last_error
+        self.status = status
+        self.attempts = attempts
 
 
 def _is_file_path(value: Any) -> bool:
@@ -334,6 +353,71 @@ def _resolve_base_url(passed_base_url: Optional[str]) -> Optional[str]:
         return None
 
 
+def _normalize_status(value: Any) -> str:
+    lowered = str(value).strip().lower()
+    if lowered in {"success", "succeeded", "ok", "completed", "done"}:
+        return "success"
+    if lowered in {"partial_success", "partial-success", "partial"}:
+        return "partial_success"
+    if lowered in {"timeout", "timed_out", "time_out"}:
+        return "timeout"
+    if lowered in {"failed", "failure"}:
+        return "failed"
+    if lowered in {"error", "errored", "exception"}:
+        return "error"
+    if lowered in {"canceled", "cancelled", "aborted"}:
+        return "canceled"
+    return lowered
+
+
+def _status_from_result(result: Dict[str, Any]) -> str:
+    if not isinstance(result, dict):
+        return "unknown"
+    candidates: List[str] = []
+
+    def _collect(container: Dict[str, Any]) -> None:
+        for key in ("status", "state", "result"):
+            if key in container and container[key] is not None:
+                candidates.append(str(container[key]))
+
+    _collect(result)
+    nested_result = result.get("result")
+    if isinstance(nested_result, dict):
+        _collect(nested_result)
+        nested_data = nested_result.get("data")
+        if isinstance(nested_data, dict):
+            _collect(nested_data)
+    data = result.get("data")
+    if isinstance(data, dict):
+        _collect(data)
+
+    if not candidates and result.get("output") is not None:
+        return "success"
+
+    for cand in candidates:
+        normalized = _normalize_status(cand)
+        if normalized in SUCCESS_STATUSES or normalized in RETRYABLE_STATUSES:
+            return normalized
+    return _normalize_status(candidates[0]) if candidates else "unknown"
+
+
+def _resolve_test_user(passed_user: Optional[str]) -> Optional[str]:
+    """Resolve test user from args or config."""
+    if passed_user:
+        return passed_user
+    try:
+        from src.config.bootstrap import get_runtime
+
+        rt = get_runtime()
+        dify_cfg = rt.app.dify or {}
+        test_user = dify_cfg.get("test_user")
+        if test_user:
+            return str(test_user)
+        return None
+    except Exception:
+        return None
+
+
 def _console_base_from_api(base: str) -> str:
     """Strip trailing /v1 if present to get console base URL."""
     cleaned = base.rstrip("/")
@@ -382,7 +466,7 @@ def execute_workflow_v1(
     batch_timeout: Optional[Union[int, float]] = None,
     upload_path: Optional[str] = None,
     run_path: Optional[str] = None,
-    user: Optional[str] = "autoopt",
+        user: Optional[str] = None,
     response_mode: str = "blocking",
     input_types: Optional[Dict[str, str]] = None,
     output_dir: Optional[Union[str, Path]] = None,
@@ -402,6 +486,7 @@ def execute_workflow_v1(
         raise RuntimeError("No base_url provided and runtime not initialized.")
     if not api_key:
         raise RuntimeError("No api_key provided for workflow execution.")
+    resolved_user = _resolve_test_user(user) or "autoopt"
     current_api_key: str = api_key
     key_lock = Lock()
 
@@ -460,7 +545,7 @@ def execute_workflow_v1(
             "retry_count": retry_count,
             "concurrency": concurrency,
             "response_mode": response_mode,
-            "user": user,
+            "user": resolved_user,
         },
         "paths": {
             "upload_path": upload_path or f"{resolved_base}/files/upload",
@@ -475,15 +560,64 @@ def execute_workflow_v1(
         except Exception:
             pass
 
-    def _one_row(idx: int, row: Dict[str, Any]) -> Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]:
+    def _one_row(
+            idx: int,
+            row: Dict[str, Any],
+            *,
+            allow_fail_return: bool,
+    ) -> Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]:
         attempts = max(0, retry_count) + 1
         last_exc: Optional[Exception] = None
+        last_result: Optional[Dict[str, Any]] = None
+        last_status: Optional[str] = None
         timestamp = time.strftime(TIME_FORMAT)
         replacements = {
             PLACEHOLDER_ID: str(idx),
             PLACEHOLDER_TIME: timestamp,
         }
         rendered_row = _apply_runtime_placeholders(row, replacements)
+
+        def _finalize_result(
+                prepared_inputs: Dict[str, Any],
+                run_result: Dict[str, Any],
+        ) -> Tuple[int, Dict[str, Any], Dict[str, Any], Optional[Path]]:
+            persisted_path: Optional[Path] = None
+            if persist_results and output_dir:
+                _persist_result(run_result, output_dir, app_id, idx, prepared_inputs, row_meta)
+                persisted_path = _persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs, row_meta)
+            try:
+                logger.info(
+                    "工作流单条完成",
+                    extra={
+                        "workflow_id": app_id,
+                        "index": idx,
+                        "raw_inputs": row,
+                        "prepared_keys": list(prepared_inputs.keys()),
+                    },
+                )
+            except Exception:
+                pass
+            return idx, prepared_inputs, run_result, persisted_path
+
+        def _retry_exhausted_result(
+                *,
+                result: Optional[Dict[str, Any]] = None,
+                error: Optional[Exception] = None,
+                status: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            payload: Dict[str, Any] = {
+                "status": "failed",
+                "error": "retry_exhausted",
+                "attempts": attempts,
+            }
+            if status:
+                payload["last_status"] = status
+            if error:
+                payload["exception"] = str(error)
+            if result is not None:
+                payload["result"] = result
+            return payload
+
         for attempt in range(1, attempts + 1):
             api_key_local = _get_api_key()
             row_meta = dict(meta_base)
@@ -496,7 +630,7 @@ def execute_workflow_v1(
                     rendered_row,
                     base_url=resolved_base,
                     api_key=api_key_local,
-                    user=user,
+                    user=resolved_user,
                     timeout=timeout,
                     upload_path=upload_path,
                     declared_types=declared,
@@ -515,7 +649,7 @@ def execute_workflow_v1(
                     prepared_inputs,
                     base_url=resolved_base,
                     api_key=api_key_local,
-                    user=user,
+                    user=resolved_user,
                     timeout=timeout,
                     response_mode=response_mode,
                     run_path=run_path,
@@ -523,23 +657,51 @@ def execute_workflow_v1(
                 # If run succeeds after potential refresh, align local key for subsequent runs
                 if api_key_local != _get_api_key():
                     _set_api_key(api_key_local)
-                persisted_path: Optional[Path] = None
-                if persist_results and output_dir:
-                    _persist_result(run_result, output_dir, app_id, idx, prepared_inputs, row_meta)
-                    persisted_path = _persist_result_json(run_result, output_dir, app_id, idx, prepared_inputs, row_meta)
-                try:
-                    logger.info(
-                        "工作流单条完成",
-                        extra={
-                            "workflow_id": app_id,
-                            "index": idx,
-                            "raw_inputs": row,
-                            "prepared_keys": list(prepared_inputs.keys()),
-                        },
+                last_result = run_result
+                last_status = _status_from_result(run_result)
+                if last_status in SUCCESS_STATUSES:
+                    return _finalize_result(prepared_inputs, run_result)
+                if last_status in RETRYABLE_STATUSES:
+                    if attempt < attempts:
+                        backoff = min(2 ** (attempt - 1), 5)
+                        try:
+                            logger.warning(
+                                "业务失败触发重试",
+                                extra={
+                                    "workflow_id": app_id,
+                                    "index": idx,
+                                    "status": last_status,
+                                    "attempt": attempt,
+                                    "attempts": attempts,
+                                    "sleep_seconds": backoff,
+                                },
+                            )
+                        except Exception:
+                            pass
+                        time.sleep(backoff)
+                        continue
+                    if allow_fail_return:
+                        try:
+                            logger.warning(
+                                "重试耗尽（业务失败）",
+                                extra={
+                                    "workflow_id": app_id,
+                                    "index": idx,
+                                    "status": last_status,
+                                    "attempts": attempts,
+                                },
+                            )
+                        except Exception:
+                            pass
+                        failure_payload = _retry_exhausted_result(result=run_result, status=last_status)
+                        return _finalize_result(prepared_inputs, failure_payload)
+                    raise WorkflowRetryExhausted(
+                        f"workflow failed after retries, status={last_status}",
+                        last_result=run_result,
+                        status=last_status,
+                        attempts=attempts,
                     )
-                except Exception:
-                    pass
-                return idx, prepared_inputs, run_result, persisted_path
+                return _finalize_result(prepared_inputs, run_result)
             except HTTPError as exc:
                 status = getattr(exc.response, "status_code", None)
                 # Prioritize token refresh for 401
@@ -567,6 +729,21 @@ def execute_workflow_v1(
                 time.sleep(min(2 ** (attempt - 1), 5))
                 continue
             if last_exc:
+                if allow_fail_return:
+                    try:
+                        logger.warning(
+                            "重试耗尽（异常）",
+                            extra={
+                                "workflow_id": app_id,
+                                "index": idx,
+                                "attempts": attempts,
+                                "error": str(last_exc),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    failure_payload = _retry_exhausted_result(error=last_exc, status=last_status)
+                    return _finalize_result(prepared_inputs, failure_payload)
                 raise last_exc
         # Should not reach here
         raise RuntimeError("Unexpected retry loop exit")
@@ -583,7 +760,10 @@ def execute_workflow_v1(
             },
         )
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = {pool.submit(_one_row, idx, row): idx for idx, row in enumerate(rows, start=1)}
+            futures = {
+                pool.submit(_one_row, idx, row, allow_fail_return=True): idx
+                for idx, row in enumerate(rows, start=1)
+            }
             try:
                 for fut in as_completed(futures, timeout=effective_batch_timeout):
                     idx = futures[fut]
@@ -600,7 +780,7 @@ def execute_workflow_v1(
                 raise RuntimeError(f"并发执行超时，未完成条目: {pending}")
     else:
         for idx, row in enumerate(rows, start=1):
-            results.append(_one_row(idx, row))
+            results.append(_one_row(idx, row, allow_fail_return=False))
 
     results.sort(key=lambda x: x[0])
     persisted_files: List[Path] = []
@@ -704,6 +884,8 @@ def execute_workflow_from_config(
     if not api_key or not resolved_base:
         raise RuntimeError("Workflow execution requires dify.base_url and workflow.api_key in config")
 
+    dify_cfg = rt.app.dify or {}
+    test_user = dify_cfg.get("test_user")
     return execute_workflow_v1(
         app_id,
         rows,
@@ -719,6 +901,7 @@ def execute_workflow_from_config(
         concurrency=rt.app.execution.get("concurrency") if rt.app.execution else 1,
         retry_count=int(exec_retry) if isinstance(exec_retry, int) else 0,
         persist_metadata=exec_meta,
+        user=str(test_user) if test_user else None,
     )
 
 

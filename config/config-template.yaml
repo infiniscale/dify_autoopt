@@ -12,8 +12,8 @@ meta:
 
 # ===== Dify 平台配置 =====
 dify:
-  #base_url: "http://xy.dnset.com:1280"   # Dify 实例根地址
-  base_url: "http://125.118.93.188:1280"   # Dify 实例根地址
+  base_url: "http://127.0.0.1"   # Dify 实例根地址
+  test_user: "auto-opt"
 
 # ===== 登录与认证配置（演示用，建议使用环境变量替代） =====
 auth:
@@ -32,26 +32,18 @@ variables:
 # ===== 工作流信息（最小示例） =====
 # 提示：如需使用 catalog（workflow_repository.yaml），可并行维护，CLI 会优先从 --catalog 加载。
 workflows:
-  # - id: "1e4be230-9776-4b6a-b20e-6c8fcdcd2f0f"
-  # - id: "d787093d-3d99-4523-801b-d3cfcb6e9ea8"
-  - id: "3f6422ab-3ed6-4a6d-af0e-b5df715c0080"
-    name: "测试工作流文件"
-    description: "对输入文本进行格式转换A"
-    # api_key: "app-mnZUnTtmjjHjyAAcS9KxYEfA"
-    # api_key: "app-lhg7xZq0KRVk5frngV0MRCjW"
-    api_key: "app-bO8xtqhXurX1TDJ1FWwkjcgA"
+  - id: "3f6422ab-xxxx-xxxx-xxxx-b5df715c0080"
+    name: "测试工作流文件"  # 会注入提示词中需要表明当前工作流的名称
+    description: "对输入文本进行格式转换A" # 会注入提示词中，主要表明工作流的主要功能
+    api_key: "app-bO8xxxxxxxxcgA"
     inputs:
       ContractFile:
         type: file
         value:
-          - "./docs/购销合同.pdf"
-          # - "./docs/【满开x西藏酷爱通信有限公司】apple授权专营店合作协议.docx"
-          # - "./docs/长宁龙之梦合同.pdf"
-          # - "./docs/受理终端采购协议（2025版）爱施德(1).pdf"
-          # - "./docs/采购合同(1).docx"
-          # - "./docs/【荣耀magic】广电智信科技（重庆）有限责任公司与深圳市德耀通讯科技有限责任公司合作协议(1).docx"
-          # - "./docs/百联店租赁合同.docx"
-          # - "./docs/微派：配送采集服务补充协议-2025年Q1版.docx"
+          - "./docs/1.pdf"
+          - "./docs/2.pdf"
+          - "./docs/3.pdf"
+          - "./docs/4.pdf"
       RulesetApiUrl:
         type: string
         value: "test{TIME}"
@@ -65,14 +57,11 @@ workflows:
         type: string
         value: "testtest"
     reference:
-      - "./docs/reference-rules/购销合同_分析报告.md"
-      # - "./docs/reference-rules/【满开x西藏酷爱通信有限公司】apple授权专营店合作协议_分析报告.md"
-      # - "./docs/reference-rules/长宁龙之梦合同_分析报告.md"
-      # - "./docs/reference-rules/受理终端采购协议（2025版）爱施德(1)_分析报告.md"
-      # - "./docs/reference-rules/采购合同(1)_分析报告.md"
-      # - "./docs/reference-rules/【荣耀magic】广电智信科技（重庆）有限责任公司与深圳市德耀通讯科技有限责任公司合作协议(1)_分析报告.md"
-      # - "./docs/reference-rules/百联店租赁合同_分析报告.md"
-      # - "./docs/reference-rules/微派：配送采集服务补充协议-2025年Q1版_分析报告.md"
+      - "./docs/reference-rules/1_分析报告.md"
+      - "./docs/reference-rules/2_分析报告.md"
+      - "./docs/reference-rules/3_分析报告.md"
+      - "./docs/reference-rules/4_分析报告.md"
+
 
   - id: "wf_chat_assistant"
     name: "对话助理工作流"
@@ -102,7 +91,9 @@ execution:
 # ===== 优化配置（示例） =====
 optimization:
   # strategy: "clarity_focus"      # auto | clarity_focus | efficiency_focus | structure_focus | llm_guided
-  max_iterations: 3
+  max_iterations: 10
+  prompt_state_max_steps: 5
+  loop_max_cycles: 10
   exit_ratio: 0.8
   llm:
     url: "${LLM_BASE_URL}"

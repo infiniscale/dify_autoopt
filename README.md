@@ -192,8 +192,10 @@ execution:
   backoff: { initial_delay: 0.5, max_delay: 4.0, factor: 2.0 }
 
 optimization:
-  strategy: "clarity_focus"   # auto | clarity_focus | efficiency_focus | structure_focus | llm_guided
+  strategy: "clarity_focus"   # auto | clarity_focus | efficiency_focus | structure_focus | llm_guided | prompt_state
   max_iterations: 3
+  loop_max_cycles: 3
+  prompt_state_max_steps: 3
   llm:
     url: "http://127.0.0.1"
     model: "gpt-4-turbo-preview"
@@ -211,6 +213,12 @@ logging:
   console_enabled: true
   file_enabled: true
 ```
+
+optimization 参数补充：
+
+- `strategy=prompt_state`：使用 PromptState 优化路径（opt/all/loop 模式均生效）
+- `loop_max_cycles`：`loop` 模式最大循环次数（覆盖 `max_iterations` 的循环含义）
+- `prompt_state_max_steps`：PromptState 单次优化最大步数（覆盖 `max_iterations` 的步数含义）
 
 约束与校验（重要）：
 
