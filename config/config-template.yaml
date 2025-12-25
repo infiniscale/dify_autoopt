@@ -13,6 +13,7 @@ meta:
 # ===== Dify 平台配置 =====
 dify:
   base_url: "http://127.0.0.1"   # Dify 实例根地址
+  test_user: "auto-opt"
 
 # ===== 登录与认证配置（演示用，建议使用环境变量替代） =====
 auth:
@@ -90,7 +91,9 @@ execution:
 # ===== 优化配置（示例） =====
 optimization:
   # strategy: "clarity_focus"      # auto | clarity_focus | efficiency_focus | structure_focus | llm_guided
-  max_iterations: 3
+  max_iterations: 10
+  prompt_state_max_steps: 5
+  loop_max_cycles: 10
   exit_ratio: 0.8
   llm:
     url: "${LLM_BASE_URL}"
