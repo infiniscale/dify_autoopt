@@ -33,8 +33,8 @@ variables:
 # 提示：如需使用 catalog（workflow_repository.yaml），可并行维护，CLI 会优先从 --catalog 加载。
 workflows:
   - id: "3f6422ab-xxxx-xxxx-xxxx-b5df715c0080"
-    name: "测试工作流文件"
-    description: "对输入文本进行格式转换A"
+    name: "测试工作流文件"  # 会注入提示词中需要表明当前工作流的名称
+    description: "对输入文本进行格式转换A" # 会注入提示词中，主要表明工作流的主要功能
     api_key: "app-bO8xxxxxxxxcgA"
     inputs:
       ContractFile:
