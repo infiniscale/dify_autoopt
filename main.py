@@ -360,7 +360,7 @@ async def main(argv: list[str] | None = None) -> int:
 
             rt = get_runtime()
             opt_cfg = (rt.app.optimization or {}) if rt and getattr(rt, "app", None) else {}
-            cfg_max_cycles = opt_cfg.get("max_iterations")
+            cfg_max_cycles = opt_cfg.get("loop_max_cycles", opt_cfg.get("max_iterations"))
             cfg_exit_ratio = opt_cfg.get("exit_ratio")
 
             max_cycles = args.max_cycles if args.max_cycles is not None else (cfg_max_cycles if isinstance(cfg_max_cycles, int) and cfg_max_cycles > 0 else 3)
@@ -647,7 +647,7 @@ async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True
 
         try:
             opt_strategy = str(ref_cfg.get("strategy") or "").lower()
-            use_prompt_state = bool(run_workflows and opt_strategy == "prompt_state")
+            use_prompt_state = opt_strategy == "prompt_state"
 
             # Build workflow context for injection (used by both optimize paths)
             wf_name = getattr(wf, "name", None)
@@ -730,7 +730,7 @@ async def run_optimize_mode(*, run_workflows: bool = True, optimize: bool = True
                     except Exception:
                         return sample_run or {}
 
-                max_steps = ref_cfg.get("max_iterations")
+                max_steps = ref_cfg.get("prompt_state_max_steps", ref_cfg.get("max_iterations"))
                 max_steps = int(max_steps) if isinstance(max_steps, int) and max_steps > 0 else 5
                 beam_width = ref_cfg.get("beam_width")
                 beam_width = int(beam_width) if isinstance(beam_width, int) and beam_width > 0 else 1

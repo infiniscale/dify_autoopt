@@ -334,6 +334,23 @@ def _resolve_base_url(passed_base_url: Optional[str]) -> Optional[str]:
         return None
 
 
+def _resolve_test_user(passed_user: Optional[str]) -> Optional[str]:
+    """Resolve test user from args or config."""
+    if passed_user:
+        return passed_user
+    try:
+        from src.config.bootstrap import get_runtime
+
+        rt = get_runtime()
+        dify_cfg = rt.app.dify or {}
+        test_user = dify_cfg.get("test_user")
+        if test_user:
+            return str(test_user)
+        return None
+    except Exception:
+        return None
+
+
 def _console_base_from_api(base: str) -> str:
     """Strip trailing /v1 if present to get console base URL."""
     cleaned = base.rstrip("/")
@@ -382,7 +399,7 @@ def execute_workflow_v1(
     batch_timeout: Optional[Union[int, float]] = None,
     upload_path: Optional[str] = None,
     run_path: Optional[str] = None,
-    user: Optional[str] = "autoopt",
+        user: Optional[str] = None,
     response_mode: str = "blocking",
     input_types: Optional[Dict[str, str]] = None,
     output_dir: Optional[Union[str, Path]] = None,
@@ -402,6 +419,7 @@ def execute_workflow_v1(
         raise RuntimeError("No base_url provided and runtime not initialized.")
     if not api_key:
         raise RuntimeError("No api_key provided for workflow execution.")
+    resolved_user = _resolve_test_user(user) or "autoopt"
     current_api_key: str = api_key
     key_lock = Lock()
 
@@ -460,7 +478,7 @@ def execute_workflow_v1(
             "retry_count": retry_count,
             "concurrency": concurrency,
             "response_mode": response_mode,
-            "user": user,
+            "user": resolved_user,
         },
         "paths": {
             "upload_path": upload_path or f"{resolved_base}/files/upload",
@@ -496,7 +514,7 @@ def execute_workflow_v1(
                     rendered_row,
                     base_url=resolved_base,
                     api_key=api_key_local,
-                    user=user,
+                    user=resolved_user,
                     timeout=timeout,
                     upload_path=upload_path,
                     declared_types=declared,
@@ -515,7 +533,7 @@ def execute_workflow_v1(
                     prepared_inputs,
                     base_url=resolved_base,
                     api_key=api_key_local,
-                    user=user,
+                    user=resolved_user,
                     timeout=timeout,
                     response_mode=response_mode,
                     run_path=run_path,
@@ -704,6 +722,8 @@ def execute_workflow_from_config(
     if not api_key or not resolved_base:
         raise RuntimeError("Workflow execution requires dify.base_url and workflow.api_key in config")
 
+    dify_cfg = rt.app.dify or {}
+    test_user = dify_cfg.get("test_user")
     return execute_workflow_v1(
         app_id,
         rows,
@@ -719,6 +739,7 @@ def execute_workflow_from_config(
         concurrency=rt.app.execution.get("concurrency") if rt.app.execution else 1,
         retry_count=int(exec_retry) if isinstance(exec_retry, int) else 0,
         persist_metadata=exec_meta,
+        user=str(test_user) if test_user else None,
     )
 
 
