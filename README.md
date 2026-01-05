@@ -98,24 +98,57 @@ pip install -r requirements.txt
 
 # 配置环境变量
 cp .env.example .env   # 复制后填写真实账号/密钥
+# 编辑 .env 文件，填写真实的配置信息
 ```
 
-.env.example 的作用与填法：
-- 复制为 `.env` 后，补齐你的 Dify 控制台账号密码或 Token，例如：
-  ```
-  DIFY_USERNAME=your_email@example.com
-  DIFY_PASSWORD=your_password
-  # 或：DIFY_API_TOKEN=app-xxxxxx
-  # 工作流运行用的 API Key 也可以放这里
-  WF1_API_KEY=app-xxxxxx
-  WF2_API_KEY=app-yyyyyy
-  ```
-- 启动时自动加载 `.env`，把 `${...}` 占位符注入到 `config/config.yaml`，避免在 YAML 中写明文。
+**⚠️ 重要：环境变量配置说明**
+
+`.env` 文件包含应用运行所需的敏感配置，必须正确配置才能启动应用。
+
+**必需配置项**：
+1. **Dify 认证**（二选一）：
+   ```bash
+   # 方式1: 用户名密码（推荐）
+   DIFY_USERNAME=your_email@example.com
+   DIFY_PASSWORD=your_password
+
+   # 方式2: API Token
+   DIFY_API_TOKEN=app-xxxxxx
+   ```
+
+2. **LLM 优化模块配置**（三个必填项）：
+   ```bash
+   LLM_BASE_URL=https://api.openai.com/v1
+   LLM_API_KEY=sk-your-api-key-here
+   LLM_MODEL=gpt-4-turbo-preview
+   ```
+
+   **常见 LLM 提供商配置示例**：
+   - OpenAI: `LLM_BASE_URL=https://api.openai.com/v1`
+   - 智谱 GLM: `LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4`
+   - 通义千问: `LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1`
+   - Ollama 本地: `LLM_BASE_URL=http://localhost:11434/v1`
+
+**配置流程**：
+1. 复制示例文件：`cp .env.example .env`
+2. 编辑 `.env` 文件，替换所有 `your_xxx_here` 占位符为真实值
+3. 确保 `.env` 文件已被 `.gitignore` 忽略（避免泄露）
+4. 启动应用时会自动加载 `.env`，将 `${...}` 占位符注入到 `config/config.yaml`
+
+**验证配置**：
+```bash
+# 验证环境变量是否正确加载
+python -c "from dotenv import load_dotenv; from pathlib import Path; load_dotenv(Path('.env')); import os; print('LLM_BASE_URL:', os.getenv('LLM_BASE_URL'))"
 ```
 
 ### 2. 配置设置（单一配置文件）
 
 本项目使用单一配置文件 `config/config.yaml`，顶层包含：`meta`、`dify`、`auth`、`variables`、`workflows`、`execution`、`optimization`、`io_paths`、`logging`。
+
+**⚠️ 重要提示**：
+- 首次运行前，请将 `config/config.yaml` 中的**示例工作流信息注释掉**
+- 如果使用不存在的工作流 ID，会在日志中看到 "导出工作流失败" 的警告信息
+- 建议先运行 `python main.py --mode run` 获取实际的工作流列表，再配置真实的工作流 ID
 
 示例（与当前实现一致）：
 ```yaml
@@ -389,10 +422,32 @@ python -m dify_opt.utils.validator config/config.yaml
 
 ### 常见问题
 
-1. **认证失败** - 检查API密钥和用户凭据
-2. **工作流找不到** - 确认工作流ID和权限设置
-3. **并发超限** - 调整并发数配置
-4. **内存不足** - 减少批量处理的数量
+1. **错误：LLM url 非法: ${LLM_BASE_URL}**
+   - **原因**：环境变量未正确配置或未被加载
+   - **解决方法**：
+     ```bash
+     # 1. 确保 .env 文件存在且配置正确
+     cat .env | grep LLM_
+
+     # 2. 验证环境变量能否被加载
+     python -c "from dotenv import load_dotenv; from pathlib import Path; load_dotenv(Path('.env')); import os; print('LLM_BASE_URL:', os.getenv('LLM_BASE_URL'))"
+
+     # 3. 检查 .env 文件中是否配置了以下三个必填项
+     # LLM_BASE_URL=https://api.openai.com/v1
+     # LLM_API_KEY=sk-your-api-key
+     # LLM_MODEL=gpt-4-turbo-preview
+     ```
+
+2. **工作流导出失败 (404 NOT FOUND)**
+   - **原因**：`config/config.yaml` 中配置了不存在的工作流 ID
+   - **解决方法**：
+     - 将示例工作流（如 `wf_chat_assistant`）注释掉
+     - 使用真实的工作流 UUID（格式如：`d787093d-3d99-4523-801b-d3cfcb6e9ea8`）
+
+3. **认证失败** - 检查API密钥和用户凭据
+4. **工作流找不到** - 确认工作流ID和权限设置
+5. **并发超限** - 调整并发数配置
+6. **内存不足** - 减少批量处理的数量
 
 ### 日志查看
 
@@ -423,4 +478,4 @@ grep ERROR logs/dify_opt.log
 
 ---
 
-*最后更新: 2025-11-19*
+*最后更新: 2026-01-05*
